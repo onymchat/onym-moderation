@@ -37,6 +37,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/cases/:case_id/appeal", post(appeal))
         .route("/v1/cases/:case_id/status", get(query_status))
         .route("/v1/cases/:case_id/decide", post(decide))
+        .route("/v1/verdicts/:verdict_ref/requeue", post(requeue_verdict))
         .with_state(state)
 }
 
@@ -421,10 +422,9 @@ async fn file_report(
     })))
 }
 
-/// The manifest a mandate consented to, parsed. Falls back to the
-/// currently published one only for mandates registered before
-/// snapshots were kept — and says so, because judging under terms the
-/// user never saw is the failure this exists to prevent.
+/// The manifest a mandate consented to, parsed. A legacy mandate with
+/// no snapshot may use the published bytes only when they still hash to
+/// the mandate's reference; otherwise there is no safe reconstruction.
 fn consented_manifest(
     state: &AppState,
     mandate: &crate::store::MandateRecord,
@@ -433,12 +433,20 @@ fn consented_manifest(
         Some(raw) => serde_json::from_slice(&raw)
             .map_err(|e| Error::Internal(format!("stored consented manifest unparseable: {e}"))),
         None => {
-            tracing::warn!(
-                mandate_ref = %mandate.mandate_ref,
-                manifest_hash = %mandate.manifest_hash,
-                "no stored manifest for this mandate; falling back to the published one"
-            );
-            Ok(state.config.manifest.clone())
+            let published_hash = util::sha256_hex(&state.config.manifest_raw);
+            if published_hash == mandate.manifest_hash {
+                tracing::warn!(
+                    mandate_ref = %mandate.mandate_ref,
+                    "legacy mandate has no snapshot; published bytes still match its hash"
+                );
+                Ok(state.config.manifest.clone())
+            } else {
+                Err(Error::Internal(format!(
+                    "mandate {} pins manifest {}, but its snapshot is missing and the published \
+                     manifest hashes to {published_hash}; refusing to judge under unconsented terms",
+                    mandate.mandate_ref, mandate.manifest_hash
+                )))
+            }
         }
     }
 }
@@ -1035,6 +1043,26 @@ async fn decide(
         "disposition": case.disposition.clone().unwrap_or_else(|| issued.disposition.clone()),
         "verdictDisposition": issued.disposition,
     })))
+}
+
+/// Return a repaired, previously permanent refusal to the delivery
+/// queue. This is an operator action: the verdict remains immutable;
+/// only its delivery state is reset after the underlying mismatch has
+/// been fixed.
+async fn requeue_verdict(
+    State(state): State<Arc<AppState>>,
+    Path(verdict_ref): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, Error> {
+    authorize_moderator(&state, &headers)?;
+    if !state.store.requeue_verdict(&verdict_ref)? {
+        return Err(Error::CaseState(format!(
+            "verdict {verdict_ref} is not an undeliverable verdict awaiting repair"
+        )));
+    }
+    tracing::warn!(%verdict_ref, "operator requeued an undeliverable verdict");
+    flush_soon(&state);
+    Ok(Json(json!({ "verdictRef": verdict_ref, "requeued": true })))
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────
@@ -1802,12 +1830,11 @@ mod tests {
         );
     }
 
-    /// The genuine new owner's remedy is mandatory (§5.7) and must not
-    /// be consumable by a stranger. Claims are bounded, not capped at
-    /// one: duplicates are noise a moderator skips, while a burned slot
-    /// is a remedy nobody can get back.
+    /// The unauthenticated path is storage-bounded, but the cap remains
+    /// exhaustible. A claim arriving before exhaustion reaches review;
+    /// ownership attestation is an interface responsibility.
     #[tokio::test]
-    async fn a_stranger_cannot_burn_the_new_holder_remedy() {
+    async fn new_holder_claims_are_bounded_but_not_authenticated() {
         let harness = Harness::new();
         let case_id = open_case(&harness).await;
         let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
@@ -1955,6 +1982,44 @@ mod tests {
             (deadline - opened).whole_days(),
             30,
             "the case must hold the window the accused consented to, not the published one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_old_snapshot_never_falls_forward_to_different_terms() {
+        let harness = Harness::new();
+        let consented_manifest =
+            crate::testing::MANIFEST_JSON.replace("\"responseWindow\": \"P3D\"", "\"responseWindow\": \"P30D\"");
+        let manifest_hash = util::sha256_hex(consented_manifest.as_bytes());
+        harness
+            .state
+            .store
+            .put_mandate(
+                &crate::store::MandateRecord {
+                    mandate_ref: "legacy-without-snapshot".into(),
+                    user_key: testing::key_reference(ACCUSED_SEED),
+                    device_binding: "device-2".into(),
+                    classes: vec!["csam".into()],
+                    manifest_hash: manifest_hash.clone(),
+                },
+                b"{}",
+                consented_manifest.as_bytes(),
+                "2026-08-01T00:00:00Z",
+            )
+            .unwrap();
+        harness.state.store.remove_manifest_snapshot(&manifest_hash).unwrap();
+
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+        let body = signed(report_json(&reporter_mandate, "r-1"), "signature", &[REPORTER_SEED]);
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{response}");
+        assert!(
+            harness
+                .state
+                .store
+                .open_case_for(&testing::key_reference(ACCUSED_SEED), "csam")
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -2285,6 +2350,43 @@ mod tests {
             )
             .await;
         assert!(moderator["undeliverable"].is_array(), "the operator gets the detail");
+    }
+
+    #[tokio::test]
+    async fn a_moderator_can_requeue_a_repaired_delivery_refusal() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        let (status, response) = harness
+            .decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+
+        let queued = harness.state.store.undelivered_verdicts().unwrap();
+        assert_eq!(queued.len(), 1);
+        let verdict_ref = queued[0].verdict_ref.clone();
+        harness.state.store.mark_undeliverable(&verdict_ref).unwrap();
+
+        let path = format!("/v1/verdicts/{verdict_ref}/requeue");
+        let (status, _) = harness
+            .send(Request::post(&path).body(Body::empty()).unwrap())
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, body) = harness
+            .send(
+                Request::post(&path)
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["requeued"], true);
+        assert!(harness.state.store.undeliverable_verdicts().unwrap().is_empty());
+        assert_eq!(harness.state.store.undelivered_verdicts().unwrap().len(), 1);
     }
 
 }

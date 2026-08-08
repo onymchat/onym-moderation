@@ -11,6 +11,11 @@ use crate::store::Store;
 use crate::types::VerdictSubmission;
 use crate::util;
 
+#[derive(serde::Deserialize)]
+struct InterfaceErrorBody {
+    error: String,
+}
+
 /// What one delivery attempt came to.
 pub enum Attempt {
     Delivered,
@@ -42,10 +47,10 @@ pub struct Delivery {
     client: reqwest::Client,
     base_url: Option<String>,
     token: Option<String>,
-    /// Base64 of the currently published manifest. A fallback only:
-    /// each verdict normally travels with the manifest its own case's
-    /// mandate pinned, which for an older mandate is not this one.
+    /// Base64 of the currently published manifest. A fallback only
+    /// when those exact bytes still hash to the mandate's reference.
     published_manifest: String,
+    published_manifest_hash: String,
 }
 
 impl Delivery {
@@ -58,6 +63,7 @@ impl Delivery {
             base_url,
             token,
             published_manifest: util::base64_encode(manifest_raw),
+            published_manifest_hash: util::sha256_hex(manifest_raw),
         }
     }
 
@@ -73,6 +79,7 @@ impl Delivery {
         &self,
         raw_verdict: &[u8],
         consented_manifest: Option<&[u8]>,
+        mandate_manifest_hash: Option<&str>,
     ) -> Result<Attempt, Error> {
         let Some(base_url) = self.base_url.as_deref() else {
             return Ok(Attempt::Retry("no interface URL configured".into()));
@@ -85,11 +92,21 @@ impl Delivery {
         // manifest would make every verdict for a pre-republication
         // mandate fail that check — the sanction would silently never
         // execute, and the case would look decided from here.
+        let consented_manifest = match consented_manifest {
+            Some(raw) => util::base64_encode(raw),
+            None if mandate_manifest_hash == Some(self.published_manifest_hash.as_str()) => {
+                self.published_manifest.clone()
+            }
+            None => {
+                return Ok(Attempt::Retry(
+                    "consented manifest snapshot is missing and published bytes do not match"
+                        .into(),
+                ))
+            }
+        };
         let submission = VerdictSubmission {
             verdict,
-            consented_manifest: consented_manifest
-                .map(util::base64_encode)
-                .unwrap_or_else(|| self.published_manifest.clone()),
+            consented_manifest,
         };
 
         let mut request = self
@@ -105,22 +122,18 @@ impl Delivery {
             Ok(response) => {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
-                // A 4xx means the interface refused the verdict's
-                // shape, and identical bytes will be refused
-                // identically forever. Retrying it every sweep turns a
-                // mutual-check mismatch into a log line nobody reads;
-                // the caller gives up after a few attempts and leaves
-                // it visible as stuck instead.
-                //
-                // A 5xx is the interface having a bad day, which is a
-                // different thing and does deserve retrying.
                 let detail = format!("{status}: {}", truncate(&body));
-                tracing::error!(%status, %body, "interface refused a verdict");
-                if status.is_client_error() {
-                    Ok(Attempt::Refused(detail))
-                } else {
-                    Ok(Attempt::Retry(detail))
+                let attempt = classify_response(status, &body, detail);
+                match &attempt {
+                    Attempt::Refused(_) => {
+                        tracing::error!(%status, %body, "interface permanently refused a verdict")
+                    }
+                    Attempt::Retry(_) => {
+                        tracing::warn!(%status, %body, "interface temporarily refused delivery")
+                    }
+                    Attempt::Delivered => unreachable!(),
                 }
+                Ok(attempt)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "interface unreachable; verdict stays queued");
@@ -135,7 +148,14 @@ impl Delivery {
             return Ok(());
         }
         for queued in store.undelivered_verdicts()? {
-            match self.deliver(&queued.raw, queued.consented_manifest.as_deref()).await? {
+            match self
+                .deliver(
+                    &queued.raw,
+                    queued.consented_manifest.as_deref(),
+                    queued.manifest_hash.as_deref(),
+                )
+                .await?
+            {
                 Attempt::Delivered => {
                     store.mark_delivered(&queued.verdict_ref)?;
                     tracing::info!(verdict_ref = %queued.verdict_ref, "verdict delivered");
@@ -169,6 +189,25 @@ impl Delivery {
             }
         }
         Ok(())
+    }
+}
+
+/// Only structured verdict/content errors are permanent. Authentication
+/// failures, rate limits, missing state, proxy responses, and unknown
+/// client errors are repairable operational conditions and stay queued.
+fn classify_response(status: reqwest::StatusCode, body: &str, detail: String) -> Attempt {
+    let code = serde_json::from_str::<InterfaceErrorBody>(body)
+        .ok()
+        .map(|body| body.error);
+    let permanent = status.is_client_error()
+        && matches!(
+            code.as_deref(),
+            Some("bad_request" | "verdict_invalid" | "class_outside_mandate")
+        );
+    if permanent {
+        Attempt::Refused(detail)
+    } else {
+        Attempt::Retry(detail)
     }
 }
 
@@ -254,6 +293,11 @@ mod tests {
         assert_eq!(stuck.len(), 1);
         assert_eq!(stuck[0].0, "v1");
         assert!(stuck[0].1.contains("422"), "the interface's own words are kept: {:?}", stuck[0].1);
+
+        assert!(store.requeue_verdict("v1").unwrap());
+        assert!(store.undeliverable_verdicts().unwrap().is_empty());
+        assert_eq!(store.undelivered_verdicts().unwrap().len(), 1);
+        assert!(!store.requeue_verdict("v1").unwrap(), "an already queued verdict is unchanged");
     }
 
     /// A delivery that succeeds after earlier trouble clears the error
@@ -269,22 +313,25 @@ mod tests {
         assert!(store.undeliverable_verdicts().unwrap().is_empty());
     }
 
-    /// 4xx and 5xx are different faults: one is the verdict being
-    /// wrong, the other is the interface having a bad day.
+    /// Status alone cannot say whether retrying helps: authentication,
+    /// rate limits, and missing interface state are all 4xx responses.
     #[test]
-    fn only_client_errors_are_treated_as_refusals() {
-        assert!(matches!(classify(400), Attempt::Refused(_)));
-        assert!(matches!(classify(422), Attempt::Refused(_)));
-        assert!(matches!(classify(500), Attempt::Retry(_)));
-        assert!(matches!(classify(503), Attempt::Retry(_)));
+    fn only_structured_permanent_errors_count_as_refusals() {
+        assert!(matches!(classify(400, "verdict_invalid"), Attempt::Refused(_)));
+        assert!(matches!(classify(400, "class_outside_mandate"), Attempt::Refused(_)));
+        assert!(matches!(classify(401, "signature_invalid"), Attempt::Retry(_)));
+        assert!(matches!(classify(429, "rate_limited"), Attempt::Retry(_)));
+        assert!(matches!(classify(400, "no_mandate"), Attempt::Retry(_)));
+        assert!(matches!(classify(404, "not_found"), Attempt::Retry(_)));
+        assert!(matches!(classify(500, "internal_error"), Attempt::Retry(_)));
     }
 
-    fn classify(status: u16) -> Attempt {
+    fn classify(status: u16, code: &str) -> Attempt {
         let status = reqwest::StatusCode::from_u16(status).unwrap();
-        if status.is_client_error() {
-            Attempt::Refused(status.to_string())
-        } else {
-            Attempt::Retry(status.to_string())
-        }
+        classify_response(
+            status,
+            &serde_json::json!({ "error": code }).to_string(),
+            status.to_string(),
+        )
     }
 }

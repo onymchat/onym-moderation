@@ -47,6 +47,7 @@ pub struct UndeliveredVerdict {
     pub verdict_ref: String,
     pub raw: Vec<u8>,
     pub consented_manifest: Option<Vec<u8>>,
+    pub manifest_hash: Option<String>,
 }
 
 pub struct MandateRecord {
@@ -347,6 +348,16 @@ impl Store {
             )
             .optional()?;
         Ok(raw)
+    }
+
+    #[cfg(test)]
+    pub fn remove_manifest_snapshot(&self, manifest_hash: &str) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM manifests WHERE manifest_hash = ?1",
+            params![manifest_hash],
+        )?;
+        Ok(())
     }
 
     fn mandate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MandateRecord> {
@@ -995,6 +1006,21 @@ impl Store {
         Ok(())
     }
 
+    /// Requeue a verdict after an operator repairs the interface,
+    /// credentials, or cross-check that caused a permanent refusal.
+    /// Historical attempt count is preserved; the fresh refusal budget
+    /// starts at zero.
+    pub fn requeue_verdict(&self, verdict_ref: &str) -> Result<bool, Error> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE verdicts
+                SET undeliverable = 0, refusals = 0, last_error = NULL
+              WHERE verdict_ref = ?1 AND delivered = 0 AND undeliverable = 1",
+            params![verdict_ref],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Verdicts that have been signed, stored, and given up on. Each
     /// one is a mark that should have moved and did not — surfaced on
     /// `/health` so it reads as a fault rather than as silence.
@@ -1023,7 +1049,7 @@ impl Store {
         // user's mandate pinned, which is not necessarily what this
         // authority publishes today.
         let mut statement = conn.prepare(
-            "SELECT v.verdict_ref, v.raw, mf.raw
+            "SELECT v.verdict_ref, v.raw, mf.raw, m.manifest_hash
                FROM verdicts v
                LEFT JOIN cases c    ON c.case_id = v.case_id
                LEFT JOIN mandates m ON m.mandate_ref = c.mandate_ref
@@ -1036,6 +1062,7 @@ impl Store {
                 verdict_ref: row.get(0)?,
                 raw: row.get(1)?,
                 consented_manifest: row.get(2)?,
+                manifest_hash: row.get(3)?,
             })
         })?;
         let mut out = Vec::new();

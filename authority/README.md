@@ -101,6 +101,7 @@ worth stating:
 | `POST` | `/v1/cases/:id/appeal` | Appeal, or a new-holder claim |
 | `GET` | `/v1/cases/:id/status` | query-status, per the confidentiality policy — requires a party credential |
 | `POST` | `/v1/cases/:id/decide` | The moderator's judgment (bearer token) |
+| `POST` | `/v1/verdicts/:ref/requeue` | Requeue a repaired permanent delivery refusal (moderator bearer token) |
 | `GET` | `/health` | Signing key, manifest hash, whether it can decide or deliver, and how many verdicts the interface refuses |
 
 `/v1/cases/:id/decide` is the only path from a report to a sanction,
@@ -192,11 +193,18 @@ Reference implementation. Known limits:
   by definition not the mandated identity, so their claim cannot be
   signature-checked. It answers every caller identically — filed or
   not, real case or invented — and records only claims against a ban in
-  force. Claims are *bounded* per case rather than capped at one:
-  capping at one let any stranger permanently consume the genuine
-  owner's only remedy, which §5.7 makes mandatory, while duplicates are
-  merely noise a moderator skips. Real attestation that a device
-  changed hands needs the interface, which holds the device key.
+  force. Claims are bounded to eight per case to cap unauthenticated
+  storage, but those eight slots are exhaustible by a stranger because
+  this service has no ownership proof or claim-resolution lifecycle.
+  That is an accepted limitation, not a complete anti-burning remedy.
+  Real attestation that a device changed hands needs the interface,
+  which holds the device key.
+
+- **Prompt delivery is detached and not single-flight.** Case openings,
+  decisions, and the sweep may drain the same backlog concurrently.
+  The interface store is idempotent, but duplicate attempts and
+  piled-up timeouts remain an accepted operational limitation of this
+  reference service.
 
 - **Appeals are recorded, not adjudicated.** Filing an appeal logs it
   and notifies; a human then decides via `decide` with `reverse`. The
