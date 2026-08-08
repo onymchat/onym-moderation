@@ -54,16 +54,16 @@ The initial automated decision uses these mappings:
 
 | Onym class | Mistral categories whose scores count |
 |---|---|
-| `csam` | `sexual`, `sexual/minors` |
-| `credible-violence` | `violence_and_threats`, `dangerous_and_criminal_content` |
+| `csam` | `sexual` |
+| `credible-violence` | `violence_and_threats`, `dangerous`, `criminal` |
 | `unsolicited-pornography` | `sexual` |
 
 The highest mapped score across all disclosed items is the case score. These
 mappings are broader than the definitions above. For example, Mistral's
-`sexual` category does not by itself establish that a person is under 18 or
-that explicit material was unsolicited. Nevertheless, under these terms a
-mapped score at or above the ban threshold controls the first decision. The
-definition, context, intent, consent, and any mismatch in the mapping are
+`sexual` category does not identify whether a person is under 18 or whether
+explicit material was unsolicited. Nevertheless, under these terms its score
+controls the first decision for both `csam` and `unsolicited-pornography`. The
+definition, context, age, intent, consent, and any mismatch in the mapping are
 considered by a human only on appeal.
 
 A permanent sanction is valid only with a separate appellate authority named
@@ -108,6 +108,14 @@ Both thresholds are inclusive. The score is the highest score from the mapped
 categories in §2 across all disclosed report items. If the class has no mapped
 category, the model cannot ban under that class.
 
+An assessment is valid only when the model response contains a numeric score
+for **every** category mapped to the case's class. If any mapped category is
+missing, renamed, or non-numeric, the Authority rejects the whole assessment.
+It must not calculate a score from the remaining subset,
+substitute zero, use a similarly named category, or treat the provider's own
+boolean `violated` field as the configured score. Unknown extra categories may
+be recorded but do not affect the case.
+
 The Mistral result determines the first-instance disposition. The Authority's
 software converts it into a signed Onym verdict and sends that verdict to the
 interface. Mistral itself does not hold the Authority signing key and cannot
@@ -139,11 +147,12 @@ make a broad Mistral category a poor match for the narrower Onym class. Agreeing
 to these terms means accepting that risk at the first decision, subject to the
 human appeal right.
 
-An invalid response from the model is an error, not a zero score. If the model
-is unavailable or returns no recognizable scores, the case remains open and is
-retried. If no valid automated decision lands by the decision deadline, the
-case is dismissed. Model failure never becomes a ban and does not route the
-case to pre-verdict human review.
+An invalid response from the model is an error, not a zero score. This includes
+a response missing even one category mapped to the case. If the model is
+unavailable or returns an incomplete or unrecognizable score set, the case
+remains open and is retried. If no valid automated decision lands by the
+decision deadline, the case is dismissed. Model failure never becomes a ban
+and does not route the case to pre-verdict human review.
 
 Mistral states that moderation models and category scores can change. This
 Authority pins the named model and thresholds for these terms. Changing the
