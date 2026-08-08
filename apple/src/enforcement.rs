@@ -295,6 +295,11 @@ impl Engine {
         // to tell that from a forgery.
         if let Some((verdict_ref, _, _)) = bans.last() {
             authorized_by = verdict_ref.clone();
+        } else if let Some((_, verdict_ref)) = open_cases.last() {
+            // With no ban in force, an active case is the reason the
+            // aggregate case-open bit is set. A later dismissal for a
+            // different case must not be named as its authorizer.
+            authorized_by = verdict_ref.clone();
         }
 
         Ok(Some(Intended {
@@ -658,6 +663,7 @@ mod tests {
         let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
         assert!(intended.bits.case_open, "case-csam is still open and still owed its notice");
         assert!(!intended.bits.banned);
+        assert_eq!(intended.authorized_by, "open-csam");
     }
 
     /// And the last one closing does clear it.

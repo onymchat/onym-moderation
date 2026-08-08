@@ -21,6 +21,13 @@ pub enum Error {
     #[error("verdict_invalid: {0}")]
     VerdictInvalid(String),
 
+    /// The verdict is structurally valid but its signed causal time is
+    /// still ahead of this interface's bounded clock-skew allowance.
+    /// Retrying the same bytes later can succeed, so authorities must
+    /// not count this as a permanent refusal.
+    #[error("verdict_not_yet_valid: {0}")]
+    VerdictNotYetValid(String),
+
     /// Contract error `no_mandate` — the verdict references a mandate
     /// this vendor never countersigned.
     #[error("no_mandate")]
@@ -48,6 +55,7 @@ impl Error {
             Error::BadRequest(_) => "bad_request",
             Error::SignatureInvalid(_) => "signature_invalid",
             Error::VerdictInvalid(_) => "verdict_invalid",
+            Error::VerdictNotYetValid(_) => "verdict_not_yet_valid",
             Error::NoMandate => "no_mandate",
             Error::ClassOutsideMandate(_) => "class_outside_mandate",
             Error::MarkWriteFailed(_) => "mark_write_failed",
@@ -61,6 +69,7 @@ impl Error {
             | Error::VerdictInvalid(_)
             | Error::NoMandate
             | Error::ClassOutsideMandate(_) => StatusCode::BAD_REQUEST,
+            Error::VerdictNotYetValid(_) => StatusCode::TOO_EARLY,
             Error::SignatureInvalid(_) => StatusCode::UNAUTHORIZED,
             // The verdict is valid; Apple is unavailable. Retryable.
             Error::MarkWriteFailed(_) => StatusCode::SERVICE_UNAVAILABLE,

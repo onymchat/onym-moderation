@@ -84,7 +84,7 @@ impl Store {
             .map_err(|e| Error::Internal(format!("set WAL: {e}")))?;
         conn.pragma_update(None, "foreign_keys", "ON").ok();
         let store = Self { conn: Mutex::new(conn) };
-        store.migrate()?;
+        store.initialize_schema()?;
         Ok(store)
     }
 
@@ -93,11 +93,14 @@ impl Store {
         let conn = Connection::open_in_memory()
             .map_err(|e| Error::Internal(format!("open in-memory store: {e}")))?;
         let store = Self { conn: Mutex::new(conn) };
-        store.migrate()?;
+        store.initialize_schema()?;
         Ok(store)
     }
 
-    fn migrate(&self) -> Result<(), Error> {
+    /// Initialize the prerelease schema. There are no deployed
+    /// Interface databases yet, so schema changes currently require a
+    /// fresh database rather than carrying unexercised migrations.
+    fn initialize_schema(&self) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             r#"
@@ -152,12 +155,12 @@ impl Store {
                 -- reversal can be committed in order and delivered out
                 -- of it, and folding by arrival let the ban come back
                 -- after the reversal that lifted it.
-                decided_at         TEXT NOT NULL DEFAULT '',
+                decided_at         TEXT NOT NULL,
                 -- Parsed, normalized components of `decided_at`.
                 -- RFC 3339 text is not chronologically sortable when
                 -- offsets or fractional spellings differ.
-                decided_at_seconds INTEGER NOT NULL DEFAULT 0,
-                decided_at_nanos   INTEGER NOT NULL DEFAULT 0
+                decided_at_seconds INTEGER NOT NULL,
+                decided_at_nanos   INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS verdicts_by_device
                 ON verdicts (device_binding);
@@ -177,90 +180,7 @@ impl Store {
             );
             "#,
         )
-        .map_err(|e| Error::Internal(format!("migrate: {e}")))?;
-
-        // `CREATE TABLE IF NOT EXISTS` does nothing to a table that
-        // already exists, so a column added above never reaches a store
-        // opened by an earlier build — and every read selecting it then
-        // fails. On a deployment holding live marks that means coming
-        // back up dead.
-        // One entry today; the list is the shape the next column will
-        // need, and forgetting to build it is how the authority's
-        // stores nearly came back up dead.
-        let added: &[(&str, &str, &str)] = &[
-            ("verdicts", "decided_at", "TEXT NOT NULL DEFAULT ''"),
-            ("verdicts", "decided_at_seconds", "INTEGER NOT NULL DEFAULT 0"),
-            ("verdicts", "decided_at_nanos", "INTEGER NOT NULL DEFAULT 0"),
-        ];
-        for (table, column, definition) in added {
-            Self::add_column(&conn, table, column, definition)?;
-        }
-        Self::backfill_verdict_decision_times(&conn)?;
-        Ok(())
-    }
-
-    /// Add a column, treating "already there" as success. SQLite has no
-    /// `ADD COLUMN IF NOT EXISTS`; the duplicate-column error is the
-    /// check.
-    fn add_column(
-        conn: &Connection,
-        table: &str,
-        column: &str,
-        definition: &str,
-    ) -> Result<(), Error> {
-        match conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), []) {
-            Ok(_) => {
-                tracing::info!(%table, %column, "added column to an existing store");
-                Ok(())
-            }
-            Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
-            Err(e) => Err(Error::Internal(format!("migrate {table}.{column}: {e}"))),
-        }
-    }
-
-    /// Populate the normalized causal key for verdicts written by a
-    /// build that stored only the raw envelope/arrival time. Leaving
-    /// these rows at zero would preserve the delivery ordering this
-    /// migration is meant to replace.
-    fn backfill_verdict_decision_times(conn: &Connection) -> Result<(), Error> {
-        let rows = {
-            let mut statement = conn.prepare(
-                "SELECT verdict_ref, raw FROM verdicts
-                  WHERE decided_at_seconds = 0 AND decided_at_nanos = 0",
-            )?;
-            let mapped = statement.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })?;
-            let mut rows = Vec::new();
-            for row in mapped {
-                rows.push(row?);
-            }
-            rows
-        };
-
-        for (verdict_ref, raw) in rows {
-            let verdict: crate::types::Verdict = serde_json::from_slice(&raw).map_err(|e| {
-                Error::Internal(format!(
-                    "migrate verdict {verdict_ref}: stored envelope is malformed: {e}"
-                ))
-            })?;
-            let decided_at = util::parse_timestamp(&verdict.decided_at).map_err(|e| {
-                Error::Internal(format!(
-                    "migrate verdict {verdict_ref}: decidedAt cannot be ordered: {e}"
-                ))
-            })?;
-            conn.execute(
-                "UPDATE verdicts
-                    SET decided_at = ?2, decided_at_seconds = ?3, decided_at_nanos = ?4
-                  WHERE verdict_ref = ?1",
-                params![
-                    verdict_ref,
-                    verdict.decided_at,
-                    decided_at.unix_timestamp(),
-                    i64::from(decided_at.nanosecond()),
-                ],
-            )?;
-        }
+        .map_err(|e| Error::Internal(format!("initialize schema: {e}")))?;
         Ok(())
     }
 
@@ -644,65 +564,6 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn migration_backfills_normalized_decision_time_from_signed_bytes() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE verdicts (
-                verdict_ref TEXT PRIMARY KEY,
-                case_id TEXT NOT NULL,
-                mandate_ref TEXT NOT NULL,
-                device_binding TEXT NOT NULL,
-                disposition TEXT NOT NULL,
-                ban_expires TEXT,
-                execute_after TEXT,
-                executed INTEGER NOT NULL DEFAULT 0,
-                superseded INTEGER NOT NULL DEFAULT 0,
-                raw BLOB NOT NULL,
-                received_at TEXT NOT NULL
-             );",
-        )
-        .unwrap();
-        let raw = serde_json::to_vec(&serde_json::json!({
-            "verdictVersion": 1,
-            "caseId": "c1",
-            "authority": "onym:component:a",
-            "mandateRef": "m1",
-            "accusedKeys": ["onym:key:user"],
-            "deviceBinding": "d1",
-            "classId": "csam",
-            "disposition": "dismiss",
-            "marks": { "case-open": false, "banned": false },
-            "reasoning": "sha256:reason",
-            "decidedAt": "2026-08-08T09:00:00-05:00",
-            "signature": "sig",
-            "final": true
-        }))
-        .unwrap();
-        conn.execute(
-            "INSERT INTO verdicts
-             (verdict_ref, case_id, mandate_ref, device_binding, disposition, raw, received_at)
-             VALUES ('v1', 'c1', 'm1', 'd1', 'dismiss', ?1, '2026-08-09T00:00:00Z')",
-            params![raw],
-        )
-        .unwrap();
-
-        let store = Store { conn: Mutex::new(conn) };
-        store.migrate().unwrap();
-        let conn = store.conn.lock().unwrap();
-        let (seconds, nanos): (i64, i64) = conn
-            .query_row(
-                "SELECT decided_at_seconds, decided_at_nanos
-                   FROM verdicts WHERE verdict_ref = 'v1'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        let expected = util::parse_timestamp("2026-08-08T14:00:00Z").unwrap();
-        assert_eq!(seconds, expected.unix_timestamp());
-        assert_eq!(nanos, i64::from(expected.nanosecond()));
-    }
 
     #[test]
     fn enrollment_is_stable_per_identity() {

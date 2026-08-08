@@ -72,7 +72,7 @@ pub fn validate(input: ValidationInput<'_>) -> Result<Outcome, Error> {
     let decided_at = util::parse_timestamp(&v.decided_at)
         .map_err(|e| Error::VerdictInvalid(format!("decidedAt: {e}")))?;
     if decided_at > input.now + time::Duration::seconds(MAX_DECISION_CLOCK_SKEW_SECONDS) {
-        return Err(Error::VerdictInvalid(
+        return Err(Error::VerdictNotYetValid(
             "decidedAt is too far in the future".into(),
         ));
     }
@@ -416,7 +416,7 @@ mod tests {
             );
             let future = validate_with(&v, &class("P90D", "suspensive"), now)
                 .expect_err("a future causal key must be refused");
-            assert!(future.to_string().contains("decidedAt"));
+            assert!(matches!(future, Error::VerdictNotYetValid(_)));
         }
     }
 

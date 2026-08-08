@@ -322,6 +322,7 @@ mod tests {
         assert!(matches!(classify(401, "signature_invalid"), Attempt::Retry(_)));
         assert!(matches!(classify(429, "rate_limited"), Attempt::Retry(_)));
         assert!(matches!(classify(400, "no_mandate"), Attempt::Retry(_)));
+        assert!(matches!(classify(425, "verdict_not_yet_valid"), Attempt::Retry(_)));
         assert!(matches!(classify(404, "not_found"), Attempt::Retry(_)));
         assert!(matches!(classify(500, "internal_error"), Attempt::Retry(_)));
     }
