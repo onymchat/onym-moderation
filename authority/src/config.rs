@@ -129,6 +129,32 @@ impl TriageConfig {
                     ));
                 }
                 profile.profile_digest = computed;
+
+                // Thresholds are consented policy, and a profile whose
+                // band is inverted or collapsed has no state in which
+                // it declines to decide — the band is the model's way
+                // of saying "ask a person", and without it every
+                // reading becomes a verdict. Published profiles are
+                // checked by construction; a supplied one is checked
+                // here.
+                if let crate::profiles::Adapter::FirstTokenScore {
+                    ban_at, dismiss_at, ..
+                } = profile.adapter
+                {
+                    if !(0.0..=1.0).contains(&ban_at) || !(0.0..=1.0).contains(&dismiss_at) {
+                        return Err(format!(
+                            "{path}: banAt and dismissAt must each be between 0 and 1 (got \
+                             {ban_at} and {dismiss_at})"
+                        ));
+                    }
+                    if dismiss_at >= ban_at {
+                        return Err(format!(
+                            "{path}: dismissAt {dismiss_at} is not below banAt {ban_at}, so there \
+                             is no band in which this profile declines to decide. That band is \
+                             what sends a case to a human instead of to a verdict."
+                        ));
+                    }
+                }
                 profile
             }
             (None, None) => {
@@ -286,15 +312,27 @@ impl Config {
                 None => true,
             };
         }
-        let Some(octets) = Self::ipv4_octets(host) else {
-            return false;
-        };
-        match octets {
-            [127, _, _, _] => true,
-            [10, _, _, _] => true,
-            [192, 168, _, _] => true,
-            [172, second, _, _] => (16..=31).contains(&second),
-            _ => false,
+        // A dotted *literal* is judged by its octets.
+        if let Some(octets) = Self::ipv4_octets(host) {
+            return match octets {
+                [127, _, _, _] => true,
+                [10, _, _, _] => true,
+                [192, 168, _, _] => true,
+                [172, second, _, _] => (16..=31).contains(&second),
+                _ => false,
+            };
+        }
+
+        // A dotted *name* is resolved, like a dotless one. Rejecting
+        // every dotted non-literal made `host.docker.internal` and
+        // `model.svc.cluster.local` hard boot failures even when they
+        // resolve to loopback — and a check that refuses correct
+        // deployments is a check operators route around, which costs
+        // more than it protects.
+        match Self::resolve(host) {
+            Some(addresses) => addresses.iter().all(Self::is_local_ip),
+            // Unresolvable and dotted: nothing says it is on this host.
+            None => false,
         }
     }
 
@@ -423,6 +461,60 @@ mod tests {
             !Config::is_local_host(Config::host_of("http://[2001:db8::1]:8000/v1")),
             "a routable IPv6 address is not this host"
         );
+    }
+
+    /// A dotted name that resolves to a private address is on this
+    /// host. Rejecting every dotted non-literal made
+    /// `host.docker.internal` a hard boot failure, and a check that
+    /// refuses correct deployments is one operators route around.
+    #[test]
+    fn a_dotted_name_is_judged_by_what_it_resolves_to() {
+        // `localhost.` and similar resolve to loopback on any sane
+        // resolver; if this environment cannot resolve it, the
+        // assertion below is skipped rather than made flaky.
+        if let Some(addresses) = Config::resolve("localhost") {
+            assert!(addresses.iter().all(Config::is_local_ip));
+        }
+        // A dotted literal is still judged by its octets, with no
+        // lookup at all.
+        assert!(Config::is_local_host("10.0.0.1"));
+        assert!(!Config::is_local_host("172.2.3.4"));
+        // And a name that resolves nowhere is not assumed local.
+        assert!(!Config::is_local_host("no-such-host.invalid"));
+    }
+
+    /// A profile whose band is inverted or collapsed has no state in
+    /// which it declines to decide, and that band is what sends a case
+    /// to a person instead of to a verdict.
+    #[test]
+    fn a_custom_profile_needs_a_band_to_decline_in() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("onym-profile-{}.json", std::process::id()));
+        let body = |ban: f64, dismiss: f64| {
+            format!(
+                r#"{{"id":"house","displayName":"House","profileDigest":"","policyDigest":"p",
+                    "repository":"o/r","revision":"r","servedModel":"m","supportsImages":false,
+                    "maxInputTokens":8192,"nativeTaxonomy":false,
+                    "prompt":{{"user":"{{document}}","usesCanonicalRule":true}},
+                    "adapter":{{"kind":"firstTokenScore","positive":["yes"],"negative":["no"],
+                                "banAt":{ban},"dismissAt":{dismiss}}}}}"#
+            )
+        };
+
+        std::fs::write(&path, body(0.2, 0.9)).unwrap();
+        std::env::set_var("AUTHORITY_TRIAGE_MODE", "advisory");
+        std::env::set_var("AUTHORITY_TRIAGE_PROFILE_PATH", path.to_str().unwrap());
+        std::env::remove_var("AUTHORITY_TRIAGE_PROFILE");
+        let inverted = TriageConfig::from_env();
+        assert!(inverted.is_err(), "an inverted band must be refused: {inverted:?}");
+
+        std::fs::write(&path, body(0.9, 0.2)).unwrap();
+        let valid = TriageConfig::from_env();
+        assert!(valid.is_ok(), "and a real one accepted: {:?}", valid.err());
+
+        std::env::remove_var("AUTHORITY_TRIAGE_MODE");
+        std::env::remove_var("AUTHORITY_TRIAGE_PROFILE_PATH");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

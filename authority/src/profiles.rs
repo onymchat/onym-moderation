@@ -93,6 +93,7 @@ pub struct PromptTemplate {
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum TaxonomyShape {
     /// `Safety: Unsafe` / `Categories: A, B` on labelled lines.
+    #[serde(rename_all = "camelCase")]
     LabelledFields { safety_field: String, categories_field: String },
     /// A bare verdict on the first line, codes on the lines after —
     /// `unsafe\nS4`.
@@ -107,6 +108,7 @@ pub enum Adapter {
     /// two token families, into a violation score. Thresholds are
     /// inclusive at both ends, and the band between them is a refusal
     /// to decide rather than a lean either way.
+    #[serde(rename_all = "camelCase")]
     FirstTokenScore {
         /// Accepted spellings meaning "violates" — the greatest log
         /// probability among them is used.
@@ -122,8 +124,10 @@ pub enum Adapter {
         reject_extra_output: bool,
     },
     /// The final output must be exactly one of two strings.
+    #[serde(rename_all = "camelCase")]
     ExactOutput { ban: String, dismiss: String },
     /// A labelled line, read after any closed reasoning block.
+    #[serde(rename_all = "camelCase")]
     LabelLine {
         field: String,
         ban: String,
@@ -136,6 +140,7 @@ pub enum Adapter {
     /// The model's own taxonomy. Only the code mapped to the case's
     /// class counts — a model's opinion about conduct nobody consented
     /// to have judged does not expand the mandate.
+    #[serde(rename_all = "camelCase")]
     NativeTaxonomy {
         shape: TaxonomyShape,
         unsafe_label: String,
@@ -1394,6 +1399,35 @@ mod tests {
 
         let body = profile.request_body("csam", "doc").unwrap();
         assert!(body["messages"][0]["content"].as_str().unwrap().contains("R-CSAM"));
+    }
+
+    /// The README documents custom profiles in camelCase, and every
+    /// adapter kind has to accept that. `rename_all` on the enum
+    /// renames its *variants*, not their fields, so a scoring profile
+    /// written as documented would not deserialize at all — and a test
+    /// asserting the threshold check would then pass for the wrong
+    /// reason, which is how this surfaced.
+    #[test]
+    fn every_adapter_kind_deserializes_the_documented_wire_shape() {
+        let adapters = [
+            r#"{"kind":"firstTokenScore","positive":["yes"],"negative":["no"],
+                "banAt":0.9,"dismissAt":0.2,"rejectExtraOutput":true}"#,
+            r#"{"kind":"exactOutput","ban":"1","dismiss":"0"}"#,
+            r#"{"kind":"labelLine","field":"User Safety","ban":"unsafe","dismiss":"safe",
+                "requireClosedReasoning":true}"#,
+            r#"{"kind":"nativeTaxonomy","shape":{"kind":"labelThenCodes"},
+                "unsafeLabel":"unsafe","safeLabel":"safe","requiredCode":{"csam":"S4"},
+                "knownCodes":["S4"]}"#,
+            r#"{"kind":"nativeTaxonomy",
+                "shape":{"kind":"labelledFields","safetyField":"Safety",
+                         "categoriesField":"Categories"},
+                "unsafeLabel":"Unsafe","safeLabel":"Safe","emptyCategories":"None",
+                "requiredCode":{"csam":"Sexual"},"knownCodes":["Sexual","None"]}"#,
+        ];
+        for adapter in adapters {
+            serde_json::from_str::<Adapter>(adapter)
+                .unwrap_or_else(|e| panic!("{adapter} did not deserialize: {e}"));
+        }
     }
 
     #[test]

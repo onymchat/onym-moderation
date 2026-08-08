@@ -487,22 +487,6 @@ fn require_manifest_current(state: &AppState, action: &str) -> Result<(), Error>
     Ok(())
 }
 
-/// Push the delivery backlog without making the caller wait for it.
-///
-/// `flush` drains the *whole* queue at fifteen seconds a verdict, so
-/// running it inline meant filing a report took time proportional to
-/// the backlog whenever the interface was down — and every request
-/// re-attempted every stuck verdict, inflating their counts. The sweep
-/// flushes on its own schedule; this only makes a fresh verdict leave
-/// promptly when the interface is healthy.
-fn flush_soon(state: &Arc<AppState>) {
-    let state = Arc::clone(state);
-    tokio::spawn(async move {
-        if let Err(e) = state.delivery.flush(&state.store).await {
-            tracing::warn!(error = %e, "background verdict delivery failed; the sweep will retry");
-        }
-    });
-}
 
 fn report_evidence_summary(report: &Report) -> Result<String, Error> {
     let evidence = serde_json::to_vec(&report.evidence)
@@ -642,7 +626,7 @@ fn join_case(
                 .into(),
         ));
     }
-    flush_soon(state);
+    crate::delivery::flush_soon(state);
     Ok(revised)
 }
 
@@ -942,9 +926,15 @@ async fn appeal(
     let stamp = util::format_timestamp(OffsetDateTime::now_utc());
     match case.appeal_state.as_str() {
         "none" => {
+            // Conditioned on `none`: the case read and this write are
+            // separate lock acquisitions, so concurrent first filings
+            // could each take this unbounded arm and overrun the cap
+            // the "pending" arm enforces. Only one can win now; the
+            // rest fall through to the bounded path on retry.
             state.store.set_appeal_state(
                 &case_id,
                 "pending",
+                Some("none"),
                 &stamp,
                 "appeal_filed",
                 &submission.statement,
@@ -1060,6 +1050,26 @@ async fn query_status(
                             let cleaned =
                                 crate::casedoc::withhold_quoted_context(note, &contexts);
                             object.insert("note".into(), Value::String(cleaned));
+                        }
+                        // And the labels. For a taxonomy read line by
+                        // line, *every line after the first* becomes a
+                        // label — and on the unknown-code path the
+                        // whole unreadable list is kept — so a model
+                        // emitting `unsafe` followed by the reporter's
+                        // account put it straight into the accused's
+                        // copy, through the one field the redaction
+                        // did not cover.
+                        if let Some(labels) = object.get("labels").and_then(Value::as_array) {
+                            let cleaned: Vec<Value> = labels
+                                .iter()
+                                .map(|label| match label.as_str() {
+                                    Some(text) => Value::String(
+                                        crate::casedoc::withhold_quoted_context(text, &contexts),
+                                    ),
+                                    None => label.clone(),
+                                })
+                                .collect();
+                            object.insert("labels".into(), Value::Array(cleaned));
                         }
                     }
                 }
@@ -2837,7 +2847,7 @@ mod tests {
         harness
             .state
             .store
-            .set_appeal_state(&case_id, "upheld", "2026-08-09T00:00:00Z", "appeal_upheld", "hash:r")
+            .set_appeal_state(&case_id, "upheld", None, "2026-08-09T00:00:00Z", "appeal_upheld", "hash:r")
             .unwrap();
 
         // Re-filing must not put it back in the queue.
@@ -3142,7 +3152,7 @@ mod tests {
         harness
             .state
             .store
-            .set_appeal_state(&case_id, "upheld", "2026-08-09T00:00:00Z", "appeal_upheld", "hash:r")
+            .set_appeal_state(&case_id, "upheld", None, "2026-08-09T00:00:00Z", "appeal_upheld", "hash:r")
             .unwrap();
         let (status, _) =
             harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal("let me try again")).await;
@@ -3220,6 +3230,116 @@ mod tests {
             )
             .await;
         assert!(panel["assessment"]["rawOutput"].as_str().unwrap().contains("asked him to stop"));
+    }
+
+
+    /// `labels` was the one field the redaction did not cover. For a
+    /// taxonomy read line by line every line after the first becomes a
+    /// label — and on the unknown-code path the whole unreadable list
+    /// is kept — so a model emitting `unsafe` followed by the
+    /// reporter's account put it straight into the accused's copy.
+    #[tokio::test]
+    async fn labels_cannot_carry_the_reporters_account_to_the_accused() {
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+
+        let account = "he sent it right after I asked him to stop";
+        let mut report = report_json(&reporter_mandate, "r-1");
+        report["evidence"][0]["context"] = json!(account);
+        let (status, response) =
+            harness.post("/v1/reports", signed(report, "signature", &[REPORTER_SEED])).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let case_id = response["caseId"].as_str().unwrap().to_string();
+
+        let case = harness.state.store.case(&case_id).unwrap().unwrap();
+        let document = crate::casedoc::build(&harness.state.store, &case).unwrap();
+        let assessment = json!({
+            "outcome": "no-decision",
+            "rawOutput": "unsafe",
+            "note": "an output containing a code nobody can interpret is not an answer",
+            "labels": [account, "S4"],
+        });
+        harness
+            .state
+            .store
+            .put_assessment(
+                &case_id,
+                &serde_json::to_vec(&assessment).unwrap(),
+                "no-decision",
+                &document.text,
+                true,
+            )
+            .unwrap();
+
+        let (status, view) =
+            harness.send(party_status_request(&case_id, ACCUSED_SEED)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !view.to_string().contains("asked him to stop"),
+            "the account leaked through labels: {view}"
+        );
+        let labels = view["assessment"]["labels"].as_array().unwrap();
+        assert!(labels.iter().any(|l| l.as_str() == Some("S4")), "real codes survive: {labels:?}");
+
+        // The moderator reviewing the appeal still sees all of it.
+        let (_, panel) = harness
+            .send(
+                Request::get(format!("/v1/cases/{case_id}/status"))
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert!(panel["assessment"]["labels"].to_string().contains("asked him to stop"));
+    }
+
+    /// The read and the write are separate lock acquisitions, so
+    /// concurrent first filings could each take the unbounded arm and
+    /// overrun the cap the "pending" arm enforces. The state move is
+    /// conditioned on `none`, so only one can win.
+    #[tokio::test]
+    async fn concurrent_first_appeals_cannot_overrun_the_cap() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        let appeal = |n: usize| {
+            signed(
+                json!({"caseId": case_id, "kind": "appeal", "statement": format!("filing {n}")}),
+                "signature",
+                &[ACCUSED_SEED],
+            )
+        };
+        let path = format!("/v1/cases/{case_id}/appeal");
+        let (a, b, c) = tokio::join!(
+            harness.post(&path, appeal(1)),
+            harness.post(&path, appeal(2)),
+            harness.post(&path, appeal(3)),
+        );
+        for (status, body) in [a, b, c] {
+            assert!(
+                status == StatusCode::OK || status == StatusCode::CONFLICT,
+                "unexpected {status}: {body}"
+            );
+        }
+
+        let filings = harness
+            .state
+            .store
+            .events(&case_id)
+            .unwrap()
+            .iter()
+            .filter(|(_, kind, _)| kind == "appeal_filed")
+            .count();
+        assert!(filings <= MAX_APPEALS_PER_CASE, "{filings} filings exceeded the cap");
+        assert_eq!(
+            harness.state.store.case(&case_id).unwrap().unwrap().appeal_state,
+            "pending"
+        );
     }
 
 }

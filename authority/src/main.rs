@@ -182,6 +182,37 @@ async fn main() {
             ),
         }
 
+        // A native taxonomy decides by the model's own categories, and
+        // the published profiles say plainly that those categories do
+        // not establish the elements of the narrower rule — Qwen's
+        // `Sexual Content or Sexual Acts` does not establish that
+        // anyone is under 18. That mismatch is meant to be caught by a
+        // human on appeal. Wire it to a class whose ban is permanent,
+        // in autonomous mode, and the first human to look at the case
+        // is looking at a permanent ban that was issued on a category
+        // admittedly unable to prove the offence.
+        if triage.profile.native_taxonomy && triage.mode == crate::config::TriageMode::Autonomous {
+            let permanent: Vec<&str> = state
+                .config
+                .manifest
+                .violation_classes
+                .iter()
+                .filter(|class| class.ban_term == "permanent")
+                .map(|class| class.class_id.as_str())
+                .collect();
+            if !permanent.is_empty() {
+                tracing::error!(
+                    profile = %triage.profile.id,
+                    classes = %permanent.join(", "),
+                    "this profile decides by the model's own categories, which its published \
+                     terms say do not establish the narrower rule's elements — and these classes \
+                     carry a permanent ban with no human before the verdict. Prefer a profile \
+                     that applies the canonical rule for permanent-term classes, or run in \
+                     advisory mode."
+                );
+            }
+        }
+
         // A class the profile cannot decide is not fatal — those cases
         // wait for a human and dismiss at their deadline — but the
         // symptom is "the classifier has gone quiet", which is a bad

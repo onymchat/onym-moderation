@@ -505,6 +505,11 @@ async fn review(
                 state.store.set_new_holder_state(
                     &case_id,
                     "refused",
+                    // The state this review was decided against. Two
+                    // moderators opening the same case would otherwise
+                    // both pass the pending check and both record a
+                    // review of it.
+                    Some("pending"),
                     &stamp,
                     "new_holder_claim_refused",
                     &form.reasoning,
@@ -513,6 +518,7 @@ async fn review(
                 state.store.set_appeal_state(
                     &case_id,
                     "upheld",
+                    Some("pending"),
                     &stamp,
                     "appeal_upheld",
                     &form.reasoning,
@@ -974,6 +980,44 @@ mod tests {
         assert!(
             !events.iter().any(|(_, kind, _)| kind == "appeal_reversed"),
             "an appeal nobody read must not be recorded as reversed"
+        );
+    }
+
+
+    /// Two moderators opening the same case both pass the "is it
+    /// pending?" check; the write must not let both record a review.
+    #[tokio::test]
+    async fn only_one_moderator_can_record_a_review_of_the_same_claim() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        state.store.put_case(&reviewable_case_with(Some("ban"), "pending", "none")).unwrap();
+
+        let uphold = || {
+            review(
+                State(state.clone()),
+                Path("c1".to_string()),
+                signed_in(&state),
+                Form(ReviewForm {
+                    outcome: "uphold".into(),
+                    reasoning: "hash:reviewed".into(),
+                    subject: "appeal".into(),
+                }),
+            )
+        };
+        uphold().await.unwrap();
+        let second = uphold().await;
+
+        assert!(second.is_err(), "the second review must not land on an answered appeal");
+        assert_eq!(state.store.case("c1").unwrap().unwrap().appeal_state, "upheld");
+        assert_eq!(
+            state
+                .store
+                .events("c1")
+                .unwrap()
+                .iter()
+                .filter(|(_, kind, _)| kind == "appeal_upheld")
+                .count(),
+            1,
+            "one review, one record of it"
         );
     }
 

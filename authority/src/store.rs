@@ -19,6 +19,19 @@ pub struct Store {
 /// One filed response: the material, when it arrived, and how many the
 /// case will hold. Grouped so the storage bound travels with the thing
 /// it bounds rather than as a trailing argument.
+/// One move of a case's claim state, and the log line that records
+/// why. `expect` is the state the caller read before deciding to make
+/// it — asserted by the write, because the read that justified the
+/// move happened under a different lock.
+pub struct CaseStateMove<'a> {
+    pub case_id: &'a str,
+    pub value: &'a str,
+    pub expect: Option<&'a str>,
+    pub at: &'a str,
+    pub event_kind: &'a str,
+    pub event_detail: &'a str,
+}
+
 pub struct ResponseFiling<'a> {
     pub case: &'a CaseRecord,
     pub raw: &'a [u8],
@@ -792,41 +805,60 @@ impl Store {
         &self,
         case_id: &str,
         value: &str,
+        expect: Option<&str>,
         at: &str,
         event_kind: &str,
         event_detail: &str,
     ) -> Result<(), Error> {
-        self.set_case_field("new_holder_state", case_id, value, at, event_kind, event_detail)
+        self.set_case_field(
+            "new_holder_state",
+            CaseStateMove { case_id, value, expect, at, event_kind, event_detail },
+        )
     }
 
     pub fn set_appeal_state(
         &self,
         case_id: &str,
         appeal_state: &str,
+        expect: Option<&str>,
         at: &str,
         event_kind: &str,
         event_detail: &str,
     ) -> Result<(), Error> {
-        self.set_case_field("appeal_state", case_id, appeal_state, at, event_kind, event_detail)
+        self.set_case_field(
+            "appeal_state",
+            CaseStateMove {
+                case_id,
+                value: appeal_state,
+                expect,
+                at,
+                event_kind,
+                event_detail,
+            },
+        )
     }
 
-    fn set_case_field(
-        &self,
-        column: &str,
-        case_id: &str,
-        value: &str,
-        at: &str,
-        event_kind: &str,
-        event_detail: &str,
-    ) -> Result<(), Error> {
+    /// `expect` is the state the caller read before deciding to make
+    /// this move. The read and the write are separate lock
+    /// acquisitions, so without it two moderators could both pass the
+    /// "is it pending?" check and both record a review of the same
+    /// claim — and, on the filing path, concurrent appeals could each
+    /// take the unbounded first-filing arm.
+    fn set_case_field(&self, column: &str, move_: CaseStateMove<'_>) -> Result<(), Error> {
+        let CaseStateMove { case_id, value, expect, at, event_kind, event_detail } = move_;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let changed = tx.execute(
-            &format!("UPDATE cases SET {column} = ?2 WHERE case_id = ?1"),
-            params![case_id, value],
+            &format!(
+                "UPDATE cases SET {column} = ?2 WHERE case_id = ?1 AND (?3 IS NULL OR {column} = ?3)"
+            ),
+            params![case_id, value, expect],
         )?;
         if changed == 0 {
-            return Err(Error::NotFound(format!("case {case_id}")));
+            return Err(Error::CaseState(format!(
+                "case {case_id} is not in the state this change was decided against; someone \
+                 else moved it first"
+            )));
         }
         tx.execute(
             "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
@@ -2187,6 +2219,40 @@ mod tests {
             extra_event: None,
         });
         assert!(matches!(result, Err(Error::CaseState(_))), "a dismissal is not a ban to reverse");
+    }
+
+
+    /// The handler reads the case, decides the claim is pending, and
+    /// then writes — two lock acquisitions. Two moderators can both
+    /// pass that read, so the write itself has to assert the state it
+    /// was decided against.
+    #[test]
+    fn a_state_move_is_refused_when_the_state_already_moved() {
+        let store = Store::in_memory().unwrap();
+        let mut case = sample_case("c1");
+        case.appeal_state = "pending".into();
+        store.put_case(&case).unwrap();
+
+        store
+            .set_appeal_state("c1", "upheld", Some("pending"), "t1", "appeal_upheld", "hash:a")
+            .unwrap();
+
+        // A second reviewer, holding the same read.
+        let second =
+            store.set_appeal_state("c1", "reversed", Some("pending"), "t2", "appeal_reversed", "hash:b");
+        assert!(matches!(second, Err(Error::CaseState(_))), "{second:?}");
+
+        assert_eq!(store.case("c1").unwrap().unwrap().appeal_state, "upheld");
+        assert_eq!(
+            store
+                .events("c1")
+                .unwrap()
+                .iter()
+                .filter(|(_, kind, _)| kind.starts_with("appeal_"))
+                .count(),
+            1,
+            "one review, one record — the losing one leaves no trace"
+        );
     }
 
 }
