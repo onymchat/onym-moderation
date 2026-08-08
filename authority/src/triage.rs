@@ -759,6 +759,9 @@ mod tests {
             new_holder_state: "none".into(),
         };
         store.put_case(&case).unwrap();
+        // Notice served: a ban — automated or not — requires the
+        // opening verdict to have reached the interface.
+        store.put_delivered_open_case_verdict(&case.case_id, "v-open").unwrap();
         let report = serde_json::json!({
             "reportVersion": 1, "reportId": "r1", "reporter": "onym:key:rep",
             "reporterMandate": "m0", "accused": "onym:key:acc", "classId": class_id,
@@ -1318,6 +1321,45 @@ mod tests {
         // ...and none of the reasoning was kept.
         assert!(!assessment.raw_output.contains("blocked him"), "{}", assessment.raw_output);
         assert!(assessment.raw_output.contains("User Safety: unsafe"));
+    }
+
+
+    /// The notice guard #2 added to `/decide` reaches autonomous triage
+    /// too, because every decider goes through `decisions::apply`.
+    /// This is the caller most likely to hit it: the model can reach a
+    /// verdict while the opening verdict is still queued for delivery,
+    /// and banning then would have run the accused's response window
+    /// against a case nobody told them about.
+    #[tokio::test]
+    async fn triage_will_not_ban_before_the_notice_has_been_delivered() {
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Violent"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        let case = open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+        // Undo the fixture's served notice: the opening verdict exists
+        // but has not reached the interface.
+        store.undeliver_open_case_verdict(&case.case_id).unwrap();
+
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let after = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(after.stage, "open", "no ban before the accused has been told");
+        assert!(after.disposition.is_none());
+        // The assessment stands — the model did its part; only the
+        // sanction waits.
+        let (raw, applied) = state.store.assessment("c1").unwrap().unwrap();
+        assert!(!applied);
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(assessment.outcome, "ban");
     }
 
 }

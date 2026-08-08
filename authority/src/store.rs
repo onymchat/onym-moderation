@@ -708,6 +708,39 @@ impl Store {
 
     // ─── Cases ───────────────────────────────────────────────────────
 
+    /// Test-only: record an opening verdict for a case that already
+    /// exists, and mark it delivered. In the service the two happen
+    /// together in `open_case_atomically` and the delivery sweep; a
+    /// fixture that builds a case row directly still needs a served
+    /// notice, because a ban now requires one.
+    #[cfg(test)]
+    pub fn put_delivered_open_case_verdict(
+        &self,
+        case_id: &str,
+        verdict_ref: &str,
+    ) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO verdicts
+             (verdict_ref, case_id, disposition, raw, issued_at, delivered)
+             VALUES (?1, ?2, 'open-case', ?3, '2026-08-01T00:00:00Z', 1)",
+            params![verdict_ref, case_id, b"{}".as_slice()],
+        )?;
+        Ok(())
+    }
+
+    /// Test-only: put a case's opening verdict back in the queue, for
+    /// exercising the "not yet served" path.
+    #[cfg(test)]
+    pub fn undeliver_open_case_verdict(&self, case_id: &str) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE verdicts SET delivered = 0 WHERE case_id = ?1 AND disposition = 'open-case'",
+            params![case_id],
+        )?;
+        Ok(())
+    }
+
     /// Test-only, and deliberately so. In the service every case-row
     /// change is a conditional `UPDATE` of the columns that change:
     /// writing a whole row back from a record read before the lock is

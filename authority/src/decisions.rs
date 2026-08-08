@@ -127,7 +127,12 @@ async fn apply_inner(
         }
         Disposition::Ban => {
             require_open(&case)?;
+            // Deadline first: a case past it is already dismissed by
+            // default, and saying "notice has not been delivered"
+            // about a case that is over would be a refusal for the
+            // wrong reason.
             require_decision_deadline_not_passed(&case, now)?;
+            require_notice_delivered(state, case_id)?;
             require_response_window_closed(&case, now)?;
             // The terms come from the manifest the accused's mandate
             // pinned. Republishing with a longer ban term must not
@@ -264,6 +269,28 @@ fn consented_manifest(
     }
 }
 
+/// Notice must actually have reached the interface before a sanction.
+///
+/// The opening verdict is what the accused is served with; until it
+/// has been delivered, their response window has been running against
+/// a case nobody told them about. Holding the window is not the same
+/// as holding it *visibly*, and a ban at the end of a silent window is
+/// a ban without notice however carefully the clock was kept.
+///
+/// This sits in the shared decision path, so autonomous triage inherits
+/// it — the caller most likely to reach a verdict while delivery is
+/// still queued.
+fn require_notice_delivered(state: &AppState, case_id: &str) -> Result<(), Error> {
+    if !state.store.open_case_verdict_delivered(case_id)? {
+        return Err(Error::CaseState(
+            "the opening verdict has not reached the interface; banning before notice would run \
+             the response window silently"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Once the decision deadline passes the case is dismissed by default
 /// (§3.5), whether or not the sweep has run yet. Without this a
 /// moderator — or a classifier — could ban a case the contract had
@@ -359,11 +386,18 @@ mod tests {
         assert!(matches!(result, Err(Error::CaseState(_))));
     }
 
+    /// A case whose accused was actually served: the opening verdict
+    /// exists and reached the interface, which is what a ban requires.
+    fn notice_served(state: &AppState, case_id: &str) {
+        state.store.put_delivered_open_case_verdict(case_id, "v-open").unwrap();
+    }
+
     #[tokio::test]
     async fn a_ban_after_the_window_is_allowed() {
         let state = std::sync::Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
         state.store.put_case(&case(false, "2026-08-05T00:00:00Z")).unwrap();
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+        notice_served(&state, "c1");
 
         apply(&state, "c1", Disposition::Ban, "hash:why", Decider::Human, now).await.unwrap();
         assert_eq!(state.store.case("c1").unwrap().unwrap().disposition.as_deref(), Some("ban"));
@@ -428,6 +462,7 @@ mod tests {
         let state = std::sync::Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
         state.store.put_case(&case(false, "2026-08-05T00:00:00Z")).unwrap();
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+        notice_served(&state, "c1");
 
         apply(&state, "c1", Disposition::Ban, "hash:why", Decider::HumanAssisted, now)
             .await

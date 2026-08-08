@@ -393,6 +393,7 @@ mod tests {
                 "2026-08-03T00:00:00Z",
                 "response",
                 "it was a quotation",
+                32,
             )
             .unwrap();
 
