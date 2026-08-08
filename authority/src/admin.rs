@@ -333,51 +333,78 @@ fn assessment_section(state: &AppState, case_id: &str) -> String {
 }
 
 fn review_form(case: &CaseRecord) -> String {
-    // Reversal is only meaningful against a ban; upholding is only
-    // meaningful while something is pending.
+    // Two claims, two controls. An appeal says the verdict was wrong; a
+    // new-holder claim says the device changed hands and the mark is
+    // punishing someone the case was never about. They are filed by
+    // different people — the second by anyone who knows the case id —
+    // and one pair of buttons could only ever answer one of them,
+    // which left the other pending forever with the page describing
+    // the wrong claim.
     let can_reverse = case.disposition.as_deref() == Some("ban");
-    let new_holder = case.new_holder_state == "pending";
     let appeal_pending = case.appeal_state == "pending";
-    let anything_pending = appeal_pending || new_holder;
+    let claim_pending = case.new_holder_state == "pending";
 
     let mut out = String::from("<h2>Review</h2>");
-    if new_holder {
-        // Said plainly, because it changes what the reviewer is being
-        // asked. A new-holder claim does not say the verdict was
-        // wrong; it says the device changed hands, and the mark is now
-        // punishing someone the case was never about.
+    if !appeal_pending && !claim_pending && !can_reverse {
         out.push_str(
-            "<p><strong>This is a new-holder claim, not an appeal.</strong> The claim is not \
-             that the verdict was wrong — it is that this device has a different owner now, \
-             and the mark is punishing them. Reversing clears the marks; refusing leaves them \
-             in force against hardware whose holder may have changed.</p>",
-        );
-    }
-    if !anything_pending && !can_reverse {
-        out.push_str(
-            "<p class=empty>No appeal is pending and there is no ban to reverse, so there is \
+            "<p class=empty>Nothing is pending and there is no ban to reverse, so there is \
              nothing for a reviewer to do here.</p>",
         );
         return out;
     }
 
-    out.push_str(&format!(
-        "<form method=post action=\"/admin/cases/{id}/review\">\
-         <label>Reasoning — a content address of your findings against the consented class \
-         definition, not a sentence.<br>\
-         <input name=reasoning size=70 placeholder=\"sha256:… or https://…\" required></label><br>",
-        id = escape(&case.case_id)
-    ));
-    if anything_pending {
+    let reasoning_field = "<label>Reasoning — a content address of your findings against the \
+         consented class definition, not a sentence.<br>\
+         <input name=reasoning size=70 placeholder=\"sha256:… or https://…\" required></label><br>";
+
+    if appeal_pending {
         out.push_str(&format!(
-            "<button name=outcome value=uphold class=secondary>{}</button> ",
-            if new_holder { "Refuse the claim — marks stay" } else { "Uphold the verdict" }
+            "<h3>Appeal</h3>\
+             <p class=sub>The accused says this verdict was wrong.</p>\
+             <form method=post action=\"/admin/cases/{id}/review\">\
+             <input type=hidden name=subject value=appeal>{reasoning_field}\
+             <button name=outcome value=uphold class=secondary>Uphold the verdict</button> ",
+            id = escape(&case.case_id)
+        ));
+        if can_reverse {
+            out.push_str("<button name=outcome value=reverse>Reverse — clears the marks</button>");
+        }
+        out.push_str("</form>");
+    }
+
+    if claim_pending {
+        out.push_str(&format!(
+            "<h3>New-holder claim</h3>\
+             <p class=sub><strong>This is not an appeal.</strong> The claim is not that the \
+             verdict was wrong — it is that this device has a different owner now, and the mark \
+             is punishing them. Granting it clears the marks; refusing leaves them in force \
+             against hardware whose holder may have changed. Anyone who knows this case id can \
+             file one, so weigh it on what it shows.</p>\
+             <form method=post action=\"/admin/cases/{id}/review\">\
+             <input type=hidden name=subject value=new-holder>{reasoning_field}\
+             <button name=outcome value=uphold class=secondary>Refuse the claim — marks \
+             stay</button> ",
+            id = escape(&case.case_id)
+        ));
+        if can_reverse {
+            out.push_str("<button name=outcome value=reverse>Grant it — clears the marks</button>");
+        }
+        out.push_str("</form>");
+    }
+
+    // A ban with nothing pending: the authority correcting itself.
+    if can_reverse && !appeal_pending && !claim_pending {
+        out.push_str(&format!(
+            "<h3>Correct this verdict</h3>\
+             <p class=sub>Nothing is pending. Reversing here is this authority correcting its \
+             own error, and is recorded as that rather than as an appeal outcome.</p>\
+             <form method=post action=\"/admin/cases/{id}/review\">\
+             <input type=hidden name=subject value=none>{reasoning_field}\
+             <button name=outcome value=reverse>Reverse — clears the marks</button></form>",
+            id = escape(&case.case_id)
         ));
     }
-    if can_reverse {
-        out.push_str("<button name=outcome value=reverse>Reverse — clears the marks</button>");
-    }
-    out.push_str("</form>");
+
     out
 }
 
@@ -385,6 +412,12 @@ fn review_form(case: &CaseRecord) -> String {
 struct ReviewForm {
     outcome: String,
     reasoning: String,
+    /// Which claim this answers: `appeal`, `new-holder`, or `none` for
+    /// the authority correcting a verdict nobody contested. The page
+    /// renders one form per pending claim, because collapsing them
+    /// meant answering one left the other pending forever.
+    #[serde(default)]
+    subject: String,
 }
 
 /// The human's decision on an appeal.
@@ -418,11 +451,46 @@ async fn review(
         .store
         .case(&case_id)?
         .ok_or_else(|| Error::NotFound(format!("case {case_id}")))?;
-    let new_holder = case.new_holder_state == "pending";
-    if form.outcome == "uphold" && case.appeal_state != "pending" && !new_holder {
-        return Err(Error::CaseState(
-            "there is no appeal or new-holder claim pending on this case to decide".into(),
-        ));
+
+    // Which claim is being answered comes from the form, not from
+    // whichever happens to be pending. A case can carry both at once —
+    // the new-holder path is unauthenticated, so a stranger can add one
+    // beside the accused's appeal — and inferring the subject meant
+    // every review answered the same one and left the other queued.
+    let subject = match form.subject.as_str() {
+        "appeal" => "appeal",
+        "new-holder" => "new-holder",
+        "" => {
+            // Older form posts carry no subject. Answer the appeal if
+            // one is pending, else the claim; refuse when both are, so
+            // an ambiguous request cannot silently pick for a reviewer.
+            match (case.appeal_state == "pending", case.new_holder_state == "pending") {
+                (true, true) => {
+                    return Err(Error::BadRequest(
+                        "this case has both an appeal and a new-holder claim pending; say which \
+                         one this answers"
+                            .into(),
+                    ))
+                }
+                (true, false) => "appeal",
+                (false, true) => "new-holder",
+                (false, false) => "none",
+            }
+        }
+        other => return Err(Error::BadRequest(format!("unknown review subject {other:?}"))),
+    };
+
+    if form.outcome == "uphold" {
+        let pending = match subject {
+            "appeal" => case.appeal_state == "pending",
+            "new-holder" => case.new_holder_state == "pending",
+            _ => false,
+        };
+        if !pending {
+            return Err(Error::CaseState(format!(
+                "there is no {subject} pending on this case to decide"
+            )));
+        }
     }
     if form.outcome == "reverse" && case.disposition.as_deref() != Some("ban") {
         return Err(Error::CaseState("only a ban can be reversed".into()));
@@ -433,7 +501,7 @@ async fn review(
             // The case log has to say which kind of review happened. A
             // device-changed-hands claim recorded as "appeal upheld"
             // is a record of a review nobody asked for.
-            if new_holder {
+            if subject == "new-holder" {
                 state.store.set_new_holder_state(
                     &case_id,
                     "refused",
@@ -465,9 +533,17 @@ async fn review(
                 &case_id,
                 Disposition::Reverse,
                 &form.reasoning,
-                // The panel renders the assessment on the page this
-                // form was submitted from, so the reviewer did see it.
-                Decider::HumanAssisted,
+                // Assisted only if there was something to assist with.
+                // Hardcoding it meant a reversal on a case triage never
+                // touched — or a deployment with triage off entirely —
+                // was logged as reached with a classifier's help that
+                // never existed, in the record this distinction exists
+                // for.
+                if state.store.assessment(&case_id)?.is_some() {
+                    Decider::HumanAssisted
+                } else {
+                    Decider::Human
+                },
                 now,
             )
             .await?;
@@ -648,7 +724,7 @@ mod tests {
             State(state.clone()),
             Path("c1".to_string()),
             signed_in(&state),
-            Form(ReviewForm { outcome: "uphold".into(), reasoning: "hash:reviewed".into() }),
+            Form(ReviewForm { outcome: "uphold".into(), reasoning: "hash:reviewed".into(), subject: String::new() }),
         )
         .await;
 
@@ -666,7 +742,7 @@ mod tests {
             State(state.clone()),
             Path("c1".to_string()),
             signed_in(&state),
-            Form(ReviewForm { outcome: "reverse".into(), reasoning: "hash:reviewed".into() }),
+            Form(ReviewForm { outcome: "reverse".into(), reasoning: "hash:reviewed".into(), subject: String::new() }),
         )
         .await;
 
@@ -684,7 +760,7 @@ mod tests {
             State(state.clone()),
             Path("c1".to_string()),
             signed_in(&state),
-            Form(ReviewForm { outcome: "uphold".into(), reasoning: "hash:reviewed".into() }),
+            Form(ReviewForm { outcome: "uphold".into(), reasoning: "hash:reviewed".into(), subject: String::new() }),
         )
         .await
         .unwrap();
@@ -705,7 +781,7 @@ mod tests {
             State(state.clone()),
             Path("c1".to_string()),
             signed_in(&state),
-            Form(ReviewForm { outcome: "uphold".into(), reasoning: "hash:reviewed".into() }),
+            Form(ReviewForm { outcome: "uphold".into(), reasoning: "hash:reviewed".into(), subject: String::new() }),
         )
         .await
         .unwrap();
@@ -734,7 +810,7 @@ mod tests {
             State(state.clone()),
             Path("c1".to_string()),
             signed_in(&state),
-            Form(ReviewForm { outcome: "reverse".into(), reasoning: "hash:reviewed".into() }),
+            Form(ReviewForm { outcome: "reverse".into(), reasoning: "hash:reviewed".into(), subject: String::new() }),
         )
         .await
         .unwrap();
@@ -746,6 +822,107 @@ mod tests {
             state.store.cases_awaiting_appeal_review().unwrap().is_empty(),
             "a reviewed appeal leaves the queue"
         );
+    }
+
+
+    /// Both claims at once — the state an *unauthenticated* new-holder
+    /// filing can create beside the accused's appeal. One pair of
+    /// buttons could only answer one of them, so every uphold recorded
+    /// a claim refusal and left the appeal pending forever, with the
+    /// page describing the wrong claim.
+    #[tokio::test]
+    async fn each_pending_claim_is_answered_separately() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        state.store.put_case(&reviewable_case_with(Some("ban"), "pending", "pending")).unwrap();
+
+        // Answer the *appeal* first, with the claim still pending —
+        // the order that exposed the collapse. Upholding used to
+        // branch on "is a claim pending", so this recorded a claim
+        // refusal and left the appeal queued forever.
+        review(
+            State(state.clone()),
+            Path("c1".to_string()),
+            signed_in(&state),
+            Form(ReviewForm {
+                outcome: "uphold".into(),
+                reasoning: "hash:appeal".into(),
+                subject: "appeal".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let case = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(case.appeal_state, "upheld", "the appeal was what was answered");
+        assert_eq!(case.new_holder_state, "pending", "the claim is still owed an answer");
+        let events = state.store.events("c1").unwrap();
+        assert!(events.iter().any(|(_, kind, _)| kind == "appeal_upheld"));
+        assert!(
+            !events.iter().any(|(_, kind, _)| kind == "new_holder_claim_refused"),
+            "answering the appeal must not record a claim refusal"
+        );
+
+        // Then the claim, separately.
+        review(
+            State(state.clone()),
+            Path("c1".to_string()),
+            signed_in(&state),
+            Form(ReviewForm {
+                outcome: "uphold".into(),
+                reasoning: "hash:claim".into(),
+                subject: "new-holder".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let case = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(case.new_holder_state, "refused");
+        assert!(
+            state.store.cases_awaiting_appeal_review().unwrap().is_empty(),
+            "with both answered the case leaves the queue"
+        );
+    }
+
+    /// A form post that does not say which claim it answers, on a case
+    /// carrying both, must not pick one silently.
+    #[tokio::test]
+    async fn an_ambiguous_review_is_refused_rather_than_guessed() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        state.store.put_case(&reviewable_case_with(Some("ban"), "pending", "pending")).unwrap();
+
+        let result = review(
+            State(state.clone()),
+            Path("c1".to_string()),
+            signed_in(&state),
+            Form(ReviewForm {
+                outcome: "uphold".into(),
+                reasoning: "hash:r".into(),
+                subject: String::new(),
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(Error::BadRequest(_))), "{result:?}");
+        let case = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(case.appeal_state, "pending");
+        assert_eq!(case.new_holder_state, "pending");
+    }
+
+    /// The page offers a control per pending claim, and says which is
+    /// which — a reviewer answering a claim should not be reading a
+    /// heading about an appeal.
+    #[test]
+    fn the_page_offers_one_control_per_pending_claim() {
+        let both = review_form(&reviewable_case_with(Some("ban"), "pending", "pending"));
+        assert_eq!(both.matches("<form").count(), 2, "one per claim");
+        assert!(both.contains("value=appeal"));
+        assert!(both.contains("value=new-holder"));
+        assert!(both.contains("New-holder claim"));
+
+        // A ban with nothing pending: correcting the authority's own
+        // error, and labelled as that rather than as an appeal.
+        let uncontested = review_form(&reviewable_case_with(Some("ban"), "none", "none"));
+        assert!(uncontested.contains("value=none"));
+        assert!(uncontested.contains("correcting its"));
+        assert!(!uncontested.contains("value=uphold"));
     }
 
 }

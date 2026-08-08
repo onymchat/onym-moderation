@@ -239,8 +239,18 @@ impl Config {
         if host.is_empty() {
             return false;
         }
-        if host == "localhost" || host == "::1" || host.ends_with(".localhost") {
+        if host == "localhost" || host == "::1" {
             return true;
+        }
+        // `.localhost` is conventionally loopback but is still a DNS
+        // name: `evil.localhost` can be made to resolve anywhere.
+        // Trusting the suffix skipped the very check the dotless case
+        // gets, so it goes through the same resolution.
+        if host.ends_with(".localhost") {
+            return match Self::resolve(host) {
+                Some(addresses) => addresses.iter().all(Self::is_local_ip),
+                None => true,
+            };
         }
         // A bare name with no dots is *usually* a compose service on
         // the private network — but "usually" is not good enough for

@@ -607,6 +607,49 @@ fn consented_model_profile(
     Ok(manifest.model_profile)
 }
 
+/// Re-attempt a decision the model reached and a guard refused.
+///
+/// No model call: the assessment is on file and still valid, and what
+/// changed is the case, not the reading. The common case is
+/// `require_notice_delivered` — the classifier can decide in seconds
+/// while the opening verdict is still queued for the interface, and
+/// without this the refusal was permanent.
+///
+/// Bounded by the case itself: once the decision deadline passes, the
+/// deadline sweep dismisses it and it stops appearing here. A case
+/// whose guard never comes good therefore ends as "undecided is
+/// dismissal", which is the right ending — the wrong one was ending
+/// there while a valid ban sat unapplied and unseen.
+pub async fn retry_unapplied_decisions(state: &std::sync::Arc<AppState>, now: OffsetDateTime) {
+    let Some(config) = state.config.triage.as_ref() else { return };
+    if config.mode != TriageMode::Autonomous {
+        // In advisory mode nothing is applied automatically, so an
+        // unapplied assessment is the expected state, not a stuck one.
+        return;
+    }
+
+    let cases = match state.store.cases_with_unapplied_decision() {
+        Ok(cases) => cases,
+        Err(e) => {
+            tracing::error!(error = %e, "could not list unapplied decisions");
+            return;
+        }
+    };
+    for case in cases {
+        let Ok(Some((raw, applied))) = state.store.assessment(&case.case_id) else { continue };
+        if applied {
+            continue;
+        }
+        let Ok(assessment) = serde_json::from_slice::<Assessment>(&raw) else { continue };
+        let disposition = match Outcome::parse(&assessment.outcome) {
+            Outcome::Ban => Disposition::Ban,
+            Outcome::Dismiss => Disposition::Dismiss,
+            Outcome::NoDecision => continue,
+        };
+        apply_automated(state, &case.case_id, disposition, &assessment, now).await;
+    }
+}
+
 /// Whether a profile is safe to run against this manifest, checked at
 /// boot rather than at the first case.
 ///
@@ -1417,6 +1460,77 @@ mod tests {
         assert!(!applied);
         let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
         assert_eq!(assessment.outcome, "ban");
+    }
+
+
+    /// The recovery the refusal test did not cover. A guard can refuse
+    /// an automated ban for a reason that later stops being true — the
+    /// opening verdict still queued for the interface, say — and
+    /// without a path back that refusal was permanent: the assessment
+    /// kept its `ban`, nothing re-attempted it, and the case ran to its
+    /// decision deadline and dismissed. In autonomous mode nobody would
+    /// ever have seen it, because no ban means no appeal means nothing
+    /// in the panel's queue.
+    #[tokio::test]
+    async fn a_ban_refused_for_undelivered_notice_lands_once_the_notice_arrives() {
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Violent"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        let case = open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+        store.undeliver_open_case_verdict(&case.case_id).unwrap();
+
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        // The model decides; the guard refuses; the case stays open
+        // with the decision on file and unapplied.
+        assess_and_maybe_decide(&state, "c1", now).await;
+        assert_eq!(state.store.case("c1").unwrap().unwrap().stage, "open");
+        let (_, applied) = state.store.assessment("c1").unwrap().unwrap();
+        assert!(!applied);
+        assert_eq!(state.store.cases_with_unapplied_decision().unwrap().len(), 1);
+
+        // The notice reaches the interface, and the next sweep applies
+        // what was already decided — without asking the model again.
+        state.store.put_delivered_open_case_verdict("c1", "v-open").unwrap();
+        retry_unapplied_decisions(&state, now).await;
+
+        let after = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(after.disposition.as_deref(), Some("ban"), "the ban must not be lost");
+        assert!(state.store.cases_with_unapplied_decision().unwrap().is_empty());
+    }
+
+    /// Advisory mode is the opposite case: an unapplied assessment is
+    /// the expected resting state, not a stuck one, and the retry must
+    /// not decide on a moderator's behalf.
+    #[tokio::test]
+    async fn advisory_assessments_are_not_applied_by_the_retry() {
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Violent"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Advisory,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+        retry_unapplied_decisions(&state, now).await;
+
+        assert_eq!(state.store.case("c1").unwrap().unwrap().stage, "open");
+        assert!(state.store.case("c1").unwrap().unwrap().disposition.is_none());
     }
 
 }

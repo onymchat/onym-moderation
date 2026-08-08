@@ -350,7 +350,8 @@ channel and leave the one next to it open.
 What this catches is verbatim quotation, which is the realistic case.
 It cannot catch a paraphrase, and nothing at this layer can: a model
 that restates the reporter's account in its own words has still said
-it. That residue is a reason to prefer the label-producing profiles
+it. Nor does it catch an account shorter than three characters, which
+is not a meaningful string to match on. That residue is a reason to prefer the label-producing profiles
 where a reporter's safety is the dominant concern — `qwen3guard-8b`,
 `llama-guard-4-12b`, `gpt-oss-safeguard-20b` and `shieldstral-3b` all
 emit a bounded label rather than prose.

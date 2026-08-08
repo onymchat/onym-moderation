@@ -186,9 +186,18 @@ pub fn withhold_quoted_context(text: &str, contexts: &[String]) -> String {
     let mut out = text.to_string();
     for context in contexts {
         let trimmed = context.trim();
-        // Very short fragments would match half the language; the
-        // point is quotation, not coincidence.
-        if trimmed.len() < 12 {
+        // The threshold was 12 bytes, which let "she blocked" — an
+        // entire account, at 11 — through. That is not a missed
+        // quotation, it is the reporter's identity in the accused's
+        // copy, so the bar drops to the point where a match stops
+        // meaning anything at all.
+        //
+        // The failure this trades into is over-redaction: a
+        // three-character account would blank every occurrence of
+        // those characters in the model's output. That direction costs
+        // the accused some legibility; the other costs the reporter
+        // their safety.
+        if trimmed.len() < 3 {
             continue;
         }
         if out.contains(trimmed) {

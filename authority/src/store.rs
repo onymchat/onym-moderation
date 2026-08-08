@@ -1277,6 +1277,36 @@ impl Store {
     /// Each case comes back with how many times it has already been
     /// put to the model, and when it last was, so the caller can space
     /// retries out instead of hammering an unhealthy model every tick.
+    /// Open cases carrying a decision the model reached but that was
+    /// never applied.
+    ///
+    /// A guard can refuse an automated decision for a reason that later
+    /// stops being true — most obviously `require_notice_delivered`,
+    /// which refuses while the opening verdict is still queued for the
+    /// interface. Without a path back, that refusal was permanent: the
+    /// assessment row kept its `ban`, nothing re-attempted it, and the
+    /// case ran to its decision deadline and dismissed. In autonomous
+    /// mode no human would ever have seen it, because no ban means no
+    /// appeal means nothing in the panel's queue.
+    pub fn cases_with_unapplied_decision(&self) -> Result<Vec<CaseRecord>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {} FROM cases c
+               JOIN assessments a ON a.case_id = c.case_id
+              WHERE c.stage = 'open'
+                AND a.applied = 0
+                AND a.recommendation IN ('ban', 'dismiss')
+              ORDER BY c.opened_at",
+            Self::CASE_COLUMNS_C
+        ))?;
+        let rows = statement.query_map([], Self::case_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn cases_awaiting_assessment(
         &self,
         now: &str,

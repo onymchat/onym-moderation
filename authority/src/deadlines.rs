@@ -162,6 +162,11 @@ pub async fn triage_sweep(
     for (case, _, _) in due.into_iter().take(MAX_ASSESSMENTS_PER_SWEEP) {
         crate::triage::assess_and_maybe_decide(state, &case.case_id, now).await;
     }
+    // Decisions the model reached and a guard refused. Cheap — no
+    // model call — and the reason it runs every tick: the guard that
+    // refused is usually a delivery that has since completed.
+    crate::triage::retry_unapplied_decisions(state, now).await;
+
     if total > MAX_ASSESSMENTS_PER_SWEEP {
         tracing::info!(
             assessed = MAX_ASSESSMENTS_PER_SWEEP,
