@@ -921,19 +921,6 @@ async fn appeal(
         if OffsetDateTime::now_utc() > deadline {
             return Err(Error::WindowClosed("the appeal window has closed".into()));
         }
-
-        // One appeal per case. Re-filing was accepted unconditionally
-        // and reset `appeal_state` to `pending`, so an accused could
-        // flip a completed review — `upheld`, or even `reversed` —
-        // back into the queue by re-POSTing the same signed object,
-        // erasing the record of a review that did happen.
-        if case.appeal_state != "none" {
-            return Err(Error::CaseState(format!(
-                "this case already has an appeal on file ({}); a decided review is not re-opened \
-                 by filing again",
-                case.appeal_state
-            )));
-        }
     }
 
     // This is where a human enters. Triage decides in the first
@@ -3043,6 +3030,64 @@ mod tests {
         let (status, view) = harness.send(Request::get(url).body(Body::empty()).unwrap()).await;
         assert_eq!(status, StatusCode::OK, "a reporter is still a party");
         assert!(view["assessment"].is_null(), "but the record is not theirs");
+    }
+
+
+    /// The two appeal rules compose: a pending appeal may be
+    /// supplemented — the accused may find more to say while waiting,
+    /// and the first filing should not be their only chance — while a
+    /// *decided* one is never re-opened by filing again. Supplementing
+    /// must also not queue the case twice for the moderator.
+    #[tokio::test]
+    async fn a_pending_appeal_can_be_supplemented_but_a_decided_one_cannot() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        let appeal = |statement: &str| {
+            signed(
+                json!({"caseId": case_id, "kind": "appeal", "statement": statement}),
+                "signature",
+                &[ACCUSED_SEED],
+            )
+        };
+
+        let (status, _) =
+            harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal("it was a quotation")).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = harness
+            .post(&format!("/v1/cases/{case_id}/appeal"), appeal("and here is the context"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "a pending appeal may be supplemented");
+
+        assert_eq!(
+            harness.state.store.case(&case_id).unwrap().unwrap().appeal_state,
+            "pending"
+        );
+        assert_eq!(
+            harness.state.store.cases_awaiting_appeal_review().unwrap().len(),
+            1,
+            "supplementing must not queue the case twice"
+        );
+
+        // Once reviewed, further filings are refused — otherwise the
+        // record of the review that happened is erased.
+        harness
+            .state
+            .store
+            .set_appeal_state(&case_id, "upheld", "2026-08-09T00:00:00Z", "appeal_upheld", "hash:r")
+            .unwrap();
+        let (status, _) =
+            harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal("let me try again")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            harness.state.store.case(&case_id).unwrap().unwrap().appeal_state,
+            "upheld",
+            "the completed review stands"
+        );
     }
 
 }
