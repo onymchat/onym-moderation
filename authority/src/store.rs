@@ -377,6 +377,24 @@ impl Store {
         Ok(record)
     }
 
+    /// Every mandate this key has registered, newest first. Standing
+    /// follows any of them: a user who re-consents after a manifest is
+    /// republished has not withdrawn the consent they gave under the
+    /// old one, and reports already signed against it are still theirs.
+    pub fn mandates_for_user(&self, user_key: &str) -> Result<Vec<MandateRecord>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT mandate_ref, user_key, device_binding, classes, manifest_hash
+               FROM mandates WHERE user_key = ?1 ORDER BY accepted_at DESC",
+        )?;
+        let rows = statement.query_map(params![user_key], Self::mandate_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn mandate_for_user(&self, user_key: &str) -> Result<Option<MandateRecord>, Error> {
         let conn = self.conn.lock().unwrap();
         let record = conn
@@ -538,7 +556,24 @@ impl Store {
             "INSERT INTO responses (case_id, raw, late, filed_at) VALUES (?1, ?2, ?3, ?4)",
             params![case.case_id, raw, late as i32, filed_at],
         )?;
-        Self::write_case(&tx, case)?;
+        // Set the one flag a response actually changes, and only while
+        // the case is still open. Writing the whole row back — from a
+        // record read before the lock was taken — would rewrite
+        // `stage`, `disposition` and `appeal_deadline` too: a response
+        // landing between a decider's read and its commit would put a
+        // decided case back to `open` with its disposition erased. The
+        // deadline sweep would then find it overdue and dismiss it by
+        // default, clearing a ban already in force and taking the
+        // appeal deadline the accused was owed with it.
+        let responded = tx.execute(
+            "UPDATE cases SET responded = 1 WHERE case_id = ?1 AND stage = 'open'",
+            params![case.case_id],
+        )?;
+        if responded == 0 {
+            return Err(Error::CaseState(
+                "the case was decided while this response was being filed".into(),
+            ));
+        }
         tx.execute(
             "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
             params![case.case_id, filed_at, event_kind, event_detail],
@@ -567,6 +602,11 @@ impl Store {
 
     // ─── Cases ───────────────────────────────────────────────────────
 
+    /// Test-only, and deliberately so. In the service every case-row
+    /// change is a conditional `UPDATE` of the columns that change:
+    /// writing a whole row back from a record read before the lock is
+    /// how a response reopened a decided case.
+    #[cfg(test)]
     fn write_case(conn: &rusqlite::Connection, case: &CaseRecord) -> Result<(), Error> {
         conn.execute(
             "INSERT OR REPLACE INTO cases
@@ -787,16 +827,19 @@ impl Store {
         // Move the case first, conditioned on it still being where the
         // caller found it. Nothing else in this transaction happens if
         // it has moved — no verdict is stored, no reporter is credited.
+        // `responded` is deliberately absent: a decision does not change
+        // it, and writing it back from a read taken before the lock
+        // would erase a response that arrived in between — the record
+        // would then say the accused never answered.
         let moved = tx.execute(
             "UPDATE cases
-                SET stage = ?2, responded = ?3, disposition = ?4, appeal_deadline = ?5
+                SET stage = ?2, disposition = ?3, appeal_deadline = ?4
               WHERE case_id = ?1
-                AND stage = ?6
-                AND (?7 IS NULL OR disposition IS ?7)",
+                AND stage = ?5
+                AND (?6 IS NULL OR disposition IS ?6)",
             params![
                 case.case_id,
                 case.stage,
-                case.responded as i32,
                 case.disposition,
                 case.appeal_deadline,
                 expect_stage,

@@ -49,12 +49,35 @@ const MAX_STATEMENT_BYTES: usize = 16 * 1024;
 /// it — but not unbounded.
 const MAX_RESPONSES_PER_CASE: usize = 32;
 
-async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
+/// How many new-holder claims one case will record. Bounded rather
+/// than capped at one: this path cannot be authenticated, so a cap of
+/// one lets any stranger consume the genuine new owner's only remedy.
+/// Several duplicates are noise a moderator skips; a burned slot is a
+/// remedy nobody can recover.
+const MAX_NEW_HOLDER_CLAIMS: usize = 8;
+
+async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<Value> {
     // Verdicts the interface refuses are surfaced here rather than
     // only in a log. Each one is a mark that should have moved and did
     // not, and "delivery has quietly failed for a week" should not be
     // something an operator finds out from a case record.
+    //
+    // The *count* is public, because a monitor needs it and a number
+    // discloses nothing. The list is not: it carries verdict refs and
+    // whatever the interface echoed back in its error — case ids,
+    // verdict fields — and this endpoint sits behind no auth on a
+    // proxy that publishes every path.
     let stuck = state.store.undeliverable_verdicts().unwrap_or_default();
+    let detail = if authorize_moderator(&state, &headers).is_ok() {
+        Some(
+            stuck
+                .iter()
+                .map(|(verdict_ref, error)| json!({ "verdictRef": verdict_ref, "error": error }))
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
     Json(json!({
         "status": "ok",
         "authority": state.config.manifest.component_id,
@@ -63,10 +86,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
         "interfaceConfigured": state.delivery.configured(),
         "canDecide": state.config.moderator_token.is_some(),
         "undeliverableVerdicts": stuck.len(),
-        "undeliverable": stuck
-            .iter()
-            .map(|(verdict_ref, error)| json!({ "verdictRef": verdict_ref, "error": error }))
-            .collect::<Vec<_>>(),
+        "undeliverable": detail,
     }))
 }
 
@@ -228,11 +248,16 @@ async fn file_report(
 
     // Standing follows the reporter's mandate: reporting requires
     // having consented to this authority too.
-    let reporter_mandate = state
-        .store
-        .mandate_for_user(&report.reporter)?
-        .ok_or(Error::ReporterUnconsented)?;
-    if reporter_mandate.mandate_ref != report.reporter_mandate {
+    // Any mandate this key has registered, not only its newest. A
+    // reporter who re-consents after the authority republishes its
+    // manifest would otherwise have every already-signed, in-flight
+    // report refused as `reporter_unconsented` — punished for keeping
+    // their consent current.
+    let reporter_mandates = state.store.mandates_for_user(&report.reporter)?;
+    if reporter_mandates.is_empty() {
+        return Err(Error::ReporterUnconsented);
+    }
+    if !reporter_mandates.iter().any(|m| m.mandate_ref == report.reporter_mandate) {
         return Err(Error::ReporterUnconsented);
     }
 
@@ -312,9 +337,14 @@ async fn file_report(
     let case = match state.store.open_case_for(&report.accused, &report.class_id)? {
         Some(existing) => join_case(&state, &existing, &report, &stamp)?,
         None => {
-            // Consent has a horizon. Opening a case under terms whose
-            // validity has lapsed would apply an agreement neither side
-            // is still offering — and opening a case sets a mark.
+            // Consent has a horizon at both ends. The accused's
+            // consented terms must still be live — opening a case under
+            // an agreement neither side is still offering would apply
+            // terms nobody stands behind, and opening a case sets a
+            // mark. And this authority's own published manifest must
+            // still be live, which the README and the boot log both
+            // promise: an expired authority stops taking new work.
+            require_manifest_current(&state, "open a case")?;
             let valid_until = util::parse_timestamp(&consented.valid_until)
                 .map_err(|e| Error::Internal(format!("consented manifest validUntil: {e}")))?;
             if now > valid_until {
@@ -391,6 +421,23 @@ fn require_manifest_current(state: &AppState, action: &str) -> Result<(), Error>
     Ok(())
 }
 
+/// Push the delivery backlog without making the caller wait for it.
+///
+/// `flush` drains the *whole* queue at fifteen seconds a verdict, so
+/// running it inline meant filing a report took time proportional to
+/// the backlog whenever the interface was down — and every request
+/// re-attempted every stuck verdict, inflating their counts. The sweep
+/// flushes on its own schedule; this only makes a fresh verdict leave
+/// promptly when the interface is healthy.
+fn flush_soon(state: &Arc<AppState>) {
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        if let Err(e) = state.delivery.flush(&state.store).await {
+            tracing::warn!(error = %e, "background verdict delivery failed; the sweep will retry");
+        }
+    });
+}
+
 /// Attach a report to a case already open for this accused and class.
 fn join_case(
     state: &AppState,
@@ -413,7 +460,7 @@ fn join_case(
 /// `Ok(None)` means another case for this accused and class was opened
 /// concurrently and won; the caller joins that one.
 async fn open_case(
-    state: &AppState,
+    state: &Arc<AppState>,
     report: &Report,
     accused_mandate: &crate::store::MandateRecord,
     class: &ViolationClass,
@@ -467,7 +514,7 @@ async fn open_case(
         return Ok(None);
     }
 
-    state.delivery.flush(&state.store).await?;
+    flush_soon(state);
     tracing::info!(case_id = %case.case_id, "case opened");
     Ok(Some(case))
 }
@@ -587,11 +634,6 @@ async fn appeal(
             "statement exceeds {MAX_STATEMENT_BYTES} bytes"
         )));
     }
-    let case = match state.store.case(&case_id)? {
-        Some(case) => case,
-        None => return Err(Error::NotFound(format!("case {case_id}"))),
-    };
-
     let new_holder = match submission.kind.as_str() {
         "appeal" => false,
         "new-holder-claim" => true,
@@ -617,18 +659,62 @@ async fn appeal(
     // disposition off the status code — precisely what an
     // unauthenticated endpoint must not do, and the reason the bounds
     // below are stated as one answer rather than three.
+    // A new-holder claim is unauthenticated by design, so it answers
+    // every caller identically — filed or not. Two things went wrong
+    // when it did not:
+    //
+    // 1. A banned case answered 200 where everything else answered
+    //    404, which made the endpoint a working "is this case a ban?"
+    //    oracle for anyone holding a case id.
+    // 2. The one-claim-per-case rule matched *any* claim ever filed and
+    //    nothing ever resolved one, so a stranger — the banned user
+    //    included — could permanently consume the genuine new owner's
+    //    only remedy, which §5.7 makes mandatory.
+    //
+    // So: record the claim when it is one the authority can act on,
+    // ignore it otherwise, and say the same thing either way. Claims
+    // are bounded per case rather than capped at one, because a
+    // duplicate is noise a moderator can skip while a consumed slot is
+    // a remedy nobody can get back.
     if new_holder {
-        let already_claimed = state
+        // The lookup happens *inside* this branch, and its result never
+        // reaches the caller: a claim about a case that does not exist
+        // answers exactly as one about a case that does.
+        let case = state.store.case(&case_id)?;
+        let claims = state
             .store
             .events(&case_id)?
             .iter()
-            .any(|(_, kind, _)| kind == "new_holder_claim");
-        if case.disposition.as_deref() != Some("ban") || already_claimed {
-            return Err(Error::NotFound(format!("case {case_id}")));
+            .filter(|(_, kind, _)| kind == "new_holder_claim")
+            .count();
+        let actionable = case.as_ref().and_then(|c| c.disposition.as_deref()) == Some("ban")
+            && claims < MAX_NEW_HOLDER_CLAIMS;
+        if actionable {
+            let stamp = util::format_timestamp(OffsetDateTime::now_utc());
+            state.store.append_event(
+                &case_id,
+                &stamp,
+                "new_holder_claim",
+                &submission.statement,
+            )?;
+            tracing::info!(%case_id, "new-holder claim filed");
         }
+        // Same answer whether it was recorded or not.
+        return Ok(Json(json!({
+            "caseId": case_id,
+            "filed": true,
+            "kind": submission.kind,
+            "note": "a new-holder claim is reviewed by a human on an expedited basis; a device \
+                     is not a person"
+        })));
     }
 
-    if !new_holder {
+    let case = match state.store.case(&case_id)? {
+        Some(case) => case,
+        None => return Err(Error::NotFound(format!("case {case_id}"))),
+    };
+
+    {
         let signing_bytes = canonical::report_signing_bytes(&body)?;
         // As on `respond`: a caller who cannot prove they are the
         // accused learns nothing about the case, including whether it
@@ -893,7 +979,7 @@ async fn decide(
         expect_disposition: if decision.disposition == "reverse" { Some("ban") } else { None },
     })?;
 
-    state.delivery.flush(&state.store).await?;
+    flush_soon(&state);
 
     tracing::info!(%case_id, verdict_ref = %issued.verdict_ref, disposition = %issued.disposition, "case decided");
     Ok(Json(json!({
@@ -1418,10 +1504,13 @@ mod tests {
     }
 
     /// The new-holder path cannot be signature-checked — the new owner
-    /// is not the mandated identity — so it is bounded instead: it
-    /// answers a ban in force, and only one may be pending.
+    /// is not the mandated identity — so it answers every caller the
+    /// same way and records only what it can act on. What it must not
+    /// do is *tell* the caller which of those happened: a
+    /// distinguishable answer made it an oracle for "is this case a
+    /// ban?".
     #[tokio::test]
-    async fn a_new_holder_claim_is_bounded_to_a_live_ban() {
+    async fn a_new_holder_claim_is_recorded_only_against_a_ban_but_answers_the_same() {
         let harness = Harness::new();
         let case_id = open_case(&harness).await;
 
@@ -1434,13 +1523,13 @@ mod tests {
             .unwrap()
         };
 
-        // Refused, and indistinguishably from a case that does not
-        // exist: this path answers strangers, so the disposition must
-        // not be readable off the status code.
+        // Open case, no ban: accepted-looking, and recorded nowhere.
         let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), claim(&case_id)).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "no ban to be relieved of");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(claims_on_file(&harness, &case_id), 0, "nothing to be relieved of");
 
-        // Ban the case, then the claim lands — once.
+        // Ban it, and the same request is now recorded — with the same
+        // answer as before.
         let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
         case.response_deadline = "2020-01-01T00:00:00Z".into();
         harness.state.store.put_case(&case).unwrap();
@@ -1448,14 +1537,72 @@ mod tests {
 
         let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), claim(&case_id)).await;
         assert_eq!(status, StatusCode::OK);
-
-        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), claim(&case_id)).await;
-        assert_eq!(
-            status,
-            StatusCode::NOT_FOUND,
-            "an unauthenticated endpoint must not be unbounded"
-        );
+        assert_eq!(claims_on_file(&harness, &case_id), 1);
     }
+
+    fn claims_on_file(harness: &Harness, case_id: &str) -> usize {
+        harness
+            .state
+            .store
+            .events(case_id)
+            .unwrap()
+            .iter()
+            .filter(|(_, kind, _)| kind == "new_holder_claim")
+            .count()
+    }
+
+    /// The genuine new owner's remedy is mandatory (§5.7) and must not
+    /// be consumable by a stranger. Claims are bounded, not capped at
+    /// one: duplicates are noise a moderator skips, while a burned slot
+    /// is a remedy nobody can get back.
+    #[tokio::test]
+    async fn a_stranger_cannot_burn_the_new_holder_remedy() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        let claim = |statement: &str| {
+            serde_json::to_vec(&json!({
+                "caseId": case_id,
+                "kind": "new-holder-claim",
+                "statement": statement,
+            }))
+            .unwrap()
+        };
+
+        // Somebody floods it. The genuine claim still lands.
+        for _ in 0..3 {
+            harness.post(&format!("/v1/cases/{case_id}/appeal"), claim("noise")).await;
+        }
+        let (status, _) = harness
+            .post(&format!("/v1/cases/{case_id}/appeal"), claim("I am the new owner"))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let recorded: Vec<String> = harness
+            .state
+            .store
+            .events(&case_id)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, kind, _)| kind == "new_holder_claim")
+            .map(|(_, _, detail)| detail)
+            .collect();
+        assert!(
+            recorded.iter().any(|d| d == "I am the new owner"),
+            "the real claim must reach a human despite the noise: {recorded:?}"
+        );
+
+        // And the append is bounded rather than unlimited.
+        for _ in 0..20 {
+            harness.post(&format!("/v1/cases/{case_id}/appeal"), claim("more noise")).await;
+        }
+        assert_eq!(claims_on_file(&harness, &case_id), MAX_NEW_HOLDER_CLAIMS);
+    }
+
 
     // ─── Confidentiality ─────────────────────────────────────────────
 
@@ -1751,6 +1898,96 @@ mod tests {
             claimed.push(harness.post(&format!("/v1/cases/{id}/appeal"), body).await.0);
         }
         assert_eq!(claimed[0], claimed[1], "the new-holder path leaks the disposition");
+    }
+
+
+    /// A response wrote the whole case row back from a record read
+    /// before the lock, so one arriving between a decider's read and
+    /// its commit put the case back to `open` with its disposition
+    /// erased. The deadline sweep would then find it overdue and
+    /// dismiss it by default — clearing a ban already in force and
+    /// taking the appeal deadline the accused was owed with it.
+    #[tokio::test]
+    async fn a_response_cannot_reopen_a_decided_case() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+
+        // Decide it.
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        let decided = harness.state.store.case(&case_id).unwrap().unwrap();
+        assert_eq!(decided.stage, "decided");
+
+        // A response filed against it — signed correctly, just late to
+        // the decision.
+        let body = signed(
+            json!({"caseId": case_id, "statement": "wait, it wasn't me", "evidence": []}),
+            "signature",
+            &[ACCUSED_SEED],
+        );
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/respond"), body).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let after = harness.state.store.case(&case_id).unwrap().unwrap();
+        assert_eq!(after.stage, "decided", "the case must not be reopened");
+        assert_eq!(after.disposition.as_deref(), Some("ban"));
+        assert_eq!(
+            after.appeal_deadline, decided.appeal_deadline,
+            "the appeal deadline the accused was owed must survive"
+        );
+    }
+
+    /// Standing follows any mandate this key registered, not only the
+    /// newest. A reporter who re-consents after a manifest is
+    /// republished has not withdrawn the consent they already gave, and
+    /// reports already signed against it are still theirs.
+    #[tokio::test]
+    async fn a_report_signed_against_an_earlier_mandate_still_has_standing() {
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let first = register_mandate(&harness, REPORTER_SEED).await;
+
+        // The reporter re-registers: same key, a later mandate.
+        let manifest_hash = util::sha256_hex(&harness.state.config.manifest_raw);
+        let mut later =
+            mandate_json(REPORTER_SEED, json!(["csam"]), &manifest_hash);
+        later["acceptedAt"] = json!("2026-08-09T00:00:00Z");
+        let (status, response) = harness
+            .post("/v1/mandates", signed(later, "signatures", &[REPORTER_SEED, INTERFACE_SEED]))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(response["mandateRef"].as_str().unwrap(), first);
+
+        // A report signed against the *earlier* mandate is still theirs.
+        let body = signed(report_json(&first, "r-1"), "signature", &[REPORTER_SEED]);
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+    }
+
+    /// `/health` is unauthenticated and proxied on every path, so the
+    /// interface's error bodies — which echo case ids and verdict
+    /// fields — must not be published on it.
+    #[tokio::test]
+    async fn health_publishes_the_count_of_stuck_verdicts_but_not_their_detail() {
+        let harness = Harness::new();
+
+        let (status, public) =
+            harness.send(Request::get("/health").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(public["undeliverableVerdicts"].is_number(), "a monitor needs the count");
+        assert!(public["undeliverable"].is_null(), "and nothing more");
+
+        let (_, moderator) = harness
+            .send(
+                Request::get("/health")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert!(moderator["undeliverable"].is_array(), "the operator gets the detail");
     }
 
 }

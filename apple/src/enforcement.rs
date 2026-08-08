@@ -222,6 +222,16 @@ impl Engine {
                     realizes.push(stored.verdict_ref.clone());
                 }
                 crate::types::Disposition::Ban => {
+                    // Decided, so no longer an open case — whatever
+                    // else is true of the ban. A ban waiting on its
+                    // `executeAfter` used to `continue` before this,
+                    // so for the whole of a suspensive appeal window
+                    // the device kept the aggregate case-open bit set
+                    // while the verdict itself declares
+                    // `case-open: false`. The mark and the document
+                    // authorizing it have to agree.
+                    open_cases.retain(|case_id| case_id != &verdict.case_id);
+
                     if !Self::ban_in_force(stored, now) {
                         // Either not yet at executeAfter, or expired.
                         // A pending replacement does not end an
@@ -712,6 +722,42 @@ mod tests {
             intended.ban_executed,
             "an earlier ban was already branded onto a device; this identity has been marked"
         );
+    }
+
+
+    /// A suspensive ban waits out its appeal window before executing.
+    /// For that whole period the case is *decided*, so the case-open
+    /// bit must be clear — the verdict itself says `case-open: false`,
+    /// and the mark has to agree with the document authorizing it.
+    #[test]
+    fn a_ban_awaiting_its_execute_after_closes_its_case() {
+        let engine = engine();
+        store_verdict(
+            &engine.store,
+            "open-csam",
+            verdict("case-csam", Disposition::OpenCase, "csam"),
+            "2026-08-08T00:00:00Z",
+        );
+        let mut pending = StoredVerdict {
+            verdict_ref: "ban-csam".into(),
+            case_id: "case-csam".into(),
+            mandate_ref: MANDATE.into(),
+            device_binding: DEVICE.into(),
+            raw: serde_json::to_vec(&verdict("case-csam", Disposition::Ban, "csam")).unwrap(),
+            disposition: "ban".into(),
+            ban_expires: None,
+            // Executes a month out: the consented appeal window.
+            execute_after: Some("2026-09-08T00:00:00Z".into()),
+            executed: false,
+            superseded: false,
+        };
+        pending.executed = false;
+        engine.store.put_verdict(&pending, "2026-08-08T01:00:00Z").unwrap();
+        engine.store.supersede_open_case("case-csam").unwrap();
+
+        let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
+        assert!(!intended.bits.banned, "the ban has not begun");
+        assert!(!intended.bits.case_open, "but the case is decided, not open");
     }
 
 }

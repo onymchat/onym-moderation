@@ -85,8 +85,10 @@ worth stating:
   output nobody can verify — a warning produced a service that looked
   healthy, decided cases, and moved no marks.
 - Once `validUntil` has passed, no new mandate is accepted and no new
-  case is opened. Cases already open still run to their deadlines: an
-  expiry must not strand someone under a case-open mark.
+  case is opened — this authority's own manifest and the one the
+  accused's mandate pinned must *both* still be live. Cases already
+  open still run to their deadlines: an expiry must not strand someone
+  under a case-open mark.
 
 ## Endpoints
 
@@ -99,7 +101,7 @@ worth stating:
 | `POST` | `/v1/cases/:id/appeal` | Appeal, or a new-holder claim |
 | `GET` | `/v1/cases/:id/status` | query-status, per the confidentiality policy — requires a party credential |
 | `POST` | `/v1/cases/:id/decide` | The moderator's judgment (bearer token) |
-| `GET` | `/health` | Signing key, manifest hash, whether it can decide or deliver, and any verdicts the interface refuses |
+| `GET` | `/health` | Signing key, manifest hash, whether it can decide or deliver, and how many verdicts the interface refuses |
 
 `/v1/cases/:id/decide` is the only path from a report to a sanction,
 and it needs a human's token. There is no automatic escalation.
@@ -188,9 +190,13 @@ Reference implementation. Known limits:
 
 - **The new-holder path cannot be authenticated here.** A new owner is
   by definition not the mandated identity, so their claim cannot be
-  signature-checked. It is bounded instead — it must answer a ban in
-  force, and only one may be pending per case. Real attestation that a
-  device changed hands needs the interface, which holds the device key.
+  signature-checked. It answers every caller identically — filed or
+  not, real case or invented — and records only claims against a ban in
+  force. Claims are *bounded* per case rather than capped at one:
+  capping at one let any stranger permanently consume the genuine
+  owner's only remedy, which §5.7 makes mandatory, while duplicates are
+  merely noise a moderator skips. Real attestation that a device
+  changed hands needs the interface, which holds the device key.
 
 - **Appeals are recorded, not adjudicated.** Filing an appeal logs it
   and notifies; a human then decides via `decide` with `reverse`. The
