@@ -2,6 +2,7 @@
 
 use std::env;
 
+use crate::profiles::{self, ModelProfile};
 use crate::types::AuthorityManifest;
 
 pub struct Config {
@@ -56,50 +57,22 @@ pub enum TriageMode {
 #[derive(Debug)]
 pub struct TriageConfig {
     pub mode: TriageMode,
-    /// The moderation endpoint. Defaults to a loopback address because
-    /// the model is meant to run on this host: case evidence is
-    /// content a reporter disclosed for adjudication, and shipping it
-    /// to someone else's API is a disclosure of its own.
+    /// The inference endpoint. Defaults to a sibling container because
+    /// the model is meant to run on this host: case evidence is content
+    /// a reporter disclosed for adjudication, and shipping it to
+    /// someone else's API is a disclosure of its own — and, under the
+    /// reference policy, one that requires fresh consent.
     pub url: String,
-    pub model: String,
     pub api_key: Option<String>,
-    /// Score at or above which the classifier recommends a ban.
-    pub ban_threshold: f64,
-    /// Score at or below which it recommends dismissal. Between the
-    /// two it recommends nothing and the case waits for a human (or
-    /// for the decision deadline).
-    pub dismiss_threshold: f64,
-    /// violation class id → the classifier categories that bear on it.
-    /// Without a mapping a category means nothing here: "sexual" is
-    /// not a violation, "unsolicited-pornography" is, and only the
-    /// manifest says so.
-    pub category_map: std::collections::BTreeMap<String, Vec<String>>,
+    /// The consented model profile. Prompt, output parsing, thresholds
+    /// and category mapping all come from here rather than from
+    /// environment variables, because they are terms a user agreed to
+    /// and not settings an operator retunes between cases.
+    pub profile: ModelProfile,
     pub timeout_secs: u64,
 }
 
 impl TriageConfig {
-    /// Categories the Mistral moderation model reports, mapped to the
-    /// example manifest's classes. This is only a default: the mapping
-    /// belongs to whoever wrote the manifest, because it is the point
-    /// where a model's taxonomy is claimed to line up with terms a user
-    /// consented to. Override with `AUTHORITY_TRIAGE_CATEGORY_MAP`.
-    fn default_category_map() -> std::collections::BTreeMap<String, Vec<String>> {
-        let mut map = std::collections::BTreeMap::new();
-        map.insert(
-            "csam".to_string(),
-            vec!["sexual".to_string(), "sexual/minors".to_string()],
-        );
-        map.insert(
-            "credible-violence".to_string(),
-            vec![
-                "violence_and_threats".to_string(),
-                "dangerous_and_criminal_content".to_string(),
-            ],
-        );
-        map.insert("unsolicited-pornography".to_string(), vec!["sexual".to_string()]);
-        map
-    }
-
     fn from_env() -> Result<Option<Self>, String> {
         let mode = match env::var("AUTHORITY_TRIAGE_MODE").unwrap_or_else(|_| "off".into()).as_str() {
             "off" => return Ok(None),
@@ -112,54 +85,66 @@ impl TriageConfig {
             }
         };
 
-        let url = env::var("AUTHORITY_TRIAGE_URL")
-            .unwrap_or_else(|_| "http://moderation-model:8000/v1/moderations".into());
-        let model =
-            env::var("AUTHORITY_TRIAGE_MODEL").unwrap_or_else(|_| "mistral-moderation-latest".into());
-
-        let category_map = match env::var("AUTHORITY_TRIAGE_CATEGORY_MAP") {
-            Ok(raw) => serde_json::from_str(&raw)
-                .map_err(|e| format!("AUTHORITY_TRIAGE_CATEGORY_MAP is not a JSON object of class → [category]: {e}"))?,
-            Err(_) => Self::default_category_map(),
+        // Either a published reference profile by id, or a profile
+        // document of your own. The second is the point: this service is
+        // not tied to the six models anyone happened to write up.
+        let mut profile = match (
+            env::var("AUTHORITY_TRIAGE_PROFILE").ok().filter(|v| !v.is_empty()),
+            env::var("AUTHORITY_TRIAGE_PROFILE_PATH").ok().filter(|v| !v.is_empty()),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err("set AUTHORITY_TRIAGE_PROFILE or AUTHORITY_TRIAGE_PROFILE_PATH, not \
+                            both — two profiles is two sets of terms"
+                    .into())
+            }
+            (Some(id), None) => profiles::by_id(&id).ok_or_else(|| {
+                format!(
+                    "AUTHORITY_TRIAGE_PROFILE {id:?} is not a published profile. Known: {}. \
+                     For any other model, describe it in a JSON profile and set \
+                     AUTHORITY_TRIAGE_PROFILE_PATH.",
+                    profiles::builtin_ids().join(", ")
+                )
+            })?,
+            (None, Some(path)) => {
+                let raw = std::fs::read(&path)
+                    .map_err(|e| format!("AUTHORITY_TRIAGE_PROFILE_PATH {path}: {e}"))?;
+                serde_json::from_slice::<ModelProfile>(&raw)
+                    .map_err(|e| format!("{path} is not a valid model profile: {e}"))?
+            }
+            (None, None) => {
+                return Err(format!(
+                    "AUTHORITY_TRIAGE_MODE is set but no profile is. Set \
+                     AUTHORITY_TRIAGE_PROFILE to one of: {}, or AUTHORITY_TRIAGE_PROFILE_PATH to \
+                     your own. There is no default: which model decides a case is a term users \
+                     consent to, not something to inherit silently.",
+                    profiles::builtin_ids().join(", ")
+                ))
+            }
         };
 
-        let ban_threshold = parse_threshold("AUTHORITY_TRIAGE_BAN_THRESHOLD", 0.9)?;
-        let dismiss_threshold = parse_threshold("AUTHORITY_TRIAGE_DISMISS_THRESHOLD", 0.2)?;
-        if dismiss_threshold >= ban_threshold {
-            return Err(
-                "AUTHORITY_TRIAGE_DISMISS_THRESHOLD must be below AUTHORITY_TRIAGE_BAN_THRESHOLD; \
-                 otherwise there is no band in which the classifier declines to decide"
-                    .into(),
-            );
+        // The one field a deployment legitimately overrides: local
+        // servers name loaded models however they were started, and
+        // that name is not part of anyone's consent.
+        if let Ok(served) = env::var("AUTHORITY_TRIAGE_SERVED_MODEL") {
+            if !served.is_empty() {
+                profile.served_model = served;
+            }
         }
+
+        let url = env::var("AUTHORITY_TRIAGE_URL")
+            .unwrap_or_else(|_| "http://moderation-model:8000/v1/chat/completions".into());
 
         Ok(Some(Self {
             mode,
             url,
-            model,
             api_key: env::var("AUTHORITY_TRIAGE_API_KEY").ok().filter(|v| !v.is_empty()),
-            ban_threshold,
-            dismiss_threshold,
-            category_map,
+            profile,
             timeout_secs: env::var("AUTHORITY_TRIAGE_TIMEOUT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(30),
+                .unwrap_or(120),
         }))
     }
-}
-
-fn parse_threshold(name: &str, default: f64) -> Result<f64, String> {
-    let value = match env::var(name) {
-        Ok(raw) => raw
-            .parse::<f64>()
-            .map_err(|_| format!("{name} must be a number between 0 and 1"))?,
-        Err(_) => default,
-    };
-    if !(0.0..=1.0).contains(&value) {
-        return Err(format!("{name} must be between 0 and 1"));
-    }
-    Ok(value)
 }
 
 impl Config {
@@ -267,7 +252,30 @@ Optional:
   AUTHORITY_STORE_PATH         SQLite path (default: /data/authority.sqlite)
   AUTHORITY_MODERATOR_TOKEN    Bearer token for POST /v1/cases/:id/decide.
                                Unset closes the endpoint — nothing may decide a case.
-  AUTHORITY_DEADLINE_SWEEP_SECS  How often to dismiss overdue cases (default: 300)
+  AUTHORITY_DEADLINE_SWEEP_SECS  How often to dismiss overdue cases, and assess cases
+                               whose response window has closed (default: 300)
+  AUTHORITY_ADMIN_TOKEN        Bearer token for the moderator panel at /admin, where
+                               appeals are reviewed. Unset closes it.
+
+Automated assessment (a model decides; a human reviews on appeal):
+  AUTHORITY_TRIAGE_MODE        off | advisory | autonomous (default: off)
+  AUTHORITY_TRIAGE_PROFILE     Which model, and with it the prompt, output parsing,
+                               thresholds and category mapping. One of:
+                                 shieldstral-3b, gpt-oss-safeguard-20b, qwen3guard-8b,
+                                 nemotron-3.5-content-safety-4b, llama-guard-4-12b,
+                                 shieldgemma-9b
+                               No default: which model decides a case is a term users
+                               consent to, not something to inherit silently.
+  AUTHORITY_TRIAGE_PROFILE_PATH  ...or a profile of your own, as JSON. Set one or the
+                               other, never both.
+  AUTHORITY_TRIAGE_URL         OpenAI-compatible chat-completions endpoint, on this host
+                               (default: http://moderation-model:8000/v1/chat/completions)
+  AUTHORITY_TRIAGE_SERVED_MODEL  What your inference server calls the loaded model, if it
+                               differs from the profile's default. The only triage value
+                               a deployment overrides — thresholds and prompts are
+                               consented policy and live in the profile.
+  AUTHORITY_TRIAGE_API_KEY     Only if the local server requires one
+  AUTHORITY_TRIAGE_TIMEOUT_SECS  Inference timeout (default: 120)
 "#
     }
 }

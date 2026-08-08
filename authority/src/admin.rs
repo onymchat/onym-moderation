@@ -228,8 +228,8 @@ async fn case_detail(
 
 fn assessment_section(state: &AppState, case_id: &str) -> String {
     let Ok(Some((raw, applied))) = state.store.assessment(case_id) else {
-        return "<h2>Automated assessment</h2><p class=empty>None — this case was not \
-                classified.</p>"
+        return "<h2>Automated assessment</h2><p class=empty>None — this case has not been \
+                assessed. A case is not shown to a model until its response window closes.</p>"
             .to_string();
     };
     let Ok(assessment) = serde_json::from_slice::<serde_json::Value>(&raw) else {
@@ -238,48 +238,70 @@ fn assessment_section(state: &AppState, case_id: &str) -> String {
             .to_string();
     };
 
+    let field = |name: &str| escape(assessment[name].as_str().unwrap_or("?"));
     let mut out = String::from("<h2>Automated assessment</h2>");
+
+    // Outcome first, then everything needed to check it. A reviewer on
+    // appeal is deciding whether the machine was right, which means
+    // they need what it was shown and what it actually said — not a
+    // summary of either.
     out.push_str(&format!(
-        "<p>Model <span class=mono>{model}</span> recommended \
-         <strong>{recommendation}</strong> at {score:.3} \
-         (applied: {applied}). Content address \
-         <span class=mono>sha256:{hash}</span> — this is what the verdict's reasoning \
-         points at.</p>",
-        model = escape(assessment["model"].as_str().unwrap_or("?")),
-        recommendation = escape(assessment["recommendation"].as_str().unwrap_or("?")),
-        score = assessment["relevantScore"].as_f64().unwrap_or(0.0),
+        "<p>Outcome <strong>{outcome}</strong> (applied: {applied}). Content address \
+         <span class=mono>sha256:{hash}</span> — this is what the verdict's reasoning points \
+         at.</p><p class=sub>{note}</p>",
+        outcome = field("outcome"),
         applied = if applied { "yes" } else { "no" },
         hash = util::sha256_hex(&raw),
+        note = field("note"),
     ));
 
-    if let Some(relevant) = assessment["relevantCategories"].as_array() {
-        let names: Vec<String> = relevant
-            .iter()
-            .filter_map(|c| c.as_str())
-            .map(escape)
-            .collect();
-        out.push_str(&format!(
-            "<p class=sub>Judged on: {}</p>",
-            if names.is_empty() { "—".to_string() } else { names.join(", ") }
-        ));
+    if let Some(score) = assessment["score"].as_f64() {
+        out.push_str(&format!("<p>Violation score <strong>{score:.4}</strong></p>"));
+    } else {
+        // Said explicitly, because the absence is deliberate: a
+        // label-producing model has no calibrated score, and inventing
+        // one would put a fabricated number in a case file where it
+        // would read as evidence.
+        out.push_str(
+            "<p class=sub>This profile produces a label, not a calibrated score. No confidence \
+             number is recorded because there is none to record.</p>",
+        );
     }
 
-    out.push_str("<table><tr><th>Category</th><th>Score</th><th>Flagged</th></tr>");
-    if let Some(categories) = assessment["categories"].as_array() {
-        for category in categories {
-            out.push_str(&format!(
-                "<tr><td>{}</td><td>{:.3}</td><td>{}</td></tr>",
-                escape(category["category"].as_str().unwrap_or("?")),
-                category["score"].as_f64().unwrap_or(0.0),
-                match category["violated"].as_bool() {
-                    Some(true) => "yes",
-                    Some(false) => "no",
-                    None => "—",
-                }
-            ));
+    if let Some(labels) = assessment["labels"].as_array() {
+        let names: Vec<String> = labels.iter().filter_map(|l| l.as_str()).map(escape).collect();
+        if !names.is_empty() {
+            out.push_str(&format!("<p class=sub>Labels returned: {}</p>", names.join(", ")));
         }
     }
+
+    out.push_str("<table>");
+    for (label, value) in [
+        ("Profile", field("profileId")),
+        ("Model", field("repository")),
+        ("Revision", field("revision")),
+        ("Profile digest", field("profileDigest")),
+        ("Policy digest", field("policyDigest")),
+        ("Class", field("classId")),
+        ("Case-document digest", field("inputDigest")),
+        ("Assessed at", field("assessedAt")),
+    ] {
+        out.push_str(&format!("<tr><th>{label}</th><td class=mono>{value}</td></tr>"));
+    }
+    out.push_str(&format!(
+        "<tr><th>Document contents</th><td>{} evidence item(s), {} response(s)</td></tr>",
+        assessment["evidenceItems"].as_u64().unwrap_or(0),
+        assessment["responseItems"].as_u64().unwrap_or(0),
+    ));
     out.push_str("</table>");
+
+    // The model's own words, escaped. This is the thing an appeal is
+    // actually about.
+    out.push_str(&format!(
+        "<h3>Final model output</h3><pre class=mono>{}</pre>",
+        escape(assessment["rawOutput"].as_str().unwrap_or(""))
+    ));
+
     out
 }
 

@@ -56,4 +56,25 @@ impl AppState {
         };
         Self::new(config, store)
     }
+
+    /// A state wired to a classifier at `url`, running the named
+    /// published profile.
+    #[cfg(test)]
+    pub fn for_tests_with_triage(
+        store: Store,
+        profile_id: &str,
+        url: &str,
+        mode: crate::config::TriageMode,
+    ) -> Self {
+        let mut state = Self::for_tests(store);
+        state.config.triage = Some(crate::config::TriageConfig {
+            mode,
+            url: url.to_string(),
+            api_key: None,
+            profile: crate::profiles::by_id(profile_id).expect("published profile"),
+            timeout_secs: 5,
+        });
+        state.triage = state.config.triage.as_ref().map(crate::triage::Triage::new);
+        state
+    }
 }

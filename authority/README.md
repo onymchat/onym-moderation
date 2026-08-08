@@ -111,12 +111,14 @@ someone says the machine got it wrong. Appeals are the panel's queue.
 
 Whatever the mode, three things do not change:
 
-- **A ban waits for the response window.** Triage may reach a ban the
-  moment a report lands; the verdict is deferred until the accused's
-  consented window has elapsed — answering early does not release it,
-  because the window is time they were promised rather than one chance
-  to speak. A classifier's certainty is not a reason to shorten it, so
-  the guard lives in `decisions.rs` where all three callers inherit it.
+- **A ban waits for the response window** — and so does the assessment
+  itself. A case is not shown to a model until the accused's consented
+  window has elapsed, because the document the model judges must be the
+  completed one, including whatever they filed in their own defence.
+  Answering early does not bring it forward: the window is time they
+  were promised, not one chance to speak. The ban guard lives in
+  `decisions.rs`, where all three callers inherit it, so a classifier's
+  certainty cannot shorten it either.
 - **A ban after the decision deadline is refused.** By then the case is
   already dismissed by default, and a decider must not win that race
   against the sweep.
@@ -124,6 +126,107 @@ Whatever the mode, three things do not change:
   someone wait for one helps nobody.
 - **Undecided is still dismissal.** If the model is down and no human
   arrives, the case hits its decision deadline and dismisses itself.
+
+## Which model? Any of them.
+
+Nothing in this service is tied to a particular vendor. A **model
+profile** is a prompt template plus an output adapter, and everything
+model-specific — prompt, output format, thresholds, category mapping,
+what counts as invalid — lives in one. Six published profiles ship
+built in:
+
+| `AUTHORITY_TRIAGE_PROFILE` | Model | Decides by |
+|---|---|---|
+| `shieldstral-3b` | `mistralai/Shieldstral-1.0-3B` | first-token score, 0.90 / 0.20 |
+| `gpt-oss-safeguard-20b` | `openai/gpt-oss-safeguard-20b` | binary `1` / `0` |
+| `qwen3guard-8b` | `Qwen/Qwen3Guard-Gen-8B` | native taxonomy |
+| `nemotron-3.5-content-safety-4b` | `nvidia/Nemotron-3.5-Content-Safety` | `User Safety:` label |
+| `llama-guard-4-12b` | `meta-llama/Llama-Guard-4-12B` | native hazard codes |
+| `shieldgemma-9b` | `google/shieldgemma-9b` | first-token score, 0.90 / 0.20 |
+
+Each corresponds to a published profile document in
+[`../authorities/`](../authorities/), and each pins a model repository
+*and revision*: a different revision is a different decision-maker, so
+it is part of the terms rather than a deployment detail.
+
+For anything else, write the same shape as JSON and point
+`AUTHORITY_TRIAGE_PROFILE_PATH` at it — no code change, because there
+is no code that knows about any particular model:
+
+```json
+{
+  "id": "house-classifier-v3",
+  "displayName": "In-house classifier",
+  "profileDigest": "<sha256 of your published profile document>",
+  "policyDigest": "<sha256 of the policy it incorporates>",
+  "repository": "example-org/house-classifier",
+  "revision": "<commit>",
+  "servedModel": "house-classifier",
+  "supportsImages": false,
+  "maxInputTokens": 8192,
+  "nativeTaxonomy": false,
+  "prompt": {
+    "system": "Apply this rule and answer VIOLATION or CLEAR:\n{rule}",
+    "user": "{document}",
+    "usesCanonicalRule": true
+  },
+  "adapter": { "kind": "exactOutput", "ban": "VIOLATION", "dismiss": "CLEAR" }
+}
+```
+
+Four adapter kinds cover the published profiles: `firstTokenScore`,
+`exactOutput`, `labelLine`, and `nativeTaxonomy`.
+
+### A profile is consented policy, not configuration
+
+There is no `AUTHORITY_TRIAGE_BAN_THRESHOLD`, and that absence is
+deliberate. The reference policy requires an authority to publish its
+prompt, thresholds, mapping and invalid-output behaviour *before*
+consent, and says those values "are consented policy, not mutable
+server configuration". An operator who could retune the ban threshold
+between two cases would be deciding the second one under terms nobody
+agreed to. The only field a deployment overrides is
+`AUTHORITY_TRIAGE_SERVED_MODEL` — what your inference server happens to
+call the loaded model, which is nobody's consent.
+
+There is also no default profile. Which model decides a case is a term
+users agree to; inheriting one silently is not a thing this service
+will do.
+
+## Three outcomes, and the third one matters most
+
+Every adapter returns ban, dismiss, or **no decision**. Output that is
+invalid, incomplete, in an ambiguous score band, or in a category this
+class does not map to is *not* a verdict:
+
+- the case stays open, and the sweep retries it;
+- if no valid decision ever lands, the decision deadline dismisses it.
+
+The failure mode this exists to prevent: unrecognised response → no
+categories found → score zero → dismiss, which would turn every model
+outage into a mass acquittal. Its mirror image would be far worse. A
+test asserts that none of the six profiles turns a timeout page, a
+refusal, or an empty body into a verdict.
+
+Only score-producing profiles record a score. A profile whose model
+emits a label gets **no** invented confidence number — a fabricated
+`0.5` sitting in a case file reads as evidence to whoever opens it
+later.
+
+## Category mapping, for profiles that use one
+
+A model's native categories are not violation classes. `Violent` is not
+an offence; `credible-violence` is, and only the manifest says so. The
+native-taxonomy profiles publish that correspondence, along with the
+mismatch it carries: `S12` does not establish that a transmission was
+unsolicited, and `Sexual Content or Sexual Acts` does not establish
+that anyone was under 18. That is why those profiles disclose the
+mismatch at consent time and why a human applies the *narrower*
+canonical rule on appeal.
+
+Only the code mapped to the case's class counts. A model flagging some
+other category has said nothing about the class the accused consented
+to be judged under, and the outcome is no decision — never a ban.
 
 ## The model runs on this host
 
@@ -133,32 +236,42 @@ logs an error at boot if it points anywhere else.
 Case evidence is content a recipient disclosed *for adjudication*.
 Sending it to a third party's API is a further disclosure — one the
 manifest's confidentiality policy would have to declare (§8 obligation
-6) and that users consented without being told about. Keeping inference
-local means the disclosed content stays with the operator who was
-consented to.
+6), and which the reference policy makes a change requiring fresh
+consent. Keeping inference local means the disclosed content stays with
+the operator who was consented to.
 
-The client speaks the documented moderation shape
-(`POST /v1/moderations` with `{model, input}`), and accepts both
-response forms the API has used — the older `results[].category_scores`
-and the newer `guardrails[].*.categories`. What can serve that shape
-locally depends on your licensing, so the compose file leaves the image
-to the operator rather than pinning one this project cannot verify.
+The client speaks the OpenAI-compatible chat-completions shape that
+llama.cpp, vLLM, Ollama and TGI all serve. Score-based profiles
+additionally need `logprobs` and `top_logprobs`; the service says so at
+boot, because otherwise the symptom is every case quietly reaching no
+decision. What can serve a given model locally depends on your
+licensing, so the compose file leaves the image to the operator rather
+than pinning one this project cannot verify.
 
-**A response it cannot parse is an error, never a clean result.** The
-tempting failure mode — unrecognised JSON, no categories, score zero,
-dismiss — would turn every outage into an acquittal.
+## What the model is shown
 
-## Category mapping
+The case document is the reference policy's §4.1 shape, in order:
+`CLASS`, `REPORTED MATERIAL`, `REPORT CONTEXT`, `ACCUSED RESPONSE` —
+the last being the literal `NONE` when nobody answered, because silence
+is a fact about the case rather than an absence in the prompt.
 
-A model's categories are not violation classes. `sexual` is not an
-offence; `unsolicited-pornography` is, and only the manifest says so.
-`AUTHORITY_TRIAGE_CATEGORY_MAP` is where you assert the correspondence,
-and a class with no mapping is scored as inconclusive rather than given
-an invented number.
+It is built **after the response window closes**, never on arrival.
+Assessing earlier would ask the model about a document the accused had
+not finished answering, and then decide the case on that reading.
 
-Only categories mapped to the case's class count toward its score, so a
-case about one class cannot be decided by a model's opinion about
-conduct nobody consented to have judged.
+Every untrusted field is fenced, and text that would close its own
+fence is defanged on the way in — visibly, so a reviewer can see the
+author wrote something fence-shaped rather than wonder why the quoted
+evidence differs. This is not a claim that prompt injection is solved;
+the profiles say plainly that it is not. It removes the cheapest
+version.
+
+The document's SHA-256 goes on the assessment, so an appeal can
+establish exactly what the model saw. So do the profile digest, policy
+digest, model revision, the raw final output, and how many evidence
+items and responses were in the document — "did it see my reply?" has a
+recorded answer rather than an inferred one. Private chain-of-thought
+is not stored: it is neither a verdict reason nor evidence.
 
 ## The moderator panel
 

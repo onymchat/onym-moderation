@@ -13,12 +13,15 @@
 mod admin;
 mod api;
 mod canonical;
+mod casedoc;
 mod cases;
 mod config;
 mod deadlines;
 mod decisions;
 mod delivery;
 mod error;
+mod policy;
+mod profiles;
 mod state;
 mod store;
 mod triage;
@@ -121,11 +124,35 @@ async fn main() {
         tracing::info!(
             mode = ?triage.mode,
             url = %triage.url,
-            model = %triage.model,
-            ban_threshold = triage.ban_threshold,
-            dismiss_threshold = triage.dismiss_threshold,
+            profile = %triage.profile.id,
+            repository = %triage.profile.repository,
+            revision = %triage.profile.revision,
+            served_model = %triage.profile.served_model,
+            profile_digest = %triage.profile.profile_digest,
+            policy_digest = %triage.profile.policy_digest,
+            native_taxonomy = triage.profile.native_taxonomy,
             "triage enabled"
         );
+
+        // A class the profile cannot decide is not fatal — those cases
+        // wait for a human and dismiss at their deadline — but the
+        // symptom is "the classifier has gone quiet", which is a bad
+        // thing to have to diagnose from case records.
+        let unmappable = crate::triage::unmappable_classes(&triage.profile, &state.config.manifest);
+        if !unmappable.is_empty() {
+            tracing::warn!(
+                classes = %unmappable.join(", "),
+                profile = %triage.profile.id,
+                "this profile has no rule or native category for these manifest classes; cases \
+                 in them will never be decided automatically"
+            );
+        }
+        if crate::triage::needs_logprobs(&triage.profile) {
+            tracing::info!(
+                "this profile scores from first-token log probabilities; the inference server \
+                 must support `logprobs` and `top_logprobs` or every case will reach no decision"
+            );
+        }
         if Config::triage_leaves_this_host(triage) {
             tracing::error!(
                 url = %triage.url,

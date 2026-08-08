@@ -97,32 +97,28 @@ async fn sweep_overdue(
     Ok(dismissed)
 }
 
-/// Retry classification for open cases that have none, and apply bans
-/// the classifier recommended once the accused's response window has
-/// closed.
+/// Assess every case whose response window has closed and that has no
+/// decision from the model yet.
 ///
-/// The deferral is the whole point. Triage may reach a ban the moment a
-/// report lands, but the accused is owed their consented window to
-/// answer first, so the recommendation waits here rather than being
-/// applied early — and answering does not release it early either: the
-/// window is time the accused was promised, not one chance to speak. If
-/// the classifier never comes back, the decision deadline dismisses the
-/// case; and because the dismissal sweep runs before this one, an
-/// overdue case is dismissed rather than banned.
+/// The timing is the point. The reference policy has the authority
+/// assess the *completed* case document — the one that includes
+/// whatever the accused chose to file — so a case is not shown to a
+/// model until the window they were promised has run out. There is no
+/// "classify on arrival, apply later" path any more: an assessment made
+/// before the response exists is an assessment of a different document,
+/// and deciding on it would make the response window decorative.
+///
+/// A case whose last assessment reached no decision is retried, which
+/// is the "valid retry" the policy allows. If none ever lands, the
+/// decision deadline dismisses the case — and because the dismissal
+/// sweep runs first, an overdue case is dismissed rather than decided.
 pub async fn triage_sweep(state: &AppState, now: OffsetDateTime) -> Result<(), Error> {
     if state.triage.is_none() {
         return Ok(());
     }
 
-    for case in state.store.cases_without_assessment()? {
+    for case in state.store.cases_awaiting_assessment(&util::format_timestamp(now))? {
         crate::triage::assess_and_maybe_decide(state, &case.case_id, now).await;
-    }
-
-    // Cases where a ban was recommended but deferred. Re-running the
-    // decision is cheap and idempotent: it either lands now or is
-    // refused again for the same reason.
-    for case in state.store.cases_with_deferred_ban()? {
-        crate::triage::apply_deferred_ban(state, &case.case_id, now).await;
     }
 
     Ok(())

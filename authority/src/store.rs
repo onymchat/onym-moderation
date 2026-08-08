@@ -1078,42 +1078,65 @@ impl Store {
 
     /// Open cases with no assessment yet — retried by the sweep, since
     /// a classifier outage must not strand a case.
-    pub fn cases_without_assessment(&self) -> Result<Vec<CaseRecord>, Error> {
+    /// The reporters' own explanations attached to evidence items —
+    /// untrusted text, and labelled as such by the caller. Kept
+    /// separate from the material itself because they are an assertion
+    /// *about* the evidence rather than evidence of authorship.
+    pub fn report_context_for_case(&self, case_id: &str) -> Result<Vec<String>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement =
+            conn.prepare("SELECT raw FROM reports WHERE case_id = ?1 ORDER BY filed_at")?;
+        let rows = statement.query_map(params![case_id], |row| row.get::<_, Vec<u8>>(0))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let raw = row?;
+            let Ok(report) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            let Some(items) = report.get("evidence").and_then(|e| e.as_array()) else {
+                continue;
+            };
+            for item in items {
+                if let Some(context) = item.get("context").and_then(|c| c.as_str()) {
+                    if !context.trim().is_empty() {
+                        out.push(context.to_string());
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Open cases ready for automated assessment: the accused's
+    /// response window has closed, and either nothing has assessed them
+    /// yet or the last attempt reached no decision.
+    ///
+    /// The window condition is policy, not scheduling — §4.1 has the
+    /// authority assess the *completed* case document. Retrying a
+    /// no-decision is the "valid retry" §4.2 allows: a model that
+    /// returned garbage once may answer on the next pass, and if it
+    /// never does, the decision deadline dismisses the case.
+    pub fn cases_awaiting_assessment(&self, now: &str) -> Result<Vec<CaseRecord>, Error> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(&format!(
-            "SELECT {} FROM cases WHERE stage = 'open'
-               AND case_id NOT IN (SELECT case_id FROM assessments)
-             ORDER BY opened_at",
+            "SELECT {} FROM cases c
+              WHERE c.stage = 'open'
+                AND c.response_deadline <= ?1
+                AND NOT EXISTS (
+                      SELECT 1 FROM assessments a
+                       WHERE a.case_id = c.case_id
+                         AND a.recommendation <> 'no-decision')
+              ORDER BY c.opened_at",
             Self::CASE_COLUMNS
         ))?;
-        let rows = statement.query_map([], Self::case_from_row)?;
+        let rows = statement.query_map(params![now], Self::case_from_row)?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
         }
         Ok(out)
     }
-
-    /// Open cases the classifier recommended banning, whose ban has not
-    /// been applied. The sweep revisits these once the accused's
-    /// response window has closed.
-    pub fn cases_with_deferred_ban(&self) -> Result<Vec<CaseRecord>, Error> {
-        let conn = self.conn.lock().unwrap();
-        let mut statement = conn.prepare(&format!(
-            "SELECT {} FROM cases WHERE stage = 'open' AND case_id IN
-               (SELECT case_id FROM assessments WHERE recommendation = 'ban' AND applied = 0)
-             ORDER BY opened_at",
-            Self::CASE_COLUMNS
-        ))?;
-        let rows = statement.query_map([], Self::case_from_row)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    }
-
-    // ─── Assessments ─────────────────────────────────────────────────
 
     pub fn put_assessment(
         &self,
