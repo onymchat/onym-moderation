@@ -99,7 +99,7 @@ worth stating:
 | `POST` | `/v1/cases/:id/appeal` | Appeal, or a new-holder claim |
 | `GET` | `/v1/cases/:id/status` | query-status, per the confidentiality policy — requires a party credential |
 | `POST` | `/v1/cases/:id/decide` | The moderator's judgment (bearer token) |
-| `GET` | `/health` | Signing key, manifest hash, whether it can decide or deliver |
+| `GET` | `/health` | Signing key, manifest hash, whether it can decide or deliver, and any verdicts the interface refuses |
 
 `/v1/cases/:id/decide` is the only path from a report to a sanction,
 and it needs a human's token. There is no automatic escalation.
@@ -111,10 +111,31 @@ signing `query-status:<caseId>` with the key that made them one
 a case that does not exist, because a distinguishable refusal would
 confirm that a named person is under investigation.
 
+Every refusal on that endpoint looks the same — bad signature, right
+key; good signature, wrong key; a case that does not exist. Checking
+membership before the signature would answer a question the caller had
+proved no right to ask.
+
 `respond` and `appeal` carry `caseId` **inside** the signed bytes. Left
 out, a signed "that wasn't me" could be lifted from one case and
 replayed onto another as an answer to an accusation its signer never
 saw.
+
+## Delivery can fail, and failing is not deciding
+
+A verdict is signed and stored whether or not the interface is
+reachable; an undelivered verdict is a delivery problem, never an
+undecided case. Unreachable and 5xx are retried indefinitely.
+
+A **4xx is different**: the interface refused the verdict's shape, and
+identical bytes will be refused identically forever. After three
+refusals the verdict is marked undeliverable and stops being retried —
+not deleted, and not treated as delivered. It appears in `/health` as
+`undeliverableVerdicts` with the interface's own error, because each
+one is a mark that should have moved and did not: for a dismissal
+somebody stays marked, and for a ban a sanction the authority believes
+it issued is in force nowhere. Re-POSTing it every five minutes turned
+that into a log line nobody reads.
 
 ## A canonicalization hazard worth knowing
 

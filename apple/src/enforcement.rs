@@ -162,7 +162,15 @@ impl Engine {
             return Ok(None);
         }
 
-        let mut case_open = false;
+        // The case-open bit is aggregate — one bit for the device, not
+        // one per case — and that is exactly why it has to be derived
+        // from the set of cases still open rather than from whichever
+        // terminal verdict arrived last. A device can carry several
+        // cases at once, and clearing the bit on case B's dismissal
+        // takes case A's notice down with it: `gate_check` only serves
+        // notices when the bit is set, so the accused would stop being
+        // told about a case they are still expected to answer.
+        let mut open_cases: Vec<String> = Vec::new();
         // More than one consented class can produce a live ban on the
         // same device. Keep them by case while folding so a dismissal
         // reverses only the case it names rather than clearing an
@@ -188,15 +196,18 @@ impl Engine {
             // unrelated write succeeded.
             match verdict.disposition {
                 crate::types::Disposition::OpenCase => {
-                    case_open = true;
+                    if !open_cases.contains(&verdict.case_id) {
+                        open_cases.push(verdict.case_id.clone());
+                    }
                     authorized_by = stored.verdict_ref.clone();
                     realizes.push(stored.verdict_ref.clone());
                 }
                 crate::types::Disposition::Dismiss => {
-                    // The profile has one aggregate case-open bit, so
-                    // any terminal verdict clears it. A dismissal is a
-                    // ban reversal only for its own case.
-                    case_open = false;
+                    // Terminal for its own case, and only its own:
+                    // this case stops contributing to the aggregate
+                    // bit, and the dismissal is a ban reversal only
+                    // here.
+                    open_cases.retain(|case_id| case_id != &verdict.case_id);
                     let mut removed_refs = Vec::new();
                     bans.retain(|(verdict_ref, active, _)| {
                         if active.case_id == verdict.case_id {
@@ -246,7 +257,9 @@ impl Engine {
                     });
                     realizes.retain(|verdict_ref| !removed_refs.contains(verdict_ref));
 
-                    case_open = false;
+                    // Decided, so no longer an open case — but again,
+                    // only this one.
+                    open_cases.retain(|case_id| case_id != &verdict.case_id);
                     bans.push((stored.verdict_ref.clone(), verdict, stored.executed));
                     authorized_by = stored.verdict_ref.clone();
                     realizes.push(stored.verdict_ref.clone());
@@ -266,8 +279,17 @@ impl Engine {
             .map(|(_, _, executed)| *executed)
             .unwrap_or(false);
 
+        // A ban in force is the reason the banned bit is set, so it
+        // names the write even when a dismissal in some other case
+        // arrived afterwards. Otherwise the write log reads "banned
+        // bits, authorized by a dismissal", and an auditor has no way
+        // to tell that from a forgery.
+        if let Some((verdict_ref, _, _)) = bans.last() {
+            authorized_by = verdict_ref.clone();
+        }
+
         Ok(Some(Intended {
-            bits: Bits { case_open, banned: !bans.is_empty() },
+            bits: Bits { case_open: !open_cases.is_empty(), banned: !bans.is_empty() },
             authorized_by,
             ban,
             realizes,
@@ -538,4 +560,108 @@ mod tests {
         assert!(!intended.bits.banned);
         assert!(intended.ban.is_none());
     }
+
+    /// The other half of the same fold. Two cases open at once — they
+    /// are different classes, opened by different reports — and the
+    /// case-open bit is aggregate. Dismissing one must not clear it
+    /// while the other is still running: `gate_check` only serves
+    /// notices when the bit is set, so the accused would silently stop
+    /// being told about a case they are still expected to answer.
+    #[test]
+    fn dismissal_leaves_the_case_open_bit_set_while_another_case_runs() {
+        let engine = engine();
+        store_verdict(
+            &engine.store,
+            "open-csam",
+            verdict("case-csam", Disposition::OpenCase, "csam"),
+            "2026-08-08T00:00:00Z",
+        );
+        store_verdict(
+            &engine.store,
+            "open-violence",
+            verdict("case-violence", Disposition::OpenCase, "credible-violence"),
+            "2026-08-08T01:00:00Z",
+        );
+        store_verdict(
+            &engine.store,
+            "dismiss-violence",
+            verdict("case-violence", Disposition::Dismiss, "credible-violence"),
+            "2026-08-08T02:00:00Z",
+        );
+        engine.store.supersede_open_case("case-violence").unwrap();
+
+        let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
+        assert!(intended.bits.case_open, "case-csam is still open and still owed its notice");
+        assert!(!intended.bits.banned);
+    }
+
+    /// And the last one closing does clear it.
+    #[test]
+    fn the_case_open_bit_clears_when_the_last_case_closes() {
+        let engine = engine();
+        store_verdict(
+            &engine.store,
+            "open-csam",
+            verdict("case-csam", Disposition::OpenCase, "csam"),
+            "2026-08-08T00:00:00Z",
+        );
+        store_verdict(
+            &engine.store,
+            "dismiss-csam",
+            verdict("case-csam", Disposition::Dismiss, "csam"),
+            "2026-08-08T02:00:00Z",
+        );
+        engine.store.supersede_open_case("case-csam").unwrap();
+
+        let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
+        assert!(!intended.bits.case_open);
+    }
+
+    /// A ban in one case does not close another case either — and when
+    /// it expires, the still-open case is still marked.
+    #[test]
+    fn a_ban_in_one_case_does_not_close_another() {
+        let engine = engine();
+        store_verdict(
+            &engine.store,
+            "open-csam",
+            verdict("case-csam", Disposition::OpenCase, "csam"),
+            "2026-08-08T00:00:00Z",
+        );
+        store_verdict(
+            &engine.store,
+            "ban-violence",
+            verdict("case-violence", Disposition::Ban, "credible-violence"),
+            "2026-08-08T01:00:00Z",
+        );
+
+        let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
+        assert!(intended.bits.banned);
+        assert!(intended.bits.case_open, "the csam case is still awaiting its response");
+    }
+
+    /// The write log must not attribute a banned device to a
+    /// dismissal. An auditor reading that has no way to tell a bug
+    /// from a forgery.
+    #[test]
+    fn a_banned_write_is_attributed_to_the_ban_not_a_later_dismissal() {
+        let engine = engine();
+        store_verdict(
+            &engine.store,
+            "ban-csam",
+            verdict("case-csam", Disposition::Ban, "csam"),
+            "2026-08-08T00:00:00Z",
+        );
+        store_verdict(
+            &engine.store,
+            "dismiss-violence",
+            verdict("case-violence", Disposition::Dismiss, "credible-violence"),
+            "2026-08-08T02:00:00Z",
+        );
+
+        let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
+        assert!(intended.bits.banned);
+        assert_eq!(intended.authorized_by, "ban-csam");
+    }
+
 }

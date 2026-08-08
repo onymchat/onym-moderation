@@ -181,6 +181,15 @@ impl Store {
                 appeal_deadline   TEXT
             );
             CREATE INDEX IF NOT EXISTS cases_by_stage ON cases (stage);
+            -- At most one open case per (accused, class). Intake checks
+            -- for an existing open case before opening one, but that
+            -- check and the insert are separate statements: two reports
+            -- arriving together can both find none and both open a
+            -- case, each setting a mark before anyone has decided
+            -- anything. The database is the only place that race can
+            -- actually be settled.
+            CREATE UNIQUE INDEX IF NOT EXISTS one_open_case_per_accused_class
+                ON cases (accused, class_id) WHERE stage = 'open';
 
             -- The accused's responses, kept whole. Discarding the
             -- counter-evidence would mean deciding, and later
@@ -209,7 +218,21 @@ impl Store {
                 disposition TEXT NOT NULL,
                 raw         BLOB NOT NULL,
                 issued_at   TEXT NOT NULL,
-                delivered   INTEGER NOT NULL DEFAULT 0
+                delivered   INTEGER NOT NULL DEFAULT 0,
+                -- How many delivery attempts have been refused, and
+                -- what the interface last said. A verdict the interface
+                -- rejects on its shape will be rejected identically
+                -- forever; without a count it just re-POSTs every sweep
+                -- and the mismatch shows up as a log line nobody reads
+                -- rather than as a thing that is stuck.
+                attempts      INTEGER NOT NULL DEFAULT 0,
+                last_error    TEXT,
+                -- Set when the interface has refused the verdict's
+                -- shape enough times that retrying is pointless. Not a
+                -- deletion: the verdict stands, and the mark it should
+                -- have moved has not moved, which is exactly what an
+                -- operator needs to see.
+                undeliverable INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS verdicts_undelivered ON verdicts (delivered);
             "#,
@@ -508,6 +531,11 @@ impl Store {
     /// row without its open-case verdict would set a mark the accused
     /// has no signed document for; a verdict without its case would be
     /// a mark nothing can ever clear.
+    ///
+    /// Returns `Ok(false)` when another case is already open for this
+    /// accused and class — the unique index caught a concurrent
+    /// opener, and the caller should join that case instead of opening
+    /// a second one.
     #[allow(clippy::too_many_arguments)]
     pub fn open_case_atomically(
         &self,
@@ -517,10 +545,41 @@ impl Store {
         raw: &[u8],
         at: &str,
         event_detail: &str,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        Self::write_case(&tx, case)?;
+        // Plain INSERT, not INSERT OR REPLACE: the unique partial index
+        // is the point, and swallowing its violation would defeat it.
+        match tx.execute(
+            "INSERT INTO cases
+             (case_id, accused, reporter, class_id, mandate_ref, device_binding, stage,
+              opened_at, response_deadline, decision_deadline, responded, disposition,
+              appeal_deadline)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                case.case_id,
+                case.accused,
+                case.reporter,
+                case.class_id,
+                case.mandate_ref,
+                case.device_binding,
+                case.stage,
+                case.opened_at,
+                case.response_deadline,
+                case.decision_deadline,
+                case.responded as i32,
+                case.disposition,
+                case.appeal_deadline,
+            ],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Ok(false);
+            }
+            Err(e) => return Err(e.into()),
+        }
         tx.execute(
             "INSERT OR REPLACE INTO verdicts (verdict_ref, case_id, disposition, raw, issued_at, delivered)
              VALUES (?1, ?2, ?3, ?4, ?5, 0)",
@@ -531,7 +590,7 @@ impl Store {
             params![case.case_id, at, "case_opened", event_detail],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     fn case_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CaseRecord> {
@@ -660,10 +719,59 @@ impl Store {
     pub fn mark_delivered(&self, verdict_ref: &str) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE verdicts SET delivered = 1 WHERE verdict_ref = ?1",
+            "UPDATE verdicts SET delivered = 1, last_error = NULL WHERE verdict_ref = ?1",
             params![verdict_ref],
         )?;
         Ok(())
+    }
+
+    /// Record a refused delivery, returning how many have now been
+    /// counted for this verdict.
+    pub fn record_delivery_failure(&self, verdict_ref: &str, error: &str) -> Result<i64, Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE verdicts SET attempts = attempts + 1, last_error = ?2 WHERE verdict_ref = ?1",
+            params![verdict_ref, error],
+        )?;
+        let attempts = conn
+            .query_row(
+                "SELECT attempts FROM verdicts WHERE verdict_ref = ?1",
+                params![verdict_ref],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        Ok(attempts)
+    }
+
+    /// Stop retrying a verdict the interface refuses. Not a deletion:
+    /// the verdict stands, and the mark it authorizes has not moved,
+    /// which is the thing an operator needs to see.
+    pub fn mark_undeliverable(&self, verdict_ref: &str) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE verdicts SET undeliverable = 1 WHERE verdict_ref = ?1",
+            params![verdict_ref],
+        )?;
+        Ok(())
+    }
+
+    /// Verdicts that have been signed, stored, and given up on. Each
+    /// one is a mark that should have moved and did not — surfaced on
+    /// `/health` so it reads as a fault rather than as silence.
+    pub fn undeliverable_verdicts(&self) -> Result<Vec<(String, String)>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT verdict_ref, COALESCE(last_error, '')
+               FROM verdicts WHERE delivered = 0 AND undeliverable = 1
+              ORDER BY issued_at",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// Verdicts the interface has not acknowledged yet. Delivery is
@@ -681,7 +789,7 @@ impl Store {
                LEFT JOIN cases c    ON c.case_id = v.case_id
                LEFT JOIN mandates m ON m.mandate_ref = c.mandate_ref
                LEFT JOIN manifests mf ON mf.manifest_hash = m.manifest_hash
-              WHERE v.delivered = 0
+              WHERE v.delivered = 0 AND v.undeliverable = 0
               ORDER BY v.issued_at",
         )?;
         let rows = statement.query_map([], |row| {

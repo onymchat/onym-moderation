@@ -65,8 +65,10 @@ curl -s https://$AUTHORITY_HOST/manifest.json | head -20
 ```
 
 `/health` reports the signing key, the manifest hash, whether a
-moderator token is configured (`canDecide`), and whether verdict
-delivery is wired (`interfaceConfigured`). All four should be what you
+moderator token is configured (`canDecide`), whether verdict delivery
+is wired (`interfaceConfigured`), and `undeliverableVerdicts` — any the
+interface has refused outright. That last one should be zero; each
+entry is a mark that should have moved and did not. All four should be what you
 expect. If the process exited at boot, read stderr: a manifest whose
 `operator` disagrees with the signing key, or an unparseable
 `validUntil`, both stop the service deliberately. `interfaceConfigured: false` means verdicts are signed and

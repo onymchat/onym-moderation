@@ -44,7 +44,17 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// parties; the store is not a place to put unbounded prose.
 const MAX_STATEMENT_BYTES: usize = 16 * 1024;
 
+/// How many separate responses one case will hold. Generous — the
+/// accused may answer, then file more counter-evidence as they find
+/// it — but not unbounded.
+const MAX_RESPONSES_PER_CASE: usize = 32;
+
 async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
+    // Verdicts the interface refuses are surfaced here rather than
+    // only in a log. Each one is a mark that should have moved and did
+    // not, and "delivery has quietly failed for a week" should not be
+    // something an operator finds out from a case record.
+    let stuck = state.store.undeliverable_verdicts().unwrap_or_default();
     Json(json!({
         "status": "ok",
         "authority": state.config.manifest.component_id,
@@ -52,6 +62,11 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
         "manifestHash": util::sha256_hex(&state.config.manifest_raw),
         "interfaceConfigured": state.delivery.configured(),
         "canDecide": state.config.moderator_token.is_some(),
+        "undeliverableVerdicts": stuck.len(),
+        "undeliverable": stuck
+            .iter()
+            .map(|(verdict_ref, error)| json!({ "verdictRef": verdict_ref, "error": error }))
+            .collect::<Vec<_>>(),
     }))
 }
 
@@ -264,16 +279,15 @@ async fn file_report(
     // Further reports join an open case rather than opening a second
     // one. Opening a case sets a mark before any response, so
     // duplicate cases would be a way to punish without deciding.
+    //
+    // The lookup and the insert are separate statements, so two reports
+    // arriving together can both find nothing. The store's unique
+    // partial index settles that race; losing it means someone else
+    // opened the case a moment ago, and the honest response is to join
+    // theirs — the same thing we would have done had we looked a
+    // moment later.
     let case = match state.store.open_case_for(&report.accused, &report.class_id)? {
-        Some(existing) => {
-            state.store.append_event(
-                &existing.case_id,
-                &stamp,
-                "report_joined",
-                &format!("report {} joined the open case", report.report_id),
-            )?;
-            existing
-        }
+        Some(existing) => join_case(&state, &existing, &report, &stamp)?,
         None => {
             // Consent has a horizon. Opening a case under terms whose
             // validity has lapsed would apply an agreement neither side
@@ -283,7 +297,22 @@ async fn file_report(
             if now > valid_until {
                 return Err(Error::NoJurisdiction);
             }
-            open_case(&state, &report, &accused_mandate, &class, now).await?
+            match open_case(&state, &report, &accused_mandate, &class, now).await? {
+                Some(opened) => opened,
+                None => {
+                    let existing = state
+                        .store
+                        .open_case_for(&report.accused, &report.class_id)?
+                        .ok_or_else(|| {
+                            Error::Internal(
+                                "a concurrent case opening was refused, but no open case is on \
+                                 file for this accused and class"
+                                    .into(),
+                            )
+                        })?;
+                    join_case(&state, &existing, &report, &stamp)?
+                }
+            }
         }
     };
 
@@ -348,15 +377,34 @@ fn require_manifest_current(state: &AppState, action: &str) -> Result<(), Error>
     Ok(())
 }
 
+/// Attach a report to a case already open for this accused and class.
+fn join_case(
+    state: &AppState,
+    existing: &CaseRecord,
+    report: &Report,
+    stamp: &str,
+) -> Result<CaseRecord, Error> {
+    state.store.append_event(
+        &existing.case_id,
+        stamp,
+        "report_joined",
+        &format!("report {} joined the open case", report.report_id),
+    )?;
+    Ok(existing.clone())
+}
+
 /// Open a case: set the deadlines the manifest declares, issue the
 /// interim `open-case` verdict, and hand it to the interface.
+///
+/// `Ok(None)` means another case for this accused and class was opened
+/// concurrently and won; the caller joins that one.
 async fn open_case(
     state: &AppState,
     report: &Report,
     accused_mandate: &crate::store::MandateRecord,
     class: &ViolationClass,
     now: OffsetDateTime,
-) -> Result<CaseRecord, Error> {
+) -> Result<Option<CaseRecord>, Error> {
     let response_days = util::parse_days(&class.response_window)
         .map_err(|e| Error::Internal(format!("manifest responseWindow: {e}")))?;
     let decision_days = util::parse_days(&class.decision_deadline)
@@ -388,7 +436,7 @@ async fn open_case(
     // The case row, its interim verdict, and the event are one write.
     // Split, a crash in between leaves either a mark with no signed
     // verdict behind it or a verdict for a case that does not exist.
-    state.store.open_case_atomically(
+    let opened = state.store.open_case_atomically(
         &case,
         &issued.verdict_ref,
         &issued.disposition,
@@ -396,10 +444,18 @@ async fn open_case(
         &stamp,
         &issued.verdict_ref,
     )?;
+    if !opened {
+        tracing::info!(
+            accused = %report.accused,
+            class_id = %report.class_id,
+            "a case for this accused and class was opened concurrently; joining it"
+        );
+        return Ok(None);
+    }
 
     state.delivery.flush(&state.store).await?;
     tracing::info!(case_id = %case.case_id, "case opened");
-    Ok(case)
+    Ok(Some(case))
 }
 
 // ─── respond / appeal ────────────────────────────────────────────────
@@ -424,12 +480,28 @@ async fn respond(
             response.case_id
         )));
     }
+    if response.statement.len() > MAX_STATEMENT_BYTES {
+        return Err(Error::BadRequest(format!(
+            "statement exceeds {MAX_STATEMENT_BYTES} bytes"
+        )));
+    }
     let mut case = state
         .store
         .case(&case_id)?
         .ok_or_else(|| Error::NotFound(format!("case {case_id}")))?;
     if case.stage != "open" {
         return Err(Error::CaseState("case is already decided".into()));
+    }
+    // The accused may answer more than once — further evidence within
+    // the window travels the same path — but not without limit. This
+    // is storage hygiene rather than a security boundary: the caller
+    // is signature-authenticated as the accused, so the cost of
+    // exceeding it falls on someone with nothing to gain.
+    if state.store.responses(&case_id)?.len() >= MAX_RESPONSES_PER_CASE {
+        return Err(Error::CaseState(format!(
+            "this case already holds {MAX_RESPONSES_PER_CASE} responses; further material \
+             belongs in one of them rather than in another filing"
+        )));
     }
 
     let signing_bytes = canonical::report_signing_bytes(&body)?;
@@ -834,19 +906,29 @@ fn authorize_case_party(
         ));
     };
 
+    // Signature first, party membership second — and the same refusal
+    // for both. Checking membership first answered a question the
+    // caller had proved no right to ask: a non-party key got `404` and
+    // a party key with a bogus signature got `401`, so anyone holding a
+    // case id could learn whether a given key is the accused, or a
+    // reporter on the case, with no proof at all. That is precisely the
+    // fact the not-found answer exists to withhold.
+    let message = format!("query-status:{case_id}");
+    let signature_valid = verify_signature(key, message.as_bytes(), signature).is_ok();
+
     let is_party = key == case.accused
-        || state.store.case_reporters(case_id)?.iter().any(|r| r == key)
-        || key == case.reporter;
-    if !is_party {
-        // Same answer as an unparticipating key asking about a case
-        // that does not exist: a distinguishable refusal would confirm
-        // the case is real.
-        return Err(Error::NotFound(format!("case {case_id}")));
+        || key == case.reporter
+        || state.store.case_reporters(case_id)?.iter().any(|r| r == key);
+
+    if signature_valid && is_party {
+        return Ok(());
     }
 
-    let message = format!("query-status:{case_id}");
-    verify_signature(key, message.as_bytes(), signature)
-        .map_err(|_| Error::SignatureInvalid("case-party signature did not verify".into()))
+    // One answer for every failure: wrong signature, right key; right
+    // signature, wrong key; a case that does not exist at all. A
+    // distinguishable refusal would confirm that a named person is
+    // under investigation.
+    Err(Error::NotFound(format!("case {case_id}")))
 }
 
 fn verify_signature(key_reference: &str, message: &[u8], signature: &str) -> Result<(), Error> {
@@ -1427,4 +1509,134 @@ mod tests {
             "the case must hold the window the accused consented to, not the published one"
         );
     }
+
+    /// Checking party membership before the signature answered a
+    /// question the caller had proved no right to ask: a non-party key
+    /// got 404 and a party key with a bad signature got 401, so anyone
+    /// holding a case id could learn whether a given key is a party to
+    /// it. Every failure now looks the same.
+    #[tokio::test]
+    async fn query_status_does_not_reveal_party_membership_without_a_signature() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+
+        let bogus = testing::sign(STRANGER_SEED, b"some other message");
+        let ask = |key: [u8; 32]| {
+            format!(
+                "/v1/cases/{case_id}/status?key={}&signature={}",
+                testing::key_reference(key),
+                urlencode(&bogus)
+            )
+        };
+
+        // The accused, with a signature that does not verify.
+        let (party, _) =
+            harness.send(Request::get(ask(ACCUSED_SEED)).body(Body::empty()).unwrap()).await;
+        // A stranger, with the same bad signature.
+        let (stranger, _) =
+            harness.send(Request::get(ask(STRANGER_SEED)).body(Body::empty()).unwrap()).await;
+        // A case that does not exist at all.
+        let (missing, _) = harness
+            .send(
+                Request::get("/v1/cases/case-nope/status?key=onym:key:00&signature=x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(party, StatusCode::NOT_FOUND);
+        assert_eq!(stranger, StatusCode::NOT_FOUND);
+        assert_eq!(missing, StatusCode::NOT_FOUND);
+        assert_eq!(
+            party, stranger,
+            "a party with a bad signature must be indistinguishable from a non-party"
+        );
+    }
+
+    /// Two reports arriving together must not open two cases: each
+    /// would set a mark before anyone decided anything.
+    #[tokio::test]
+    async fn concurrent_reports_open_exactly_one_case() {
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+
+        // Same accused and class, two distinct reports, filed together.
+        let first = signed(report_json(&reporter_mandate, "r-1"), "signature", &[REPORTER_SEED]);
+        let second = signed(report_json(&reporter_mandate, "r-2"), "signature", &[REPORTER_SEED]);
+        let (a, b) = tokio::join!(
+            harness.post("/v1/reports", first),
+            harness.post("/v1/reports", second)
+        );
+        assert_eq!(a.0, StatusCode::OK, "{}", a.1);
+        assert_eq!(b.0, StatusCode::OK, "{}", b.1);
+        assert_eq!(a.1["caseId"], b.1["caseId"], "both reports must join one case");
+
+        // And exactly one open-case verdict was issued, so exactly one
+        // mark was ever authorized.
+        let queued = harness.state.store.undelivered_verdicts().unwrap();
+        assert_eq!(queued.len(), 1, "one case opening, one interim verdict");
+    }
+
+    /// The store refuses a second open case for the same accused and
+    /// class outright — the race above is settled there, not by
+    /// hoping the check-then-act window stays narrow.
+    #[test]
+    fn the_store_refuses_a_second_open_case_for_the_same_accused_and_class() {
+        let store = Store::in_memory().unwrap();
+        let case = |case_id: &str| crate::store::CaseRecord {
+            case_id: case_id.into(),
+            accused: "onym:key:acc".into(),
+            reporter: "onym:key:rep".into(),
+            class_id: "csam".into(),
+            mandate_ref: "m1".into(),
+            device_binding: "d1".into(),
+            stage: "open".into(),
+            opened_at: "2026-08-01T00:00:00Z".into(),
+            response_deadline: "2026-08-04T00:00:00Z".into(),
+            decision_deadline: "2026-08-08T00:00:00Z".into(),
+            responded: false,
+            disposition: None,
+            appeal_deadline: None,
+        };
+        assert!(store
+            .open_case_atomically(&case("c1"), "v1", "open-case", b"{}", "t0", "v1")
+            .unwrap());
+        assert!(
+            !store
+                .open_case_atomically(&case("c2"), "v2", "open-case", b"{}", "t0", "v2")
+                .unwrap(),
+            "a second open case for the same accused and class is refused"
+        );
+
+        // Once the first is decided, a later case may open.
+        let mut decided = case("c1");
+        decided.stage = "decided".into();
+        decided.disposition = Some("dismiss".into());
+        store.put_case(&decided).unwrap();
+        assert!(store
+            .open_case_atomically(&case("c3"), "v3", "open-case", b"{}", "t1", "v3")
+            .unwrap());
+    }
+
+    /// `appeal` bounded its statement and `respond` did not. Same
+    /// untrusted free text, same store.
+    #[tokio::test]
+    async fn a_response_statement_is_bounded_like_an_appeal_is() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+
+        let body = signed(
+            json!({
+                "caseId": case_id,
+                "statement": "x".repeat(MAX_STATEMENT_BYTES + 1),
+                "evidence": [],
+            }),
+            "signature",
+            &[ACCUSED_SEED],
+        );
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/respond"), body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
 }
