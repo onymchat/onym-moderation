@@ -324,6 +324,14 @@ renders it alongside the rule to apply, and `query-status` returns it
 to the accused, so the content address in a verdict's `reasoning` is
 something a party can actually resolve.
 
+**The model's stored output carries no reasoning.** A profile running
+with thinking enabled puts the whole block inside its final message,
+and the reference policy is explicit that private chain-of-thought "is
+neither a verdict reason nor evidence and need not be retained or
+disclosed". It is stripped before storage, leaving a visible marker.
+The adapter still evaluates the full output — an unclosed reasoning
+block is how it detects a truncated generation.
+
 **The accused's copy withholds `REPORT CONTEXT`.** That field is the
 reporter writing in their own words, and "he sent it after I asked him
 to stop" identifies them completely in a two-person conversation — a
@@ -332,6 +340,20 @@ withholding is visible rather than silent: an accused shown a gap can
 ask about it, one shown a seamless document does not know there is
 anything to ask for. Moderators see the whole of it, because the
 authority is allowed to.
+
+The same withholding applies to the **model's own output**, which can
+quote what it was shown — ShieldGemma's prompt asks it to "walk
+through step by step", and Nemotron reasons in the open. Redacting the
+document and then serving the model's prose beside it would close one
+channel and leave the one next to it open.
+
+What this catches is verbatim quotation, which is the realistic case.
+It cannot catch a paraphrase, and nothing at this layer can: a model
+that restates the reporter's account in its own words has still said
+it. That residue is a reason to prefer the label-producing profiles
+where a reporter's safety is the dominant concern — `qwen3guard-8b`,
+`llama-guard-4-12b`, `gpt-oss-safeguard-20b` and `shieldstral-3b` all
+emit a bounded label rather than prose.
 
 Its SHA-256 goes on the assessment, and is re-checked after inference:
 a reading of a document that changed while the model held it — a late

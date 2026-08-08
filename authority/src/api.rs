@@ -1040,6 +1040,27 @@ async fn query_status(
                         };
                         object.insert("document".into(), Value::String(visible));
                     }
+                    // The model's own words can quote what it was
+                    // shown. Withholding the reporter's account from
+                    // the document and then handing it back inside
+                    // `rawOutput` would close one channel and leave the
+                    // one beside it open.
+                    if !moderator {
+                        let contexts = state.store.report_context_for_case(&case_id)?;
+                        if let Some(raw) = object.get("rawOutput").and_then(Value::as_str) {
+                            let cleaned =
+                                crate::casedoc::withhold_quoted_context(raw, &contexts);
+                            object.insert("rawOutput".into(), Value::String(cleaned));
+                        }
+                        // The adapter's own note is generated here, but
+                        // it can echo an unreadable output back for
+                        // diagnosis, so it gets the same treatment.
+                        if let Some(note) = object.get("note").and_then(Value::as_str) {
+                            let cleaned =
+                                crate::casedoc::withhold_quoted_context(note, &contexts);
+                            object.insert("note".into(), Value::String(cleaned));
+                        }
+                    }
                 }
                 value
             }
@@ -3088,6 +3109,80 @@ mod tests {
             "upheld",
             "the completed review stands"
         );
+    }
+
+
+    /// Redacting the document and then serving the model's prose beside
+    /// it closes one channel and leaves the adjacent one open. Two
+    /// published profiles ask the model to reason in the open, so its
+    /// output can quote the field the document redaction just removed.
+    #[tokio::test]
+    async fn the_models_own_words_cannot_quote_the_reporter_back_to_the_accused() {
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+
+        let account = "he sent it right after I asked him to stop";
+        let mut report = report_json(&reporter_mandate, "r-1");
+        report["evidence"][0]["context"] = json!(account);
+        let (status, response) =
+            harness.post("/v1/reports", signed(report, "signature", &[REPORTER_SEED])).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let case_id = response["caseId"].as_str().unwrap().to_string();
+
+        // A model that reasons in the open, quoting what it was shown.
+        let case = harness.state.store.case(&case_id).unwrap().unwrap();
+        let document = crate::casedoc::build(&harness.state.store, &case).unwrap();
+        let assessment = json!({
+            "outcome": "no-decision",
+            "rawOutput": format!("No. The report context says \"{account}\", which does not \
+                                  establish the required elements."),
+            "note": "score 0.1100 at or below the profile's dismissal threshold 0.2",
+        });
+        harness
+            .state
+            .store
+            .put_assessment(
+                &case_id,
+                &serde_json::to_vec(&assessment).unwrap(),
+                "no-decision",
+                &document.text,
+                true,
+            )
+            .unwrap();
+
+        let message = format!("query-status:{case_id}");
+        let url = format!(
+            "/v1/cases/{case_id}/status?key={}&signature={}",
+            testing::key_reference(ACCUSED_SEED),
+            urlencode(&testing::sign(ACCUSED_SEED, message.as_bytes()))
+        );
+        let (status, view) = harness.send(Request::get(url).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Nowhere in the answer — not the document, not the model's
+        // words about it.
+        assert!(
+            !view.to_string().contains("asked him to stop"),
+            "the reporter's account leaked: {view}"
+        );
+        let raw = view["assessment"]["rawOutput"].as_str().unwrap();
+        assert!(raw.contains("[withheld"), "and the withholding is visible: {raw}");
+        assert!(
+            raw.contains("does not establish the required elements"),
+            "the rest of the model's reasoning still reaches them: {raw}"
+        );
+
+        // The moderator reviewing the appeal sees all of it.
+        let (_, panel) = harness
+            .send(
+                Request::get(format!("/v1/cases/{case_id}/status"))
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert!(panel["assessment"]["rawOutput"].as_str().unwrap().contains("asked him to stop"));
     }
 
 }

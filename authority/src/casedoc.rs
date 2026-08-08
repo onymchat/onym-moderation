@@ -165,6 +165,39 @@ pub fn redact_report_context(document: &str) -> String {
     out
 }
 
+/// Withhold any of the reporter's account that appears verbatim in
+/// some other text — in practice, the model's own output.
+///
+/// Redacting the document and then serving the model's prose beside it
+/// closes one channel and leaves the adjacent one open. Two of the
+/// published profiles ask the model to reason in the open —
+/// ShieldGemma's prompt says "walk through step by step", and Nemotron
+/// runs with thinking enabled — so their output can quote the material
+/// they were shown, including the field the document redaction just
+/// removed.
+///
+/// This catches verbatim quotation, which is the realistic case. It
+/// cannot catch a paraphrase, and nothing at this layer can: a model
+/// that restates "he sent it after I asked him to stop" in its own
+/// words has still said it. That residue is a reason to prefer the
+/// label-producing profiles where the reporter's safety matters most,
+/// and it is stated as such in the README rather than papered over.
+pub fn withhold_quoted_context(text: &str, contexts: &[String]) -> String {
+    let mut out = text.to_string();
+    for context in contexts {
+        let trimmed = context.trim();
+        // Very short fragments would match half the language; the
+        // point is quotation, not coincidence.
+        if trimmed.len() < 12 {
+            continue;
+        }
+        if out.contains(trimmed) {
+            out = out.replace(trimmed, "[withheld — quoted from the reporter's account]");
+        }
+    }
+    out
+}
+
 /// Wrap untrusted text so it cannot close its own fence.
 ///
 /// The replacement is visible rather than silent: a reviewer reading

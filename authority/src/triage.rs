@@ -317,7 +317,19 @@ impl Triage {
             input_digest: document.digest.clone(),
             evidence_items: document.evidence_items,
             response_items: document.response_items,
-            raw_output: truncate(raw_output, MAX_STORED_OUTPUT),
+            // Reasoning is stripped before storage, not after. The
+            // reference policy is explicit that private
+            // chain-of-thought "is neither a verdict reason nor
+            // evidence and need not be retained or disclosed", and a
+            // profile that runs with thinking enabled puts the whole
+            // block inside the final message — so `raw_output` was
+            // storing it verbatim while the comment on this struct
+            // claimed it was absent.
+            //
+            // The adapter still evaluates the *full* output: an
+            // unclosed reasoning block is how it detects a truncated
+            // generation, and it needs to see one to say so.
+            raw_output: truncate(&strip_reasoning(raw_output), MAX_STORED_OUTPUT),
             outcome: assessed.outcome.as_str().to_string(),
             score: assessed.score,
             labels: assessed.labels,
@@ -423,6 +435,29 @@ fn parse_completion(value: &Value) -> Option<ModelOutput> {
     }
 
     Some(ModelOutput { text, first_token_logprobs })
+}
+
+/// Remove `<think>…</think>` blocks, leaving a visible marker.
+///
+/// An unclosed block is stripped to the end of the output: a
+/// generation cut off mid-reasoning is all reasoning, and keeping the
+/// tail of it would retain exactly what this removes.
+fn strip_reasoning(text: &str) -> String {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        out.push_str("[reasoning withheld]");
+        match rest[start..].find(CLOSE) {
+            Some(end) => rest = &rest[start + end + CLOSE.len()..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn truncate(value: &str, limit: usize) -> String {
@@ -1221,6 +1256,68 @@ mod tests {
 
         let due = state.store.cases_awaiting_assessment("2026-08-12T00:00:00Z").unwrap();
         assert_eq!(due[0].1, 1);
+    }
+
+
+    /// The struct's own comment says private chain-of-thought is
+    /// absent. A profile running with thinking enabled puts the whole
+    /// block inside the final message, so it was being stored verbatim
+    /// — the comment describing a property the code did not hold, for
+    /// the third time in this branch.
+    #[test]
+    fn reasoning_is_stripped_before_storage() {
+        let stored = strip_reasoning(
+            "<think>the reporter says he sent it after she asked him to stop</think>\n\
+             User Safety: unsafe",
+        );
+        assert!(!stored.contains("asked him to stop"), "{stored}");
+        assert!(stored.contains("User Safety: unsafe"), "the answer survives: {stored}");
+        assert!(stored.contains("[reasoning withheld]"), "and the removal is visible");
+    }
+
+    /// A generation cut off mid-reasoning is all reasoning. Keeping the
+    /// tail would retain exactly what stripping removes.
+    #[test]
+    fn an_unclosed_reasoning_block_is_stripped_to_the_end() {
+        let stored = strip_reasoning("<think>weighing whether she consented, she said she");
+        assert!(!stored.contains("consented"), "{stored}");
+        assert_eq!(stored, "[reasoning withheld]");
+    }
+
+    #[test]
+    fn output_without_reasoning_is_untouched() {
+        assert_eq!(strip_reasoning("Safety: Unsafe\nCategories: Violent"), "Safety: Unsafe\nCategories: Violent");
+    }
+
+    /// End to end: the adapter still sees the reasoning (it needs an
+    /// unclosed block to detect a truncated generation), and the store
+    /// does not.
+    #[tokio::test]
+    async fn the_adapter_reads_reasoning_that_the_store_never_keeps() {
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content":
+                "<think>she says he sent it unprompted after she blocked him</think>\n\
+                 User Safety: unsafe"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "csam", "2026-08-04T00:00:00Z");
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "nemotron-3.5-content-safety-4b",
+            &url,
+            TriageMode::Advisory,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let (raw, _) = state.store.assessment("c1").unwrap().unwrap();
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        // The adapter read the label out of the text after the block...
+        assert_eq!(assessment.outcome, "ban");
+        // ...and none of the reasoning was kept.
+        assert!(!assessment.raw_output.contains("blocked him"), "{}", assessment.raw_output);
+        assert!(assessment.raw_output.contains("User Safety: unsafe"));
     }
 
 }
