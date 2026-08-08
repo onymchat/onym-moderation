@@ -1188,7 +1188,7 @@ async fn requeue_verdict(
         )));
     }
     tracing::warn!(%verdict_ref, "operator requeued an undeliverable verdict");
-    flush_soon(&state);
+    crate::delivery::flush_soon(&state);
     Ok(Json(json!({ "verdictRef": verdict_ref, "requeued": true })))
 }
 

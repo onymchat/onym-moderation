@@ -578,10 +578,29 @@ fn consented_model_profile(
     case: &CaseRecord,
 ) -> Result<Option<crate::types::ModelProfileReference>, Error> {
     let Some(mandate) = state.store.mandate(&case.mandate_ref)? else {
-        return Ok(state.config.manifest.model_profile.clone());
+        // No mandate on file at all. Nothing can be attributed to
+        // terms this case's accused agreed to, so nothing decides it.
+        return Err(Error::Internal(format!(
+            "case {} names mandate {}, which is not on file; refusing to pick a decider for \
+             terms that cannot be read",
+            case.case_id, case.mandate_ref
+        )));
     };
     let Some(raw) = state.store.manifest_bytes(&mandate.manifest_hash)? else {
-        return Ok(state.config.manifest.model_profile.clone());
+        // A legacy mandate with no snapshot. The published bytes stand
+        // in only while they still hash to what the mandate pinned —
+        // the same rule #2 applied to the class terms, and for the same
+        // reason: falling back to whatever is published now is how a
+        // case gets decided under terms its accused never saw.
+        let published = util::sha256_hex(&state.config.manifest_raw);
+        if published == mandate.manifest_hash {
+            return Ok(state.config.manifest.model_profile.clone());
+        }
+        return Err(Error::Internal(format!(
+            "mandate {} pins manifest {}, its snapshot is missing, and the published manifest \
+             hashes to {published}; refusing to choose a decider under unconsented terms",
+            mandate.mandate_ref, mandate.manifest_hash
+        )));
     };
     let manifest: crate::types::AuthorityManifest = serde_json::from_slice(&raw)
         .map_err(|e| Error::Internal(format!("stored consented manifest unparseable: {e}")))?;
@@ -758,6 +777,24 @@ mod tests {
             appeal_state: "none".into(),
             new_holder_state: "none".into(),
         };
+        // The mandate the case names, with the manifest it consented
+        // to. A case whose mandate is not on file is not a real case:
+        // nothing can be attributed to terms its accused agreed to, and
+        // the decider is chosen from those terms.
+        store
+            .put_mandate(
+                &crate::store::MandateRecord {
+                    mandate_ref: "m1".into(),
+                    user_key: "onym:key:acc".into(),
+                    device_binding: "d1".into(),
+                    classes: vec![class_id.to_string()],
+                    manifest_hash: util::sha256_hex(crate::testing::MANIFEST_JSON.as_bytes()),
+                },
+                b"{}",
+                crate::testing::MANIFEST_JSON.as_bytes(),
+                "2026-08-01T00:00:00Z",
+            )
+            .unwrap();
         store.put_case(&case).unwrap();
         // Notice served: a ban — automated or not — requires the
         // opening verdict to have reached the interface.
@@ -1005,6 +1042,20 @@ mod tests {
             appeal_state: "none".into(),
             new_holder_state: "none".into(),
         };
+        store
+            .put_mandate(
+                &crate::store::MandateRecord {
+                    mandate_ref: "m1".into(),
+                    user_key: "onym:key:acc".into(),
+                    device_binding: "d1".into(),
+                    classes: vec!["csam".into()],
+                    manifest_hash: util::sha256_hex(crate::testing::MANIFEST_JSON.as_bytes()),
+                },
+                b"{}",
+                crate::testing::MANIFEST_JSON.as_bytes(),
+                "2026-08-01T00:00:00Z",
+            )
+            .unwrap();
         store.put_case(&case).unwrap();
         let state = std::sync::Arc::new(AppState::for_tests_with_triage(
             store,
@@ -1116,7 +1167,10 @@ mod tests {
         let store = crate::store::Store::in_memory().unwrap();
         open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
 
-        // The mandate consented to a manifest naming a different model.
+        // A second mandate, whose manifest names a different model, and
+        // the case pointed at it. Mandates are immutable — the store
+        // ignores a re-insert under the same ref — so this cannot be
+        // done by overwriting the fixture's.
         let consented = crate::testing::MANIFEST_JSON.replace(
             "\"moderationProfileId\"",
             "\"modelProfile\": {\"id\": \"shieldgemma-9b\", \"digest\": \"deadbeef\"},\n  \"moderationProfileId\"",
@@ -1124,7 +1178,7 @@ mod tests {
         store
             .put_mandate(
                 &crate::store::MandateRecord {
-                    mandate_ref: "m1".into(),
+                    mandate_ref: "m2".into(),
                     user_key: "onym:key:acc".into(),
                     device_binding: "d1".into(),
                     classes: vec!["credible-violence".into()],
@@ -1135,6 +1189,9 @@ mod tests {
                 "2026-08-01T00:00:00Z",
             )
             .unwrap();
+        let mut case = store.case("c1").unwrap().unwrap();
+        case.mandate_ref = "m2".into();
+        store.put_case(&case).unwrap();
 
         let state = std::sync::Arc::new(AppState::for_tests_with_triage(
             store,
