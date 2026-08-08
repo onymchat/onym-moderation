@@ -151,7 +151,22 @@ impl Engine {
     }
 
     /// Fold this device's verdicts into the marks they currently
-    /// authorize. Later verdicts win; expiry and supersession clear.
+    /// authorize.
+    ///
+    /// **The fold is per case**, and that is the whole of the
+    /// difficulty. A device can carry several cases at once — they are
+    /// different classes, opened by different reports — and each has
+    /// its own verdict history. Folding them into one running pair of
+    /// bits made the newest verdict in *any* case overwrite the state
+    /// of every other: dismissing case B cleared case A's case-open
+    /// mark, which silently stopped the accused being served a notice
+    /// for a case they are still expected to answer, and worse, cleared
+    /// an in-force ban from case A, since a reversal and an unrelated
+    /// dismissal are the same disposition on the wire and only the case
+    /// id tells them apart.
+    ///
+    /// So: take the latest surviving verdict of each case, then ask
+    /// what the set of them implies. Within a case, later still wins.
     fn intended_marks(
         &self,
         device_binding: &str,
@@ -162,12 +177,12 @@ impl Engine {
             return Ok(None);
         }
 
-        let mut case_open = false;
-        let mut ban: Option<(String, Verdict)> = None;
-        let mut authorized_by = String::from("reconciliation");
-        let mut realizes: Vec<String> = Vec::new();
-        let mut ban_executed = false;
-
+        // Oldest first, so a later verdict for the same case replaces
+        // the earlier one. `order` keeps cases in the sequence their
+        // latest verdict arrived, which is what "newest" means below.
+        let mut latest: std::collections::HashMap<String, (&StoredVerdict, Verdict)> =
+            Default::default();
+        let mut order: Vec<String> = Vec::new();
         for stored in verdicts.iter().rev() {
             if stored.superseded {
                 continue;
@@ -179,45 +194,69 @@ impl Engine {
                     continue;
                 }
             };
-            // `realizes` collects only verdicts whose marks this write
-            // actually puts into effect — a ban still waiting on its
-            // executeAfter must not be flagged executed because some
-            // unrelated write succeeded.
+            latest.insert(stored.case_id.clone(), (stored, verdict));
+            order.retain(|case_id| case_id != &stored.case_id);
+            order.push(stored.case_id.clone());
+        }
+        if latest.is_empty() {
+            return Ok(None);
+        }
+
+        let mut open_cases: Vec<String> = Vec::new();
+        let mut governing_ban: Option<(String, Verdict, bool)> = None;
+        let mut newest_terminal: Option<String> = None;
+        let mut realizes: Vec<String> = Vec::new();
+
+        for case_id in &order {
+            let Some((stored, verdict)) = latest.get(case_id) else { continue };
             match verdict.disposition {
                 crate::types::Disposition::OpenCase => {
-                    case_open = true;
-                    authorized_by = stored.verdict_ref.clone();
+                    open_cases.push(stored.verdict_ref.clone());
                     realizes.push(stored.verdict_ref.clone());
                 }
                 crate::types::Disposition::Dismiss => {
-                    // Dismissal clears the case-open mark, and a
-                    // reversal on appeal clears a ban.
-                    case_open = false;
-                    ban = None;
-                    authorized_by = stored.verdict_ref.clone();
+                    // Clears *this* case only — its interim mark, or
+                    // its own ban when this is a reversal on appeal.
+                    newest_terminal = Some(stored.verdict_ref.clone());
                     realizes.push(stored.verdict_ref.clone());
                 }
                 crate::types::Disposition::Ban => {
-                    if !Self::ban_in_force(stored, now) {
-                        // Either not yet at executeAfter, or expired.
-                        // Both mean: not banned right now.
-                        if Self::ban_expired(stored, now) {
-                            authorized_by = "expiry".into();
-                            ban = None;
-                        }
-                        continue;
+                    if Self::ban_in_force(stored, now) {
+                        governing_ban =
+                            Some((stored.verdict_ref.clone(), verdict.clone(), stored.executed));
+                        newest_terminal = Some(stored.verdict_ref.clone());
+                        realizes.push(stored.verdict_ref.clone());
+                    } else if Self::ban_expired(stored, now) {
+                        // The verdict's own authority clears it; no
+                        // further object is needed, and nothing new is
+                        // realized by the clearing.
+                        newest_terminal = Some("expiry".into());
                     }
-                    case_open = false;
-                    ban = Some((stored.verdict_ref.clone(), verdict));
-                    authorized_by = stored.verdict_ref.clone();
-                    realizes.push(stored.verdict_ref.clone());
-                    ban_executed = stored.executed;
+                    // Otherwise: decided, but not yet at executeAfter.
+                    // It authorizes nothing yet — and the case-open
+                    // mark does not survive it either, because the case
+                    // is no longer undecided.
                 }
             }
         }
 
+        // Whichever verdict actually accounts for the bits being
+        // written. A ban in force is the reason the banned bit is set,
+        // so it names the write even when some later dismissal in
+        // another case arrived afterwards — the write log should not
+        // attribute a banned device to a dismissal.
+        let authorized_by = match (&governing_ban, open_cases.last(), &newest_terminal) {
+            (Some((verdict_ref, _, _)), _, _) => verdict_ref.clone(),
+            (None, Some(verdict_ref), _) => verdict_ref.clone(),
+            (None, None, Some(verdict_ref)) => verdict_ref.clone(),
+            (None, None, None) => String::from("reconciliation"),
+        };
+
+        let ban_executed = governing_ban.as_ref().map(|(_, _, executed)| *executed).unwrap_or(false);
+        let ban = governing_ban.map(|(verdict_ref, verdict, _)| (verdict_ref, verdict));
+
         Ok(Some(Intended {
-            bits: Bits { case_open, banned: ban.is_some() },
+            bits: Bits { case_open: !open_cases.is_empty(), banned: ban.is_some() },
             authorized_by,
             ban,
             realizes,
@@ -347,5 +386,240 @@ impl Engine {
             &stamp,
         )?;
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+
+    fn engine() -> Engine {
+        // No DeviceCheck credentials: these exercise the fold, which is
+        // where the reasoning lives. Writing bits is Apple's side.
+        Engine { store: Store::in_memory().unwrap(), device_check: None }
+    }
+
+    fn at(stamp: &str) -> OffsetDateTime {
+        util::parse_timestamp(stamp).unwrap()
+    }
+
+    /// One stored verdict for `case_id`. `received_at` is the caller's
+    /// ordering handle — the fold's whole premise is that later
+    /// verdicts within a case win.
+    fn verdict(
+        engine: &Engine,
+        verdict_ref: &str,
+        case_id: &str,
+        disposition: &str,
+        received_at: &str,
+        adjust: impl FnOnce(&mut serde_json::Value, &mut StoredVerdict),
+    ) {
+        let mut body = serde_json::json!({
+            "verdictVersion": 1,
+            "caseId": case_id,
+            "authority": "onym:component:test-authority",
+            "mandateRef": "m1",
+            "accusedKeys": ["onym:key:acc"],
+            "deviceBinding": "device-1",
+            "classId": "csam",
+            "disposition": disposition,
+            "marks": {
+                "case-open": disposition == "open-case",
+                "banned": disposition == "ban",
+            },
+            "reasoning": "hash:findings",
+            "decidedAt": received_at,
+            "signature": "c2ln",
+            "final": disposition != "open-case",
+        });
+        let mut stored = StoredVerdict {
+            verdict_ref: verdict_ref.into(),
+            case_id: case_id.into(),
+            mandate_ref: "m1".into(),
+            device_binding: "device-1".into(),
+            raw: Vec::new(),
+            disposition: disposition.into(),
+            ban_expires: None,
+            execute_after: None,
+            executed: false,
+            superseded: false,
+        };
+        adjust(&mut body, &mut stored);
+        stored.raw = serde_json::to_vec(&body).unwrap();
+        engine.store.put_verdict(&stored, received_at).unwrap();
+    }
+
+    fn plain(_: &mut serde_json::Value, _: &mut StoredVerdict) {}
+
+    fn ban_from<'a>(
+        execute_after: &'a str,
+        expires: Option<&'a str>,
+    ) -> impl FnOnce(&mut serde_json::Value, &mut StoredVerdict) + 'a {
+        move |body: &mut serde_json::Value, stored: &mut StoredVerdict| {
+            body["executeAfter"] = serde_json::json!(execute_after);
+            stored.execute_after = Some(execute_after.into());
+            if let Some(expires) = expires {
+                body["banExpires"] = serde_json::json!(expires);
+                stored.ban_expires = Some(expires.into());
+            }
+        }
+    }
+
+    fn marks(engine: &Engine, now: &str) -> Intended {
+        engine.intended_marks("device-1", at(now)).unwrap().expect("verdicts on file")
+    }
+
+    /// The bug this fold exists to prevent. Two cases open at once —
+    /// different classes, different reports. Dismissing one must not
+    /// clear the other's case-open mark, because notice delivery is
+    /// gated on that bit: the accused would silently stop being served
+    /// a notice for a case they are still expected to answer.
+    #[test]
+    fn dismissing_one_case_leaves_another_open_case_marked() {
+        let engine = engine();
+        verdict(&engine, "v-a-open", "case-a", "open-case", "2026-08-01T00:00:00Z", plain);
+        verdict(&engine, "v-b-open", "case-b", "open-case", "2026-08-02T00:00:00Z", plain);
+        verdict(&engine, "v-b-dismiss", "case-b", "dismiss", "2026-08-03T00:00:00Z", plain);
+        engine.store.supersede_open_case("case-b").unwrap();
+
+        let intended = marks(&engine, "2026-08-04T00:00:00Z");
+        assert!(intended.bits.case_open, "case A is still open and still owed its notice");
+        assert!(!intended.bits.banned);
+        assert_eq!(intended.authorized_by, "v-a-open");
+    }
+
+    /// Worse version of the same fold: a reversal and an unrelated
+    /// dismissal are the same disposition on the wire, and only the
+    /// case id separates them. Dismissing case B must not lift case
+    /// A's ban.
+    #[test]
+    fn dismissing_one_case_does_not_lift_another_cases_ban() {
+        let engine = engine();
+        verdict(&engine, "v-a-ban", "case-a", "ban", "2026-08-01T00:00:00Z",
+                ban_from("2026-08-01T00:00:00Z", Some("2026-12-01T00:00:00Z")));
+        verdict(&engine, "v-b-open", "case-b", "open-case", "2026-08-02T00:00:00Z", plain);
+        verdict(&engine, "v-b-dismiss", "case-b", "dismiss", "2026-08-03T00:00:00Z", plain);
+        engine.store.supersede_open_case("case-b").unwrap();
+
+        let intended = marks(&engine, "2026-08-04T00:00:00Z");
+        assert!(intended.bits.banned, "the ban in case A is untouched by case B's dismissal");
+        assert_eq!(intended.ban.as_ref().unwrap().0, "v-a-ban");
+    }
+
+    /// And the reversal that *is* about this case does lift it.
+    #[test]
+    fn a_reversal_in_the_same_case_lifts_its_ban() {
+        let engine = engine();
+        verdict(&engine, "v-ban", "case-a", "ban", "2026-08-01T00:00:00Z",
+                ban_from("2026-08-01T00:00:00Z", Some("2026-12-01T00:00:00Z")));
+        verdict(&engine, "v-reversal", "case-a", "dismiss", "2026-08-05T00:00:00Z", plain);
+
+        let intended = marks(&engine, "2026-08-06T00:00:00Z");
+        assert!(!intended.bits.banned);
+        assert!(!intended.bits.case_open);
+        assert_eq!(intended.authorized_by, "v-reversal");
+    }
+
+    /// The write log must not attribute a banned device to a
+    /// dismissal. An auditor reading "banned bits, authorized by a
+    /// dismissal" has no way to tell a bug from a forgery.
+    #[test]
+    fn a_banned_write_is_attributed_to_the_ban_not_a_later_dismissal() {
+        let engine = engine();
+        verdict(&engine, "v-a-ban", "case-a", "ban", "2026-08-01T00:00:00Z",
+                ban_from("2026-08-01T00:00:00Z", Some("2026-12-01T00:00:00Z")));
+        verdict(&engine, "v-b-dismiss", "case-b", "dismiss", "2026-08-03T00:00:00Z", plain);
+
+        let intended = marks(&engine, "2026-08-04T00:00:00Z");
+        assert!(intended.bits.banned);
+        assert_eq!(intended.authorized_by, "v-a-ban");
+    }
+
+    /// Within one case, later still wins.
+    #[test]
+    fn within_a_case_the_latest_verdict_governs() {
+        let engine = engine();
+        verdict(&engine, "v-open", "case-a", "open-case", "2026-08-01T00:00:00Z", plain);
+        verdict(&engine, "v-ban", "case-a", "ban", "2026-08-04T00:00:00Z",
+                ban_from("2026-08-04T00:00:00Z", Some("2026-12-01T00:00:00Z")));
+        engine.store.supersede_open_case("case-a").unwrap();
+
+        let intended = marks(&engine, "2026-08-05T00:00:00Z");
+        assert!(intended.bits.banned);
+        assert!(!intended.bits.case_open, "a decided case is no longer an open one");
+    }
+
+    /// A ban waiting on its `executeAfter` — the suspensive appeal
+    /// window — authorizes nothing yet, and does not leave the case
+    /// looking open either: it is decided, just not yet in force.
+    #[test]
+    fn a_ban_before_its_execute_after_authorizes_nothing() {
+        let engine = engine();
+        verdict(&engine, "v-open", "case-a", "open-case", "2026-08-01T00:00:00Z", plain);
+        verdict(&engine, "v-ban", "case-a", "ban", "2026-08-04T00:00:00Z",
+                ban_from("2026-09-04T00:00:00Z", Some("2026-12-01T00:00:00Z")));
+        engine.store.supersede_open_case("case-a").unwrap();
+
+        let intended = marks(&engine, "2026-08-05T00:00:00Z");
+        assert!(!intended.bits.banned);
+        assert!(!intended.bits.case_open);
+        assert!(
+            !intended.realizes.iter().any(|r| r == "v-ban"),
+            "a pending ban must not be flagged executed by an unrelated write"
+        );
+    }
+
+    /// Expiry clears on the verdict's own authority, with no further
+    /// object from the authority.
+    #[test]
+    fn an_expired_ban_clears_itself() {
+        let engine = engine();
+        verdict(&engine, "v-ban", "case-a", "ban", "2026-08-01T00:00:00Z",
+                ban_from("2026-08-01T00:00:00Z", Some("2026-08-10T00:00:00Z")));
+
+        assert!(marks(&engine, "2026-08-05T00:00:00Z").bits.banned);
+        let after = marks(&engine, "2026-08-11T00:00:00Z");
+        assert!(!after.bits.banned);
+        assert_eq!(after.authorized_by, "expiry");
+    }
+
+    /// A ban with no expiry is a consented permanent term, not a
+    /// missing field to be defaulted away.
+    #[test]
+    fn a_permanent_ban_does_not_expire() {
+        let engine = engine();
+        verdict(&engine, "v-ban", "case-a", "ban", "2026-08-01T00:00:00Z",
+                ban_from("2026-08-01T00:00:00Z", None));
+        assert!(marks(&engine, "2030-01-01T00:00:00Z").bits.banned);
+    }
+
+    /// Two bans, one expired: the live one still governs.
+    #[test]
+    fn an_expired_ban_does_not_clear_a_live_one() {
+        let engine = engine();
+        verdict(&engine, "v-a-ban", "case-a", "ban", "2026-08-01T00:00:00Z",
+                ban_from("2026-08-01T00:00:00Z", Some("2026-08-10T00:00:00Z")));
+        verdict(&engine, "v-b-ban", "case-b", "ban", "2026-08-02T00:00:00Z",
+                ban_from("2026-08-02T00:00:00Z", Some("2026-12-01T00:00:00Z")));
+
+        let intended = marks(&engine, "2026-08-11T00:00:00Z");
+        assert!(intended.bits.banned);
+        assert_eq!(intended.ban.as_ref().unwrap().0, "v-b-ban");
+    }
+
+    /// A superseded interim verdict is out of the fold entirely.
+    #[test]
+    fn superseded_verdicts_are_ignored() {
+        let engine = engine();
+        verdict(&engine, "v-open", "case-a", "open-case", "2026-08-01T00:00:00Z", plain);
+        engine.store.supersede_open_case("case-a").unwrap();
+        assert!(engine.intended_marks("device-1", at("2026-08-02T00:00:00Z")).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_device_with_no_verdicts_intends_nothing() {
+        let engine = engine();
+        assert!(engine.intended_marks("device-1", at("2026-08-02T00:00:00Z")).unwrap().is_none());
     }
 }

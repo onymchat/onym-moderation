@@ -32,12 +32,21 @@ Apple stores exactly two bits per device, per developer account:
 
 | Bit | Mark | Set by | Cleared by |
 |---|---|---|---|
-| `bit0` | `case-open` | a valid interim `open-case` verdict | dismissal, superseding ban, decision-deadline default |
-| `bit1` | `banned` | a valid ban verdict, at or after its `executeAfter` | expiry, reversal, new-holder appeal |
+| `bit0` | `case-open` | a valid interim `open-case` verdict | that case's dismissal, superseding ban, or decision-deadline default |
+| `bit1` | `banned` | a valid ban verdict, at or after its `executeAfter` | expiry, reversal of that case, new-holder appeal |
 
 Everything else — which verdict, which case, until when — lives in this
 service's store. The bits are a cache of its conclusions, which is why
 losing `/data` loses the meaning while Apple keeps the values.
+
+**The bits are a fold over cases, and the fold is per case.** A device
+can carry several at once — different classes, different reports — and
+each has its own verdict history. `bit0` is set while *any* case is
+open; `bit1` while *any* ban is in force. Only a verdict in a case can
+change that case's contribution: dismissing one case does not clear
+another's mark, which matters twice over, because a reversal and an
+unrelated dismissal are the same disposition on the wire and only the
+case id separates them.
 
 ## Endpoints
 
