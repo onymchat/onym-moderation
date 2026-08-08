@@ -6,7 +6,7 @@ These terms are shown when you select the **Nemotron-3.5-Content-Safety-4B
 Reference Authority**. They incorporate the [Onym Reference Moderation
 Policy](../REFERENCE-AUTHORITY-POLICY.md), version 1, whose canonical UTF-8
 bytes (LF line endings, no byte-order mark) have SHA-256
-`7ab0681bff4a453f9f14973c9b28671bf507dad81c180c9cf29c46d594a41c75`.
+`8609e064f9615e29fad4fb97e3feed533dd4a01986f9fc73e3a2d3fd60f4c08b`.
 
 > **Automated decision:** NVIDIA's locally hosted model interprets the
 > Authority-supplied policy and returns `safe` or `unsafe`. `unsafe` causes the
