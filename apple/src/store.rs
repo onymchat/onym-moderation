@@ -152,7 +152,12 @@ impl Store {
                 -- reversal can be committed in order and delivered out
                 -- of it, and folding by arrival let the ban come back
                 -- after the reversal that lifted it.
-                decided_at     TEXT NOT NULL DEFAULT ''
+                decided_at         TEXT NOT NULL DEFAULT '',
+                -- Parsed, normalized components of `decided_at`.
+                -- RFC 3339 text is not chronologically sortable when
+                -- offsets or fractional spellings differ.
+                decided_at_seconds INTEGER NOT NULL DEFAULT 0,
+                decided_at_nanos   INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS verdicts_by_device
                 ON verdicts (device_binding);
@@ -182,10 +187,15 @@ impl Store {
         // One entry today; the list is the shape the next column will
         // need, and forgetting to build it is how the authority's
         // stores nearly came back up dead.
-        let added: &[(&str, &str, &str)] = &[("verdicts", "decided_at", "TEXT NOT NULL DEFAULT ''")];
+        let added: &[(&str, &str, &str)] = &[
+            ("verdicts", "decided_at", "TEXT NOT NULL DEFAULT ''"),
+            ("verdicts", "decided_at_seconds", "INTEGER NOT NULL DEFAULT 0"),
+            ("verdicts", "decided_at_nanos", "INTEGER NOT NULL DEFAULT 0"),
+        ];
         for (table, column, definition) in added {
             Self::add_column(&conn, table, column, definition)?;
         }
+        Self::backfill_verdict_decision_times(&conn)?;
         Ok(())
     }
 
@@ -206,6 +216,52 @@ impl Store {
             Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
             Err(e) => Err(Error::Internal(format!("migrate {table}.{column}: {e}"))),
         }
+    }
+
+    /// Populate the normalized causal key for verdicts written by a
+    /// build that stored only the raw envelope/arrival time. Leaving
+    /// these rows at zero would preserve the delivery ordering this
+    /// migration is meant to replace.
+    fn backfill_verdict_decision_times(conn: &Connection) -> Result<(), Error> {
+        let rows = {
+            let mut statement = conn.prepare(
+                "SELECT verdict_ref, raw FROM verdicts
+                  WHERE decided_at_seconds = 0 AND decided_at_nanos = 0",
+            )?;
+            let mapped = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            let mut rows = Vec::new();
+            for row in mapped {
+                rows.push(row?);
+            }
+            rows
+        };
+
+        for (verdict_ref, raw) in rows {
+            let verdict: crate::types::Verdict = serde_json::from_slice(&raw).map_err(|e| {
+                Error::Internal(format!(
+                    "migrate verdict {verdict_ref}: stored envelope is malformed: {e}"
+                ))
+            })?;
+            let decided_at = util::parse_timestamp(&verdict.decided_at).map_err(|e| {
+                Error::Internal(format!(
+                    "migrate verdict {verdict_ref}: decidedAt cannot be ordered: {e}"
+                ))
+            })?;
+            conn.execute(
+                "UPDATE verdicts
+                    SET decided_at = ?2, decided_at_seconds = ?3, decided_at_nanos = ?4
+                  WHERE verdict_ref = ?1",
+                params![
+                    verdict_ref,
+                    verdict.decided_at,
+                    decided_at.unix_timestamp(),
+                    i64::from(decided_at.nanosecond()),
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     // ─── Enrollments ─────────────────────────────────────────────────
@@ -347,6 +403,8 @@ impl Store {
 
     pub fn put_verdict(&self, verdict: &StoredVerdict, now: &str) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
+        let decided_at = util::parse_timestamp(&verdict.decided_at)
+            .map_err(|e| Error::VerdictInvalid(format!("decidedAt: {e}")))?;
         let existing: Option<Vec<u8>> = conn
             .query_row(
                 "SELECT raw FROM verdicts WHERE verdict_ref = ?1",
@@ -355,9 +413,13 @@ impl Store {
             )
             .optional()?;
         if let Some(raw) = existing {
-            if raw == verdict.raw {
-                // Delivery is at-least-once. An exact retry must not
-                // reset `executed`, `superseded`, or receipt ordering.
+            let stored_signing_bytes = crate::canonical::verdict_signing_bytes(&raw)?;
+            let incoming_signing_bytes =
+                crate::canonical::verdict_signing_bytes(&verdict.raw)?;
+            if stored_signing_bytes == incoming_signing_bytes {
+                // The signature envelope may legitimately differ while
+                // the signed decision — and verdictRef — is identical.
+                // Preserve execution, supersession, and receipt order.
                 return Ok(());
             }
             return Err(Error::VerdictInvalid(format!(
@@ -368,8 +430,9 @@ impl Store {
         conn.execute(
             "INSERT INTO verdicts
              (verdict_ref, case_id, mandate_ref, device_binding, disposition,
-              ban_expires, execute_after, executed, superseded, raw, received_at, decided_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+              ban_expires, execute_after, executed, superseded, raw, received_at, decided_at,
+              decided_at_seconds, decided_at_nanos)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 verdict.verdict_ref,
                 verdict.case_id,
@@ -382,7 +445,9 @@ impl Store {
                 verdict.superseded as i32,
                 verdict.raw,
                 now,
-                verdict.decided_at
+                verdict.decided_at,
+                decided_at.unix_timestamp(),
+                i64::from(decided_at.nanosecond()),
             ],
         )?;
         Ok(())
@@ -407,17 +472,24 @@ impl Store {
     /// itself after being reversed. The same shape let a stale
     /// `open-case` land after a dismissal and reopen the case.
     ///
-    /// `received_at` and `rowid` remain as tie-breaks, so ordering is
-    /// still total when two verdicts share a `decidedAt`.
+    /// Same-instant decisions use terminal precedence (open, ban,
+    /// dismiss/reverse). The reference authority emits second-precision
+    /// times, so arrival must not decide this tie either.
     pub fn verdicts_for_device(&self, device_binding: &str) -> Result<Vec<StoredVerdict>, Error> {
         let conn = self.conn.lock().unwrap();
-        // `rowid` breaks ties when two verdicts land in the same second,
-        // so ordering is total rather than merely mostly-ordered.
         let mut statement = conn.prepare(
             "SELECT verdict_ref, case_id, mandate_ref, device_binding, raw, disposition,
                     ban_expires, execute_after, executed, superseded, decided_at
              FROM verdicts WHERE device_binding = ?1
-             ORDER BY decided_at DESC, received_at DESC, rowid DESC",
+             ORDER BY decided_at_seconds DESC,
+                      decided_at_nanos DESC,
+                      CASE disposition
+                          WHEN 'dismiss' THEN 2
+                          WHEN 'ban' THEN 1
+                          ELSE 0
+                      END DESC,
+                      received_at DESC,
+                      rowid DESC",
         )?;
         let rows = statement.query_map(params![device_binding], |row| {
             Ok(StoredVerdict {
@@ -572,6 +644,65 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_backfills_normalized_decision_time_from_signed_bytes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE verdicts (
+                verdict_ref TEXT PRIMARY KEY,
+                case_id TEXT NOT NULL,
+                mandate_ref TEXT NOT NULL,
+                device_binding TEXT NOT NULL,
+                disposition TEXT NOT NULL,
+                ban_expires TEXT,
+                execute_after TEXT,
+                executed INTEGER NOT NULL DEFAULT 0,
+                superseded INTEGER NOT NULL DEFAULT 0,
+                raw BLOB NOT NULL,
+                received_at TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "verdictVersion": 1,
+            "caseId": "c1",
+            "authority": "onym:component:a",
+            "mandateRef": "m1",
+            "accusedKeys": ["onym:key:user"],
+            "deviceBinding": "d1",
+            "classId": "csam",
+            "disposition": "dismiss",
+            "marks": { "case-open": false, "banned": false },
+            "reasoning": "sha256:reason",
+            "decidedAt": "2026-08-08T09:00:00-05:00",
+            "signature": "sig",
+            "final": true
+        }))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO verdicts
+             (verdict_ref, case_id, mandate_ref, device_binding, disposition, raw, received_at)
+             VALUES ('v1', 'c1', 'm1', 'd1', 'dismiss', ?1, '2026-08-09T00:00:00Z')",
+            params![raw],
+        )
+        .unwrap();
+
+        let store = Store { conn: Mutex::new(conn) };
+        store.migrate().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let (seconds, nanos): (i64, i64) = conn
+            .query_row(
+                "SELECT decided_at_seconds, decided_at_nanos
+                   FROM verdicts WHERE verdict_ref = 'v1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let expected = util::parse_timestamp("2026-08-08T14:00:00Z").unwrap();
+        assert_eq!(seconds, expected.unix_timestamp());
+        assert_eq!(nanos, i64::from(expected.nanosecond()));
+    }
 
     #[test]
     fn enrollment_is_stable_per_identity() {

@@ -554,20 +554,34 @@ fn join_case(
     // indefinitely.
     let (notices, already_noticed) =
         state.store.notice_status(&existing.case_id, evidence_summary)?;
-    if already_noticed || notices >= MAX_NOTICES_PER_CASE {
-        let reason = if already_noticed {
-            "its evidence is already before the accused"
-        } else {
-            "this case has issued as many notices as it may"
-        };
-        state.store.attach_joined_report(
+    if already_noticed {
+        let attached = state.store.attach_noticed_report(
             &report.reporter,
             &report.report_id,
             &existing.case_id,
             &util::format_timestamp(now),
-            &format!("report {} joined without a new notice: {reason}", report.report_id),
+            evidence_summary,
+            &format!(
+                "report {} joined without a new notice: its evidence is already before the accused",
+                report.report_id
+            ),
         )?;
+        if !attached {
+            return Err(Error::CaseState(
+                "the case stopped accepting this joined report while it was being filed; retry"
+                    .into(),
+            ));
+        }
         return Ok(existing.clone());
+    }
+    if notices >= MAX_NOTICES_PER_CASE {
+        // New evidence may not become adjudicable without notice. Keep
+        // the stored report unattached so retrying after this case
+        // closes can open a later case with full windows.
+        return Err(Error::CaseState(format!(
+            "case {} has reached its notice limit; retry this report after the case closes",
+            existing.case_id
+        )));
     }
     let class = manifest
         .violation_class(&existing.class_id)
@@ -618,10 +632,12 @@ fn join_case(
         &stamp,
         &format!("report {} joined; notice and windows restarted", report.report_id),
         evidence_summary,
+        MAX_NOTICES_PER_CASE,
     )?;
     if !joined {
         return Err(Error::CaseState(
-            "the case was decided while joined evidence was being noticed; retry the report"
+            "the case no longer accepts a new notice (it closed, reached its notice limit, or \
+             the evidence was concurrently noticed); retry the report"
                 .into(),
         ));
     }
@@ -2661,6 +2677,59 @@ mod tests {
                 .count(),
             1,
             "and no second notice was issued"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_beyond_the_notice_cap_is_not_attached_unserved() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+
+        // The opening report is notice one; seven distinct allegations
+        // bring the case to its cap of eight.
+        for index in 2..=8 {
+            let content = format!("distinct prohibited thing {index}");
+            let mut report = report_json(&reporter_mandate, &format!("r-{index}"));
+            report["evidence"][0]["disclosedContent"] = json!(content);
+            report["evidence"][0]["authenticityProof"] =
+                json!(testing::sign(ACCUSED_SEED, content.as_bytes()));
+            let (status, body) =
+                harness.post("/v1/reports", signed(report, "signature", &[REPORTER_SEED])).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+
+        let content = "distinct prohibited thing 9";
+        let mut report = report_json(&reporter_mandate, "r-9");
+        report["evidence"][0]["disclosedContent"] = json!(content);
+        report["evidence"][0]["authenticityProof"] =
+            json!(testing::sign(ACCUSED_SEED, content.as_bytes()));
+        let (status, body) =
+            harness.post("/v1/reports", signed(report, "signature", &[REPORTER_SEED])).await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "case_state");
+        assert_eq!(
+            harness
+                .state
+                .store
+                .report(&testing::key_reference(REPORTER_SEED), "r-9")
+                .unwrap()
+                .unwrap()
+                .case_id,
+            None,
+            "unserved evidence must not become part of the case"
+        );
+        assert_eq!(
+            harness
+                .state
+                .store
+                .events(&case_id)
+                .unwrap()
+                .iter()
+                .filter(|(_, kind, _)| kind == "notice_evidence")
+                .count(),
+            MAX_NOTICES_PER_CASE as usize
         );
     }
 

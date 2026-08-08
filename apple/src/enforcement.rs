@@ -846,6 +846,11 @@ mod tests {
             .unwrap()
             .clone();
         retry.executed = false;
+        // verdictRef addresses signing bytes, not the signature
+        // envelope. Re-signing the same decision is still a retry.
+        let mut envelope: serde_json::Value = serde_json::from_slice(&retry.raw).unwrap();
+        envelope["signature"] = serde_json::json!("replacement-signature");
+        retry.raw = serde_json::to_vec(&envelope).unwrap();
         engine.store.put_verdict(&retry, "2026-08-08T02:00:00Z").unwrap();
 
         let after = engine.store.verdicts_for_device(DEVICE).unwrap();
@@ -925,6 +930,38 @@ mod tests {
             !intended.bits.banned,
             "a ban decided before the reversal that lifted it must not come back by arriving late"
         );
+    }
+
+    #[test]
+    fn same_second_reversal_has_terminal_precedence_over_a_late_ban() {
+        let engine = engine();
+
+        let mut reversal = verdict("case-csam", Disposition::Dismiss, "csam");
+        reversal.decided_at = "2026-08-08T01:00:00Z".into();
+        store_verdict(&engine.store, "reversal", reversal, "2026-08-08T10:00:00Z");
+
+        let mut ban = verdict("case-csam", Disposition::Ban, "csam");
+        ban.decided_at = "2026-08-08T01:00:00Z".into();
+        store_verdict(&engine.store, "ban", ban, "2026-08-08T11:00:00Z");
+
+        assert!(!engine.intended_marks(DEVICE, now()).unwrap().unwrap().bits.banned);
+    }
+
+    /// 09:00-05:00 is 14:00Z, so this reversal at 14:30Z is later even
+    /// though its RFC 3339 wire string sorts below the ban's.
+    #[test]
+    fn decision_order_normalizes_rfc3339_offsets() {
+        let engine = engine();
+
+        let mut reversal = verdict("case-csam", Disposition::Dismiss, "csam");
+        reversal.decided_at = "2026-08-08T14:30:00Z".into();
+        store_verdict(&engine.store, "reversal", reversal, "2026-08-08T10:00:00Z");
+
+        let mut ban = verdict("case-csam", Disposition::Ban, "csam");
+        ban.decided_at = "2026-08-08T09:00:00-05:00".into();
+        store_verdict(&engine.store, "ban", ban, "2026-08-08T11:00:00Z");
+
+        assert!(!engine.intended_marks(DEVICE, now()).unwrap().unwrap().bits.banned);
     }
 
     /// The same shape, one disposition over: a stale `open-case`

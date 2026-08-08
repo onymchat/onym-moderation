@@ -30,6 +30,12 @@ pub enum Outcome {
 /// slack moves no consented bound.
 const TOLERANCE_SECONDS: i64 = 1;
 
+/// A signed decision may be a few minutes ahead of the interface's
+/// clock, but it may not live arbitrarily far in the future. The
+/// interface uses `decidedAt` as the causal order for marks, so a
+/// future value would outrank every honest correction until that time.
+const MAX_DECISION_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
+
 pub struct ValidationInput<'a> {
     pub verdict: &'a Verdict,
     /// The exact bytes the authority signed over (signature field
@@ -58,6 +64,18 @@ pub fn validate(input: ValidationInput<'_>) -> Result<Outcome, Error> {
     let v = input.verdict;
 
     validate_signature(&input)?;
+
+    // This is checked for every disposition, not only bans. A
+    // dismissal/reversal with an unreadable timestamp cannot reliably
+    // clear the verdict it supersedes, and a far-future verdict would
+    // dominate the causal fold indefinitely.
+    let decided_at = util::parse_timestamp(&v.decided_at)
+        .map_err(|e| Error::VerdictInvalid(format!("decidedAt: {e}")))?;
+    if decided_at > input.now + time::Duration::seconds(MAX_DECISION_CLOCK_SKEW_SECONDS) {
+        return Err(Error::VerdictInvalid(
+            "decidedAt is too far in the future".into(),
+        ));
+    }
 
     // Mandate binding: the verdict must name the mandate's authority,
     // device, user, and a class within it.
@@ -95,7 +113,7 @@ pub fn validate(input: ValidationInput<'_>) -> Result<Outcome, Error> {
                     v.class_id
                 ))
             })?;
-            validate_ban(v, class, input.now)
+            validate_ban(v, class, decided_at, input.now)
         }
     }
 }
@@ -132,14 +150,12 @@ fn validate_dismissal(v: &Verdict) -> Result<Outcome, Error> {
 fn validate_ban(
     v: &Verdict,
     class: &ViolationClass,
+    decided_at: OffsetDateTime,
     now: OffsetDateTime,
 ) -> Result<Outcome, Error> {
     if v.marks != (Marks { case_open: false, banned: true }) {
         return Err(Error::VerdictInvalid("ban marks inconsistent with disposition".into()));
     }
-
-    let decided_at = util::parse_timestamp(&v.decided_at)
-        .map_err(|e| Error::VerdictInvalid(format!("decidedAt: {e}")))?;
 
     // The appeal window is a consented term, so the deadline is
     // derived, not declared — otherwise an authority could set
@@ -362,6 +378,46 @@ mod tests {
         v.disposition = Disposition::OpenCase;
         v.marks = Marks { case_open: true, banned: false };
         assert!(validate_with(&v, &class("P90D", "suspensive"), now).is_err());
+    }
+
+    /// Every disposition participates in the causal fold, so every one
+    /// needs a usable and reasonably current ordering key.
+    #[test]
+    fn every_disposition_requires_a_bounded_decision_time() {
+        let now = OffsetDateTime::now_utc();
+        for disposition in [Disposition::OpenCase, Disposition::Dismiss, Disposition::Ban] {
+            let mut v = suspensive_ban(now);
+            v.disposition = disposition;
+            match disposition {
+                Disposition::OpenCase => {
+                    v.marks = Marks { case_open: true, banned: false };
+                    v.ban_expires = None;
+                    v.execute_after = None;
+                    v.appeal_deadline = None;
+                    v.is_final = false;
+                }
+                Disposition::Dismiss => {
+                    v.marks = Marks { case_open: false, banned: false };
+                    v.ban_expires = None;
+                    v.execute_after = None;
+                    v.appeal_deadline = None;
+                    v.is_final = true;
+                }
+                Disposition::Ban => {}
+            }
+
+            v.decided_at = "not-a-time".into();
+            let malformed = validate_with(&v, &class("P90D", "suspensive"), now)
+                .expect_err("an unreadable causal key must be refused");
+            assert!(malformed.to_string().contains("decidedAt"));
+
+            v.decided_at = util::format_timestamp(
+                now + time::Duration::seconds(MAX_DECISION_CLOCK_SKEW_SECONDS + 1),
+            );
+            let future = validate_with(&v, &class("P90D", "suspensive"), now)
+                .expect_err("a future causal key must be refused");
+            assert!(future.to_string().contains("decidedAt"));
+        }
     }
 
     #[test]

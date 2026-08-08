@@ -782,9 +782,28 @@ impl Store {
         at: &str,
         event_detail: &str,
         evidence_summary: &str,
+        max_notices: i64,
     ) -> Result<bool, Error> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        // Re-assert dedupe and the cap under the same lock that
+        // attaches evidence. Concurrent joins may all have observed
+        // the previous count.
+        let notices: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM case_events
+              WHERE case_id = ?1 AND kind = 'notice_evidence'",
+            params![case.case_id],
+            |row| row.get(0),
+        )?;
+        let already_noticed: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM case_events
+              WHERE case_id = ?1 AND kind = 'notice_evidence' AND detail = ?2",
+            params![case.case_id, evidence_summary],
+            |row| row.get(0),
+        )?;
+        if notices >= max_notices || already_noticed > 0 {
+            return Ok(false);
+        }
         // `decision_deadline > ?4` is the point. A report arriving
         // after the deadline but before the sweep ran would otherwise
         // move the horizon forward on a case the contract had already
@@ -1047,29 +1066,52 @@ impl Store {
         Ok((notices, seen > 0))
     }
 
-    /// Attach a joined report to a case without re-noticing it: the
-    /// evidence it carries is already before the accused.
-    pub fn attach_joined_report(
+    /// Attach without re-noticing only while the case remains open and
+    /// an existing notice covers these exact evidence bytes.
+    pub fn attach_noticed_report(
         &self,
         reporter: &str,
         report_id: &str,
         case_id: &str,
         at: &str,
+        evidence_summary: &str,
         detail: &str,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        tx.execute(
+        let eligible: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM cases c
+              WHERE c.case_id = ?1
+                AND c.stage = 'open'
+                AND c.decision_deadline > ?2
+                AND EXISTS (
+                    SELECT 1 FROM case_events e
+                     WHERE e.case_id = c.case_id
+                       AND e.kind = 'notice_evidence'
+                       AND e.detail = ?3
+                )",
+            params![case_id, at, evidence_summary],
+            |row| row.get(0),
+        )?;
+        if eligible == 0 {
+            return Ok(false);
+        }
+        let attached = tx.execute(
             "UPDATE reports SET case_id = ?3
              WHERE reporter = ?1 AND report_id = ?2 AND case_id IS NULL",
             params![reporter, report_id, case_id],
         )?;
+        if attached != 1 {
+            return Err(Error::Internal(format!(
+                "joined report {report_id:?} was not available to attach to case {case_id:?}"
+            )));
+        }
         tx.execute(
             "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
             params![case_id, at, "report_joined", detail],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     /// Test-only: put every one of a case's notices back in the queue.
