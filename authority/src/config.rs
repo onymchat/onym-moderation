@@ -48,6 +48,9 @@ impl Config {
             .map_err(|e| format!("AUTHORITY_MANIFEST_PATH {manifest_path}: {e}"))?;
         let manifest: AuthorityManifest = serde_json::from_slice(&manifest_raw)
             .map_err(|e| format!("{manifest_path} is not a valid authority manifest: {e}"))?;
+        manifest
+            .validate_class_terms()
+            .map_err(|e| format!("{manifest_path} has invalid authority policy: {e}"))?;
 
         let signing_seed = match env::var("AUTHORITY_SIGNING_SEED") {
             Ok(hex_seed) => {

@@ -24,6 +24,14 @@ use crate::util;
 /// how many were dismissed.
 pub async fn sweep(state: &AppState, now: OffsetDateTime) -> Result<usize, Error> {
     let overdue = state.store.cases_overdue(&util::format_timestamp(now))?;
+    sweep_overdue(state, now, overdue).await
+}
+
+async fn sweep_overdue(
+    state: &AppState,
+    now: OffsetDateTime,
+    overdue: Vec<crate::store::CaseRecord>,
+) -> Result<usize, Error> {
     let mut dismissed = 0;
 
     for mut case in overdue {
@@ -48,7 +56,7 @@ pub async fn sweep(state: &AppState, now: OffsetDateTime) -> Result<usize, Error
         // intake weight of someone who may have been entirely right,
         // and would give a stalling authority a quiet way to demote
         // reporters it would rather not hear from.
-        state.store.commit_decision(&crate::store::Decision {
+        let committed = state.store.commit_decision(&crate::store::Decision {
             case: &case,
             verdict_ref: &issued.verdict_ref,
             disposition: &issued.disposition,
@@ -61,7 +69,19 @@ pub async fn sweep(state: &AppState, now: OffsetDateTime) -> Result<usize, Error
             // meantime, theirs stands and this one does not land.
             expect_stage: "open",
             expect_disposition: None,
-        })?;
+        });
+        match committed {
+            Ok(()) => {}
+            Err(Error::CaseState(reason)) => {
+                tracing::info!(
+                    case_id = %case.case_id,
+                    %reason,
+                    "overdue dismissal lost a decision race; keeping the committed decision"
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
 
         tracing::warn!(
             case_id = %case.case_id,
@@ -161,5 +181,53 @@ mod tests {
         assert_eq!(sweep(&state, now).await.unwrap(), 1);
         assert_eq!(sweep(&state, now).await.unwrap(), 0);
         assert_eq!(state.store.undelivered_verdicts().unwrap().len(), 1);
+    }
+
+    /// A moderator may decide one case after the sweep reads the
+    /// overdue batch. That expected race must not delay the defaults
+    /// owed to every other case in the same batch.
+    #[tokio::test]
+    async fn a_lost_decision_race_does_not_abort_the_overdue_batch() {
+        let state = AppState::for_tests(Store::in_memory().unwrap());
+        let first = case_due("2026-08-08T00:00:00Z");
+        let mut second = case_due("2026-08-08T00:00:00Z");
+        second.case_id = "c2".into();
+        second.accused = "onym:key:acc-2".into();
+        state.store.put_case(&first).unwrap();
+        state.store.put_case(&second).unwrap();
+
+        let now = util::parse_timestamp("2026-08-09T00:00:00Z").unwrap();
+        let stale_batch = state.store.cases_overdue(&util::format_timestamp(now)).unwrap();
+
+        let mut moderator_winner = first;
+        let issued = cases::dismissal_verdict(
+            &moderator_winner,
+            &state.config.manifest.component_id,
+            "moderator dismissed first",
+            now,
+            &state.signing_key,
+        )
+        .unwrap();
+        moderator_winner.stage = "decided".into();
+        moderator_winner.disposition = Some("dismiss".into());
+        state
+            .store
+            .commit_decision(&crate::store::Decision {
+                case: &moderator_winner,
+                verdict_ref: &issued.verdict_ref,
+                disposition: &issued.disposition,
+                raw: &issued.raw,
+                at: &util::format_timestamp(now),
+                event_kind: "decided",
+                event_detail: "moderator dismissed",
+                credited_reporters: &[],
+                expect_stage: "open",
+                expect_disposition: None,
+            })
+            .unwrap();
+
+        assert_eq!(sweep_overdue(&state, now, stale_batch).await.unwrap(), 1);
+        assert_eq!(state.store.case("c1").unwrap().unwrap().stage, "decided");
+        assert_eq!(state.store.case("c2").unwrap().unwrap().stage, "decided");
     }
 }

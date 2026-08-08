@@ -57,6 +57,76 @@ impl AuthorityManifest {
     pub fn violation_class(&self, class_id: &str) -> Option<&ViolationClass> {
         self.violation_classes.iter().find(|c| c.class_id == class_id)
     }
+
+    /// Validate every term the case lifecycle later relies on. Policy
+    /// errors are configuration failures, not per-report server errors:
+    /// an authority must not start if it cannot honor its own manifest.
+    pub fn validate_class_terms(&self) -> Result<(), String> {
+        for class in &self.violation_classes {
+            for (field, value) in [
+                ("responseWindow", class.response_window.as_str()),
+                ("decisionDeadline", class.decision_deadline.as_str()),
+                ("appealWindow", class.appeal_window.as_str()),
+            ] {
+                crate::util::parse_days(value).map_err(|error| {
+                    format!("class {:?} has invalid {field}: {error}", class.class_id)
+                })?;
+            }
+
+            if class.ban_term != "permanent" {
+                crate::util::parse_days(&class.ban_term).map_err(|error| {
+                    format!("class {:?} has invalid banTerm: {error}", class.class_id)
+                })?;
+            }
+
+            if !matches!(class.appeal_effect.as_str(), "suspensive" | "non-suspensive") {
+                return Err(format!(
+                    "class {:?} has invalid appealEffect {:?}; expected suspensive or \
+                     non-suspensive",
+                    class.class_id, class.appeal_effect
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    fn manifest() -> AuthorityManifest {
+        serde_json::from_str(crate::testing::MANIFEST_JSON).unwrap()
+    }
+
+    #[test]
+    fn every_declared_class_term_is_validated_before_serving() {
+        assert!(manifest().validate_class_terms().is_ok());
+
+        for (field, invalid) in [
+            ("responseWindow", "PT1H"),
+            ("decisionDeadline", "P0D"),
+            ("appealWindow", "thirty days"),
+            ("banTerm", "forever"),
+        ] {
+            let mut manifest = manifest();
+            let class = &mut manifest.violation_classes[0];
+            match field {
+                "responseWindow" => class.response_window = invalid.into(),
+                "decisionDeadline" => class.decision_deadline = invalid.into(),
+                "appealWindow" => class.appeal_window = invalid.into(),
+                "banTerm" => class.ban_term = invalid.into(),
+                _ => unreachable!(),
+            }
+            let error = manifest.validate_class_terms().unwrap_err();
+            assert!(error.contains(field), "{error}");
+        }
+
+        let mut manifest = manifest();
+        manifest.violation_classes[0].appeal_effect = "sometimes-suspensive".into();
+        let error = manifest.validate_class_terms().unwrap_err();
+        assert!(error.contains("appealEffect"), "{error}");
+    }
 }
 
 // ─── Mandate (§5.3) ──────────────────────────────────────────────────
