@@ -15,9 +15,14 @@
 //! carries.
 
 /// SHA-256 of the reference policy's canonical UTF-8 bytes, as every
-/// published model profile states it. A deployment can hand the
-/// document to `AUTHORITY_POLICY_PATH` and have this checked at boot;
-/// see `Config`.
+/// published model profile states it.
+///
+/// Checked against the document itself by
+/// `profiles::tests::every_pinned_digest_matches_the_document_it_names`,
+/// which fails if this constant and
+/// `REFERENCE-AUTHORITY-POLICY.md` ever drift apart. (An earlier
+/// version of this comment pointed at an `AUTHORITY_POLICY_PATH`
+/// environment variable that was never built.)
 pub const REFERENCE_POLICY_SHA256: &str =
     "8609e064f9615e29fad4fb97e3feed533dd4a01986f9fc73e3a2d3fd60f4c08b";
 

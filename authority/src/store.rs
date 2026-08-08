@@ -746,17 +746,6 @@ impl Store {
         Ok(())
     }
 
-    /// Test-only: put a case's opening verdict back in the queue, for
-    /// exercising the "not yet served" path.
-    #[cfg(test)]
-    pub fn undeliver_open_case_verdict(&self, case_id: &str) -> Result<(), Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE verdicts SET delivered = 0 WHERE case_id = ?1 AND disposition = 'open-case'",
-            params![case_id],
-        )?;
-        Ok(())
-    }
 
     /// Test-only, and deliberately so. In the service every case-row
     /// change is a conditional `UPDATE` of the columns that change:
@@ -1199,7 +1188,13 @@ impl Store {
     /// the classifier reads and what a reviewer is shown.
     pub fn evidence_for_case(&self, case_id: &str) -> Result<Vec<String>, Error> {
         let conn = self.conn.lock().unwrap();
-        let mut statement = conn.prepare("SELECT raw FROM reports WHERE case_id = ?1 ORDER BY filed_at")?;
+        // `report_id` breaks ties: two reports filed in the same second
+        // would otherwise order arbitrarily between reads, changing the
+        // document's digest with nothing in the case having changed —
+        // which reads as "the record moved while the model was reading
+        // it" and discards a perfectly good assessment.
+        let mut statement = conn
+            .prepare("SELECT raw FROM reports WHERE case_id = ?1 ORDER BY filed_at, report_id")?;
         let rows = statement.query_map(params![case_id], |row| row.get::<_, Vec<u8>>(0))?;
 
         let mut out = Vec::new();
@@ -1260,8 +1255,8 @@ impl Store {
     /// *about* the evidence rather than evidence of authorship.
     pub fn report_context_for_case(&self, case_id: &str) -> Result<Vec<String>, Error> {
         let conn = self.conn.lock().unwrap();
-        let mut statement =
-            conn.prepare("SELECT raw FROM reports WHERE case_id = ?1 ORDER BY filed_at")?;
+        let mut statement = conn
+            .prepare("SELECT raw FROM reports WHERE case_id = ?1 ORDER BY filed_at, report_id")?;
         let rows = statement.query_map(params![case_id], |row| row.get::<_, Vec<u8>>(0))?;
 
         let mut out = Vec::new();
@@ -1632,6 +1627,17 @@ impl Store {
                 "joined report {report_id:?} was not available to attach to case {case_id:?}"
             )));
         }
+        // The document a model reads is built from the case's reports,
+        // and it does not dedupe — so even a report whose evidence is
+        // already noticed adds to it. Without this bump the schema's
+        // own promise ("bumped by … evidence joined") was false, the
+        // in-flight digest check and the revision check disagreed, and
+        // the recovery path would apply a stored decision taken from a
+        // reading of a document that had since changed.
+        tx.execute(
+            "UPDATE cases SET revision = revision + 1 WHERE case_id = ?1",
+            params![case_id],
+        )?;
         tx.execute(
             "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
             params![case_id, at, "report_joined", detail],

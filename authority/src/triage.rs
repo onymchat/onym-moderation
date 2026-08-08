@@ -338,7 +338,13 @@ impl Triage {
             outcome: assessed.outcome.as_str().to_string(),
             score: assessed.score,
             labels: assessed.labels,
-            note: assessed.note,
+            // The adapter's note quotes the output it could not read —
+            // up to 120 characters of it, verbatim — so for a profile
+            // whose server inlines the reasoning block into `content`,
+            // the note carried exactly what stripping `raw_output`
+            // removed. It is stored, rendered in the panel, and
+            // returned to the accused, so it gets the same treatment.
+            note: strip_reasoning(&assessed.note),
             assessed_at: util::format_timestamp(now),
         };
 
@@ -1481,7 +1487,7 @@ mod tests {
         let case = open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
         // Undo the fixture's served notice: the opening verdict exists
         // but has not reached the interface.
-        store.undeliver_open_case_verdict(&case.case_id).unwrap();
+        store.undeliver_open_case_verdicts(&case.case_id).unwrap();
 
         let state = std::sync::Arc::new(AppState::for_tests_with_triage(
             store,
@@ -1520,7 +1526,7 @@ mod tests {
         .await;
         let store = crate::store::Store::in_memory().unwrap();
         let case = open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
-        store.undeliver_open_case_verdict(&case.case_id).unwrap();
+        store.undeliver_open_case_verdicts(&case.case_id).unwrap();
 
         let state = std::sync::Arc::new(AppState::for_tests_with_triage(
             store,
@@ -1677,6 +1683,126 @@ mod tests {
             "a stale revision must be refused"
         );
         assert_eq!(state.store.case("c1").unwrap().unwrap().stage, "open");
+    }
+
+
+    /// The adapter's note quotes the output it could not read. For a
+    /// profile whose server inlines the reasoning block into the final
+    /// message, that note carried exactly what stripping `raw_output`
+    /// had removed — and the note is stored, rendered in the panel,
+    /// and returned to the accused.
+    #[tokio::test]
+    async fn the_adapter_note_carries_no_reasoning_either() {
+        // Output the adapter cannot read, with reasoning inlined: the
+        // note will quote it back.
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content":
+                "<think>she says he sent it after she blocked him</think> maybe?"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "csam", "2026-08-04T00:00:00Z");
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "gpt-oss-safeguard-20b",
+            &url,
+            TriageMode::Advisory,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let (raw, _) = state.store.assessment("c1").unwrap().unwrap();
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(assessment.outcome, "no-decision");
+        assert!(
+            !assessment.note.contains("blocked him"),
+            "the note must not smuggle back what raw_output had stripped: {}",
+            assessment.note
+        );
+        assert!(!assessment.raw_output.contains("blocked him"));
+    }
+
+    /// A joined report changes the document a model reads — the store
+    /// does not dedupe evidence — so it has to move the revision.
+    /// Without that the in-flight digest check and the revision check
+    /// disagreed, and the recovery path applied a stored decision
+    /// taken from a reading of a document that had since changed.
+    #[tokio::test]
+    async fn joining_a_report_moves_the_case_revision() {
+        let store = crate::store::Store::in_memory().unwrap();
+        let case = open_case(&store, "csam", "2026-08-04T00:00:00Z");
+        let before = store.case("c1").unwrap().unwrap().revision;
+
+        // A second report, evidence already noticed, attached without
+        // a new notice.
+        let report = serde_json::json!({
+            "reportVersion": 1, "reportId": "r2", "reporter": "onym:key:rep",
+            "reporterMandate": "m0", "accused": "onym:key:acc", "classId": "csam",
+            "evidence": [{"disclosedContent": "the material", "authenticityProof": "sig"}],
+            "filedAt": "2026-08-03T00:00:00Z",
+        });
+        store
+            .put_report("r2", "onym:key:rep", "onym:key:acc", "csam", None, 1.0,
+                        &serde_json::to_vec(&report).unwrap(), "2026-08-03T00:00:00Z")
+            .unwrap();
+        // The case must already have noticed this evidence for the
+        // attach to be eligible — that is what makes it a join without
+        // a new notice.
+        store
+            .append_event_bounded(
+                &case.case_id,
+                "2026-08-02T00:00:00Z",
+                "notice_evidence",
+                "sha256:already-noticed",
+                8,
+            )
+            .unwrap();
+
+        let attached = store
+            .attach_noticed_report(
+                "onym:key:rep",
+                "r2",
+                &case.case_id,
+                "2026-08-03T00:00:00Z",
+                "sha256:already-noticed",
+                "joined",
+            )
+            .unwrap();
+        assert!(attached, "the join must actually land, or this test proves nothing");
+
+        assert_ne!(
+            store.case("c1").unwrap().unwrap().revision,
+            before,
+            "the document changed, so the revision must move with it"
+        );
+    }
+
+    /// Two reports filed in the same second must not reorder between
+    /// reads: an unstable document digest reads as "the record changed
+    /// while the model was reading it" and throws away a good
+    /// assessment.
+    #[test]
+    fn the_case_document_is_stable_across_reads() {
+        let store = crate::store::Store::in_memory().unwrap();
+        let case = open_case(&store, "csam", "2026-08-04T00:00:00Z");
+        for id in ["r2", "r3", "r4"] {
+            let report = serde_json::json!({
+                "reportVersion": 1, "reportId": id, "reporter": "onym:key:rep",
+                "reporterMandate": "m0", "accused": "onym:key:acc", "classId": "csam",
+                "evidence": [{"disclosedContent": format!("material {id}"),
+                              "authenticityProof": "sig"}],
+                "filedAt": "2026-08-02T00:00:00Z",
+            });
+            store
+                .put_report(id, "onym:key:rep", "onym:key:acc", "csam", Some(&case.case_id), 1.0,
+                            &serde_json::to_vec(&report).unwrap(), "2026-08-02T00:00:00Z")
+                .unwrap();
+        }
+
+        let first = crate::casedoc::build(&store, &case).unwrap().digest;
+        for _ in 0..5 {
+            assert_eq!(crate::casedoc::build(&store, &case).unwrap().digest, first);
+        }
     }
 
 }
