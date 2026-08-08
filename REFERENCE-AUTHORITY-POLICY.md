@@ -95,7 +95,8 @@ publish:
 - score or label calculation, aggregation, thresholds, and invalid-output
   behavior;
 - whether classification is local or which third party receives case data;
-  and
+- how long reports, case material, and model outputs are retained, and what
+  is deleted when; and
 - whether and when a human reviews a decision.
 
 Those values are consented policy, not mutable server configuration. An
@@ -211,12 +212,21 @@ accused without consent unless law requires. The accused receives enough
 evidence and reasoning to answer fairly.
 
 The Authority retains disclosed evidence, responses, final model outputs, and
-decisions only as long as intake, the case, and appeal require. A declined
-report is deleted within 30 days. A completed case record is deleted within 30
-days after its appeal path closes, except for:
+decisions only as long as intake, the case, and appeal require, and publishes
+the retention periods it actually applies before consent.
+
+This reference policy deliberately states no deletion schedule of its own. A
+period named here that an Authority's implementation did not keep would be
+worse than naming none: the people whose disclosed material it is would be
+relying on a deletion that never happens, and a promise nobody keeps is worse
+than an acknowledged gap. The retention an Authority is bound to is the one it
+published, and you should read it before agreeing.
+
+Whatever period an Authority publishes, it may keep material beyond it only
+where the material is:
 
 - the signed mandate and verdict needed to validate or clear a live mark;
-- minimal non-content audit and transparency records; and
+- minimal non-content audit and transparency records; or
 - material law specifically requires it to preserve or report.
 
 Case material is not sold, used for advertising, or used to train a model.
