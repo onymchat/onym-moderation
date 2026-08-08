@@ -179,6 +179,8 @@ async fn accept_mandate(
     }
 
     let mandate_ref = util::sha256_hex(&signing_bytes);
+    let accepted_at = util::parse_timestamp(&mandate.accepted_at)
+        .map_err(|e| Error::BadRequest(format!("acceptedAt: {e}")))?;
     // The manifest bytes are stored alongside the mandate, not merely
     // referenced: this mandate consents to *these* terms, and when the
     // published manifest is superseded the case must still be judged by
@@ -193,7 +195,7 @@ async fn accept_mandate(
         },
         &body,
         &state.config.manifest_raw,
-        &util::format_timestamp(OffsetDateTime::now_utc()),
+        &util::format_timestamp(accepted_at),
     )?;
 
     tracing::info!(%mandate_ref, user = %mandate.user, "mandate accepted");
@@ -220,7 +222,9 @@ async fn file_report(
     // reporter. Identical bytes under the same (reporter, reportId) are
     // the same report arriving twice, and the honest answer is the
     // original receipt.
-    if let Some(existing) = state.store.report(&report.reporter, &report.report_id)? {
+    let report_already_stored = if let Some(existing) =
+        state.store.report(&report.reporter, &report.report_id)?
+    {
         if existing.raw != body.as_ref() {
             return Err(Error::BadRequest(format!(
                 "reportId {:?} is already on file with different contents; a filed report is \
@@ -244,7 +248,10 @@ async fn file_report(
                 "decisionDeadline": case.as_ref().map(|c| c.decision_deadline.clone()),
             })));
         }
-    }
+        true
+    } else {
+        false
+    };
 
     // Standing follows the reporter's mandate: reporting requires
     // having consented to this authority too.
@@ -313,16 +320,18 @@ async fn file_report(
     // is a mark the accused could not be shown a reason for. A report
     // with no case yet is the harmless direction: it is evidence
     // sitting on file, and re-filing it picks up where this left off.
-    state.store.put_report(
-        &report.report_id,
-        &report.reporter,
-        &report.accused,
-        &report.class_id,
-        None,
-        weight,
-        &body,
-        &stamp,
-    )?;
+    if !report_already_stored {
+        state.store.put_report(
+            &report.report_id,
+            &report.reporter,
+            &report.accused,
+            &report.class_id,
+            None,
+            weight,
+            &body,
+            &stamp,
+        )?;
+    }
 
     // Further reports join an open case rather than opening a second
     // one. Opening a case sets a mark before any response, so
@@ -499,6 +508,8 @@ async fn open_case(
     // verdict behind it or a verdict for a case that does not exist.
     let opened = state.store.open_case_atomically(
         &case,
+        &report.reporter,
+        &report.report_id,
         &issued.verdict_ref,
         &issued.disposition,
         &issued.raw,
@@ -1267,7 +1278,94 @@ mod tests {
         assert_eq!(response["error"], "authenticity_unverified");
     }
 
+    /// A crash after evidence storage but before case opening must not
+    /// strand an otherwise valid report forever. Refiling the exact
+    /// signed bytes resumes at case opening.
+    #[tokio::test]
+    async fn an_interrupted_report_filing_resumes_from_the_stored_evidence() {
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+        let body = signed(
+            report_json(&reporter_mandate, "interrupted-report"),
+            "signature",
+            &[REPORTER_SEED],
+        );
+
+        harness
+            .state
+            .store
+            .put_report(
+                "interrupted-report",
+                &testing::key_reference(REPORTER_SEED),
+                &testing::key_reference(ACCUSED_SEED),
+                "csam",
+                None,
+                1.0,
+                &body,
+                "2026-08-02T00:00:00Z",
+            )
+            .unwrap();
+
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let case_id = response["caseId"].as_str().unwrap();
+        assert_eq!(
+            harness
+                .state
+                .store
+                .report(&testing::key_reference(REPORTER_SEED), "interrupted-report")
+                .unwrap()
+                .unwrap()
+                .case_id
+                .as_deref(),
+            Some(case_id)
+        );
+    }
+
     // ─── Mandates ────────────────────────────────────────────────────
+
+    /// Re-delivering an old signed mandate is idempotent. It must not
+    /// refresh that row's ordering and restore classes the user's newer
+    /// mandate no longer grants.
+    #[tokio::test]
+    async fn replaying_an_older_mandate_does_not_restore_its_jurisdiction() {
+        let harness = Harness::new();
+        let manifest_hash = util::sha256_hex(&harness.state.config.manifest_raw);
+
+        let broad = signed(
+            mandate_json(
+                ACCUSED_SEED,
+                json!(["csam", "unsolicited-pornography"]),
+                &manifest_hash,
+            ),
+            "signatures",
+            &[ACCUSED_SEED, INTERFACE_SEED],
+        );
+        let (status, _) = harness.post("/v1/mandates", broad.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let mut narrow = mandate_json(ACCUSED_SEED, json!(["csam"]), &manifest_hash);
+        narrow["acceptedAt"] = json!("2026-08-09T00:00:00Z");
+        let narrow = signed(narrow, "signatures", &[ACCUSED_SEED, INTERFACE_SEED]);
+        let (status, narrow_response) = harness.post("/v1/mandates", narrow).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = harness.post("/v1/mandates", broad).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let current = harness
+            .state
+            .store
+            .mandate_for_user(&testing::key_reference(ACCUSED_SEED))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.mandate_ref,
+            narrow_response["mandateRef"].as_str().unwrap()
+        );
+        assert_eq!(current.classes, vec!["csam".to_string()]);
+    }
 
     /// Without a configured interface key a countersignature cannot be
     /// checked, and an unverifiable designation is the forgery the
@@ -1796,12 +1894,49 @@ mod tests {
             disposition: None,
             appeal_deadline: None,
         };
+        for report_id in ["r1", "r2", "r3"] {
+            store
+                .put_report(
+                    report_id,
+                    "onym:key:rep",
+                    "onym:key:acc",
+                    "csam",
+                    None,
+                    1.0,
+                    b"{}",
+                    "t0",
+                )
+                .unwrap();
+        }
         assert!(store
-            .open_case_atomically(&case("c1"), "v1", "open-case", b"{}", "t0", "v1")
+            .open_case_atomically(
+                &case("c1"),
+                "onym:key:rep",
+                "r1",
+                "v1",
+                "open-case",
+                b"{}",
+                "t0",
+                "v1"
+            )
             .unwrap());
+        assert_eq!(
+            store.report("onym:key:rep", "r1").unwrap().unwrap().case_id.as_deref(),
+            Some("c1"),
+            "the opening report is attached in the transaction that exposes the verdict"
+        );
         assert!(
             !store
-                .open_case_atomically(&case("c2"), "v2", "open-case", b"{}", "t0", "v2")
+                .open_case_atomically(
+                    &case("c2"),
+                    "onym:key:rep",
+                    "r2",
+                    "v2",
+                    "open-case",
+                    b"{}",
+                    "t0",
+                    "v2"
+                )
                 .unwrap(),
             "a second open case for the same accused and class is refused"
         );
@@ -1812,7 +1947,16 @@ mod tests {
         decided.disposition = Some("dismiss".into());
         store.put_case(&decided).unwrap();
         assert!(store
-            .open_case_atomically(&case("c3"), "v3", "open-case", b"{}", "t1", "v3")
+            .open_case_atomically(
+                &case("c3"),
+                "onym:key:rep",
+                "r3",
+                "v3",
+                "open-case",
+                b"{}",
+                "t1",
+                "v3"
+            )
             .unwrap());
     }
 

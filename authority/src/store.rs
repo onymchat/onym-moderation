@@ -319,7 +319,7 @@ impl Store {
             params![record.manifest_hash, manifest_raw, accepted_at],
         )?;
         tx.execute(
-            "INSERT OR REPLACE INTO mandates
+            "INSERT OR IGNORE INTO mandates
              (mandate_ref, user_key, device_binding, classes, raw, accepted_at, manifest_hash)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -385,7 +385,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(
             "SELECT mandate_ref, user_key, device_binding, classes, manifest_hash
-               FROM mandates WHERE user_key = ?1 ORDER BY accepted_at DESC",
+               FROM mandates WHERE user_key = ?1 ORDER BY accepted_at DESC, rowid DESC",
         )?;
         let rows = statement.query_map(params![user_key], Self::mandate_from_row)?;
         let mut out = Vec::new();
@@ -400,7 +400,7 @@ impl Store {
         let record = conn
             .query_row(
                 "SELECT mandate_ref, user_key, device_binding, classes, manifest_hash
-                 FROM mandates WHERE user_key = ?1 ORDER BY accepted_at DESC LIMIT 1",
+                 FROM mandates WHERE user_key = ?1 ORDER BY accepted_at DESC, rowid DESC LIMIT 1",
                 params![user_key],
                 Self::mandate_from_row,
             )
@@ -641,10 +641,9 @@ impl Store {
         Self::write_case(&conn, case)
     }
 
-    /// Open a case and issue its interim verdict as one unit. A case
-    /// row without its open-case verdict would set a mark the accused
-    /// has no signed document for; a verdict without its case would be
-    /// a mark nothing can ever clear.
+    /// Open a case, attach its opening report, and issue its interim
+    /// verdict as one unit. A deliverable verdict must never name a
+    /// case whose evidence is not attached yet.
     ///
     /// Returns `Ok(false)` when another case is already open for this
     /// accused and class — the unique index caught a concurrent
@@ -654,6 +653,8 @@ impl Store {
     pub fn open_case_atomically(
         &self,
         case: &CaseRecord,
+        opening_reporter: &str,
+        opening_report_id: &str,
         verdict_ref: &str,
         disposition: &str,
         raw: &[u8],
@@ -693,6 +694,17 @@ impl Store {
                 return Ok(false);
             }
             Err(e) => return Err(e.into()),
+        }
+        let attached = tx.execute(
+            "UPDATE reports SET case_id = ?3
+             WHERE reporter = ?1 AND report_id = ?2 AND case_id IS NULL",
+            params![opening_reporter, opening_report_id, case.case_id],
+        )?;
+        if attached != 1 {
+            return Err(Error::Internal(format!(
+                "opening report {opening_report_id:?} was not available to attach to case {:?}",
+                case.case_id
+            )));
         }
         tx.execute(
             "INSERT OR REPLACE INTO verdicts (verdict_ref, case_id, disposition, raw, issued_at, delivered)

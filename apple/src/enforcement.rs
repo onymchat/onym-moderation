@@ -176,6 +176,7 @@ impl Engine {
         // reverses only the case it names rather than clearing an
         // unrelated sanction.
         let mut bans: Vec<(String, Verdict, bool)> = Vec::new();
+        let mut ban_was_ever_executed = false;
         let mut authorized_by = String::from("reconciliation");
         let mut realizes: Vec<String> = Vec::new();
 
@@ -222,6 +223,7 @@ impl Engine {
                     realizes.push(stored.verdict_ref.clone());
                 }
                 crate::types::Disposition::Ban => {
+                    ban_was_ever_executed |= stored.executed;
                     // Decided, so no longer an open case — whatever
                     // else is true of the ban. A ban waiting on its
                     // `executeAfter` used to `continue` before this,
@@ -284,15 +286,11 @@ impl Engine {
         let ban = bans
             .last()
             .map(|(verdict_ref, verdict, _)| (verdict_ref.clone(), verdict.clone()));
-        // *Any* executed ban, not just the newest. This feeds the
-        // moved-device check: if some ban on this identity has already
-        // been written to a device, a device presenting clean bits is a
-        // different piece of hardware. Reading only the newest missed
-        // the case of two live bans where the older one was written and
-        // the newer has not been yet — and the cost of missing it is
-        // branding a device the verdict never named, quite possibly a
-        // new owner's.
-        let ban_executed = bans.iter().any(|(_, _, executed)| *executed);
+        // Historical execution matters too. An expired ban disappears
+        // from `bans`, but it still proves that this identity was
+        // branded onto some device. Forgetting that fact can make a
+        // later ban brand a clean device that may have a new owner.
+        let ban_executed = ban_was_ever_executed;
 
         // A ban in force is the reason the banned bit is set, so it
         // names the write even when a dismissal in some other case
@@ -721,6 +719,91 @@ mod tests {
         assert!(
             intended.ban_executed,
             "an earlier ban was already branded onto a device; this identity has been marked"
+        );
+    }
+
+    /// Expiry clears a sanction, not the historical fact that its mark
+    /// was written. If a later active ban has not been written yet,
+    /// that history still protects a clean replacement device.
+    #[test]
+    fn an_expired_executed_ban_still_counts_as_historical_branding() {
+        let engine = engine();
+
+        let mut expired = verdict("case-csam", Disposition::Ban, "csam");
+        expired.ban_expires = Some("2026-08-08T12:00:00Z".into());
+        store_verdict(
+            &engine.store,
+            "expired-ban",
+            expired,
+            "2026-08-08T00:00:00Z",
+        );
+
+        let active = verdict("case-violence", Disposition::Ban, "credible-violence");
+        let active_raw = serde_json::to_vec(&active).unwrap();
+        engine
+            .store
+            .put_verdict(
+                &StoredVerdict {
+                    verdict_ref: "active-ban".into(),
+                    case_id: active.case_id,
+                    mandate_ref: MANDATE.into(),
+                    device_binding: DEVICE.into(),
+                    raw: active_raw,
+                    disposition: "ban".into(),
+                    ban_expires: active.ban_expires,
+                    execute_after: active.execute_after,
+                    executed: false,
+                    superseded: false,
+                },
+                "2026-08-08T13:00:00Z",
+            )
+            .unwrap();
+
+        let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
+        assert!(intended.bits.banned, "the newer ban is still active");
+        assert!(
+            intended.ban_executed,
+            "the expired ban already branded this identity onto a device"
+        );
+    }
+
+    /// At-least-once delivery may submit the same verdict again after
+    /// it has executed. The retry must preserve execution state and
+    /// must not make the old verdict newest by resetting receivedAt.
+    #[test]
+    fn duplicate_verdict_delivery_preserves_execution_and_order() {
+        let engine = engine();
+        store_verdict(
+            &engine.store,
+            "first-ban",
+            verdict("case-csam", Disposition::Ban, "csam"),
+            "2026-08-08T00:00:00Z",
+        );
+        store_verdict(
+            &engine.store,
+            "later-ban",
+            verdict("case-violence", Disposition::Ban, "credible-violence"),
+            "2026-08-08T01:00:00Z",
+        );
+
+        let stored = engine.store.verdicts_for_device(DEVICE).unwrap();
+        let mut retry = stored
+            .iter()
+            .find(|v| v.verdict_ref == "first-ban")
+            .unwrap()
+            .clone();
+        retry.executed = false;
+        engine.store.put_verdict(&retry, "2026-08-08T02:00:00Z").unwrap();
+
+        let after = engine.store.verdicts_for_device(DEVICE).unwrap();
+        assert_eq!(after[0].verdict_ref, "later-ban");
+        assert!(
+            after
+                .iter()
+                .find(|v| v.verdict_ref == "first-ban")
+                .unwrap()
+                .executed,
+            "a retry cannot turn an executed verdict back into pending"
         );
     }
 

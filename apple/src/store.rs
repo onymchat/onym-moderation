@@ -304,8 +304,26 @@ impl Store {
 
     pub fn put_verdict(&self, verdict: &StoredVerdict, now: &str) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
+        let existing: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT raw FROM verdicts WHERE verdict_ref = ?1",
+                params![verdict.verdict_ref],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = existing {
+            if raw == verdict.raw {
+                // Delivery is at-least-once. An exact retry must not
+                // reset `executed`, `superseded`, or receipt ordering.
+                return Ok(());
+            }
+            return Err(Error::VerdictInvalid(format!(
+                "verdictRef {:?} is already on file with different contents",
+                verdict.verdict_ref
+            )));
+        }
         conn.execute(
-            "INSERT OR REPLACE INTO verdicts
+            "INSERT INTO verdicts
              (verdict_ref, case_id, mandate_ref, device_binding, disposition,
               ban_expires, execute_after, executed, superseded, raw, received_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
