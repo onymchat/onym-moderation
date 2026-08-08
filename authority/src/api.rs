@@ -59,6 +59,12 @@ const MAX_APPEALS_PER_CASE: usize = 32;
 /// not a credible consent timestamp.
 const MAX_MANDATE_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 
+/// How many notices one case will issue. Each one restarts the
+/// accused's response window, so an unbounded count is an unbounded
+/// case-open mark — and the mark is a pre-verdict effect the contract
+/// allows only because a case ends.
+const MAX_NOTICES_PER_CASE: i64 = 8;
+
 /// Party credentials for status reads are short-lived and travel in
 /// headers, outside proxy access-log request URIs.
 const STATUS_CREDENTIAL_MAX_AGE_SECONDS: i64 = 5 * 60;
@@ -525,6 +531,44 @@ fn join_case(
     if now > valid_until {
         return Err(Error::NoJurisdiction);
     }
+
+    // A case past its decision deadline is dismissed by default, sweep
+    // or no sweep. Joining evidence to it would move the horizon
+    // forward on a case the contract had already ended in the accused's
+    // favour — the "undecided is dismissal" race again, reached through
+    // intake rather than through a decider.
+    let existing_deadline = util::parse_timestamp(&existing.decision_deadline)
+        .map_err(|e| Error::Internal(format!("stored decisionDeadline: {e}")))?;
+    if now > existing_deadline {
+        return Err(Error::WindowClosed(format!(
+            "case {} passed its decision deadline at {}; it is dismissed by default and takes \
+             no further evidence",
+            existing.case_id, existing.decision_deadline
+        )));
+    }
+
+    // Evidence already before the accused alleges nothing new, and a
+    // notice restating it would restart their windows for no reason.
+    // Re-filing the same accused-signed material under fresh report
+    // ids was otherwise a way to hold a case — and its mark — open
+    // indefinitely.
+    let (notices, already_noticed) =
+        state.store.notice_status(&existing.case_id, evidence_summary)?;
+    if already_noticed || notices >= MAX_NOTICES_PER_CASE {
+        let reason = if already_noticed {
+            "its evidence is already before the accused"
+        } else {
+            "this case has issued as many notices as it may"
+        };
+        state.store.attach_joined_report(
+            &report.reporter,
+            &report.report_id,
+            &existing.case_id,
+            &util::format_timestamp(now),
+            &format!("report {} joined without a new notice: {reason}", report.report_id),
+        )?;
+        return Ok(existing.clone());
+    }
     let class = manifest
         .violation_class(&existing.class_id)
         .ok_or_else(|| Error::ClassOutsideMandate(existing.class_id.clone()))?;
@@ -533,11 +577,27 @@ fn join_case(
     let decision_days = util::parse_days(&class.decision_deadline)
         .map_err(|e| Error::Internal(format!("manifest decisionDeadline: {e}")))?;
 
+    // The response window restarts — the accused needs time to answer
+    // allegations they have just been served — but the decision
+    // deadline never moves *outward*. The terminal horizon is fixed
+    // when the case opens, so a stream of joins cannot walk it forward
+    // forever. A join late enough to push the response window past
+    // that horizon simply means no ban can issue on this case: it
+    // dismisses at its deadline, and the new evidence is free to open
+    // a fresh case afterwards.
     let mut revised = existing.clone();
     revised.response_deadline =
         util::format_timestamp(now + time::Duration::days(response_days));
-    revised.decision_deadline =
-        util::format_timestamp(now + time::Duration::days(decision_days));
+    // The decision deadline does not move. It is set when the case
+    // opens and it is the accused's guarantee that this ends: a stream
+    // of joins each pushing it out would make the case-open mark
+    // permanent, and that mark is a pre-verdict effect the contract
+    // allows only because a case has a horizon.
+    //
+    // A join late enough that the restarted response window runs past
+    // that horizon simply means no ban can issue here — the case
+    // dismisses at its deadline and the new evidence is free to open a
+    // fresh case afterwards, with its own full windows.
     let issued = cases::open_case_verdict(
         &revised,
         &state.config.manifest.component_id,
@@ -555,6 +615,7 @@ fn join_case(
         &issued.raw,
         &stamp,
         &format!("report {} joined; notice and windows restarted", report.report_id),
+        evidence_summary,
     )?;
     if !joined {
         return Err(Error::CaseState(
@@ -619,6 +680,7 @@ async fn open_case(
         &issued.raw,
         &stamp,
         &issued.verdict_ref,
+        evidence_summary,
     )?;
     if !opened {
         tracing::info!(
@@ -1637,9 +1699,12 @@ mod tests {
         let case_id = open_case(&harness).await;
         let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
 
+        // A live case with a nearly-spent response window. Joined
+        // evidence must restart that window — the accused has just been
+        // served with something new — without touching the decision
+        // deadline, which is their guarantee the case ends.
         let mut original_case = harness.state.store.case(&case_id).unwrap().unwrap();
-        original_case.response_deadline = "2020-01-01T00:00:00Z".into();
-        original_case.decision_deadline = "2020-01-02T00:00:00Z".into();
+        original_case.response_deadline = "2026-08-09T00:00:00Z".into();
         harness.state.store.put_case(&original_case).unwrap();
 
         let mut report = report_json(&reporter_mandate, "r-2");
@@ -1665,8 +1730,14 @@ mod tests {
         let notice: Value = serde_json::from_slice(&revised_notice[0].raw).unwrap();
         assert_eq!(notice["reasoning"].as_str(), Some(expected_evidence_summary.as_str()));
         let revised_case = harness.state.store.case(&case_id).unwrap().unwrap();
-        assert_ne!(revised_case.response_deadline, original_case.response_deadline);
-        assert_ne!(revised_case.decision_deadline, original_case.decision_deadline);
+        assert_ne!(
+            revised_case.response_deadline, original_case.response_deadline,
+            "the accused gets their window back for allegations they have just been served"
+        );
+        assert_eq!(
+            revised_case.decision_deadline, original_case.decision_deadline,
+            "the horizon does not move: joins must not be able to walk it forward forever"
+        );
         harness
             .state
             .store
@@ -2267,7 +2338,8 @@ mod tests {
                 "open-case",
                 b"{}",
                 "t0",
-                "v1"
+                "v1",
+                "sha256:test-evidence",
             )
             .unwrap());
         assert_eq!(
@@ -2285,7 +2357,8 @@ mod tests {
                     "open-case",
                     b"{}",
                     "t0",
-                    "v2"
+                    "v2",
+                    "sha256:test-evidence",
                 )
                 .unwrap(),
             "a second open case for the same accused and class is refused"
@@ -2305,7 +2378,8 @@ mod tests {
                 "open-case",
                 b"{}",
                 "t1",
-                "v3"
+                "v3",
+                "sha256:test-evidence",
             )
             .unwrap());
     }
@@ -2519,6 +2593,116 @@ mod tests {
         assert_eq!(body["requeued"], true);
         assert!(harness.state.store.undeliverable_verdicts().unwrap().is_empty());
         assert_eq!(harness.state.store.undelivered_verdicts().unwrap().len(), 1);
+    }
+
+
+    /// A case past its decision deadline is dismissed by default,
+    /// sweep or no sweep. Joining evidence to it moved the horizon
+    /// forward on a case the contract had already ended in the
+    /// accused's favour — the same race the deciders were fixed for,
+    /// reached through intake instead.
+    #[tokio::test]
+    async fn a_join_cannot_revive_a_case_past_its_decision_deadline() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.decision_deadline = "2020-01-02T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+
+        let mut report = report_json(&reporter_mandate, "r-2");
+        report["evidence"][0]["disclosedContent"] = json!("a different prohibited thing");
+        report["evidence"][0]["authenticityProof"] =
+            json!(testing::sign(ACCUSED_SEED, b"a different prohibited thing"));
+        let (status, _) =
+            harness.post("/v1/reports", signed(report, "signature", &[REPORTER_SEED])).await;
+
+        assert_eq!(status, StatusCode::GONE);
+        let after = harness.state.store.case(&case_id).unwrap().unwrap();
+        assert_eq!(
+            after.decision_deadline, "2020-01-02T00:00:00Z",
+            "the horizon must not move on a case that is already over"
+        );
+    }
+
+    /// The same accused-signed material under a fresh report id used to
+    /// produce a fresh notice and restart the accused's windows, so a
+    /// reporter could hold a case — and its mark — open indefinitely
+    /// without alleging anything new.
+    #[tokio::test]
+    async fn re_filing_the_same_evidence_joins_without_a_new_notice() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+        let before = harness.state.store.case(&case_id).unwrap().unwrap();
+
+        // Same evidence, new report id.
+        let body = signed(report_json(&reporter_mandate, "r-2"), "signature", &[REPORTER_SEED]);
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["caseId"], case_id, "it still joins the case");
+
+        let after = harness.state.store.case(&case_id).unwrap().unwrap();
+        assert_eq!(
+            after.response_deadline, before.response_deadline,
+            "nothing new was alleged, so nothing restarts"
+        );
+        assert_eq!(
+            harness
+                .state
+                .store
+                .events(&case_id)
+                .unwrap()
+                .iter()
+                .filter(|(_, kind, _)| kind == "notice_evidence")
+                .count(),
+            1,
+            "and no second notice was issued"
+        );
+    }
+
+    /// Each joined report emits its own notice covering only its own
+    /// evidence. Checking that the *latest* was delivered let an
+    /// undelivered earlier one's allegations sit in the case —
+    /// attached, credited, and available to support a ban — while the
+    /// accused had never been served with them. Two joins were enough.
+    #[tokio::test]
+    async fn every_notice_must_be_delivered_not_merely_the_latest() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+
+        // The opening notice never reaches the interface.
+        harness.state.store.undeliver_open_case_verdicts(&case_id).unwrap();
+        let opening = harness.state.store.undelivered_verdicts().unwrap();
+        assert_eq!(opening.len(), 1);
+        let opening_ref = opening[0].verdict_ref.clone();
+
+        // A second report joins, carrying its own notice.
+        let mut report = report_json(&reporter_mandate, "r-2");
+        report["evidence"][0]["disclosedContent"] = json!("a different prohibited thing");
+        report["evidence"][0]["authenticityProof"] =
+            json!(testing::sign(ACCUSED_SEED, b"a different prohibited thing"));
+        let (status, _) =
+            harness.post("/v1/reports", signed(report, "signature", &[REPORTER_SEED])).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The later notice lands; the opening one is still queued.
+        for queued in harness.state.store.undelivered_verdicts().unwrap() {
+            if queued.verdict_ref != opening_ref {
+                harness.state.store.mark_delivered(&queued.verdict_ref).unwrap();
+            }
+        }
+
+        assert!(
+            !harness.state.store.open_case_verdict_delivered(&case_id).unwrap(),
+            "an unserved allegation is still unserved, whatever landed after it"
+        );
+
+        // Serve it, and only then is the case fully noticed.
+        harness.state.store.mark_delivered(&opening_ref).unwrap();
+        assert!(harness.state.store.open_case_verdict_delivered(&case_id).unwrap());
     }
 
 }

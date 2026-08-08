@@ -286,6 +286,11 @@ async fn receive_verdict(
         &StoredVerdict {
             verdict_ref: verdict_ref.clone(),
             case_id: parsed.case_id.clone(),
+            // The authority's own signed decision time. It is inside
+            // the signing bytes, so it cannot be reordered in transit
+            // — which is exactly why the fold uses it instead of the
+            // moment this request happened to arrive.
+            decided_at: parsed.decided_at.clone(),
             mandate_ref: parsed.mandate_ref.clone(),
             device_binding: mandate.device_binding.clone(),
             raw: verdict_bytes.clone(),

@@ -489,7 +489,8 @@ mod tests {
             .put_verdict(
                 &StoredVerdict {
                     verdict_ref: verdict_ref.into(),
-                    case_id: verdict.case_id,
+                    case_id: verdict.case_id.clone(),
+                    decided_at: verdict.decided_at.clone(),
                     mandate_ref: MANDATE.into(),
                     device_binding: DEVICE.into(),
                     raw,
@@ -599,7 +600,8 @@ mod tests {
                 .put_verdict(
                     &StoredVerdict {
                         verdict_ref: verdict_ref.into(),
-                        case_id: value.case_id,
+                        case_id: value.case_id.clone(),
+                        decided_at: value.decided_at.clone(),
                         mandate_ref: MANDATE.into(),
                         device_binding: DEVICE.into(),
                         raw,
@@ -747,6 +749,7 @@ mod tests {
         let mut fresh = StoredVerdict {
             verdict_ref: "ban-violence".into(),
             case_id: "case-violence".into(),
+            decided_at: "2026-08-08T01:00:00Z".into(),
             mandate_ref: MANDATE.into(),
             device_binding: DEVICE.into(),
             raw: serde_json::to_vec(&verdict(
@@ -794,7 +797,8 @@ mod tests {
             .put_verdict(
                 &StoredVerdict {
                     verdict_ref: "active-ban".into(),
-                    case_id: active.case_id,
+                    case_id: active.case_id.clone(),
+                    decided_at: active.decided_at.clone(),
                     mandate_ref: MANDATE.into(),
                     device_binding: DEVICE.into(),
                     raw: active_raw,
@@ -873,6 +877,7 @@ mod tests {
         let mut pending = StoredVerdict {
             verdict_ref: "ban-csam".into(),
             case_id: "case-csam".into(),
+            decided_at: "2026-08-08T01:00:00Z".into(),
             mandate_ref: MANDATE.into(),
             device_binding: DEVICE.into(),
             raw: serde_json::to_vec(&verdict("case-csam", Disposition::Ban, "csam")).unwrap(),
@@ -890,6 +895,74 @@ mod tests {
         let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
         assert!(!intended.bits.banned, "the ban has not begun");
         assert!(!intended.bits.case_open, "but the case is decided, not open");
+    }
+
+
+    /// Delivery is at-least-once and not single-flight, so the
+    /// authority can commit a ban and then its reversal while the ban
+    /// is still queued — and the reversal can arrive first. Folding by
+    /// arrival made the ban the newest input when it finally landed,
+    /// and it reinstated itself *after* the reversal that lifted it.
+    ///
+    /// Causality belongs to the authority that decided. `decidedAt` is
+    /// inside the signing bytes, so it cannot be reordered in transit.
+    #[test]
+    fn a_late_arriving_ban_does_not_undo_the_reversal_that_lifted_it() {
+        let engine = engine();
+
+        // The reversal is decided second and arrives first.
+        let mut reversal = verdict("case-csam", Disposition::Dismiss, "csam");
+        reversal.decided_at = "2026-08-08T02:00:00Z".into();
+        store_verdict(&engine.store, "reversal", reversal, "2026-08-08T10:00:00Z");
+
+        // The ban was decided first and lands late.
+        let mut ban = verdict("case-csam", Disposition::Ban, "csam");
+        ban.decided_at = "2026-08-08T01:00:00Z".into();
+        store_verdict(&engine.store, "ban", ban, "2026-08-08T11:00:00Z");
+
+        let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
+        assert!(
+            !intended.bits.banned,
+            "a ban decided before the reversal that lifted it must not come back by arriving late"
+        );
+    }
+
+    /// The same shape, one disposition over: a stale `open-case`
+    /// landing after the dismissal that closed its case must not
+    /// reopen it and re-mark the device.
+    #[test]
+    fn a_late_arriving_notice_does_not_reopen_a_dismissed_case() {
+        let engine = engine();
+
+        let mut dismissal = verdict("case-csam", Disposition::Dismiss, "csam");
+        dismissal.decided_at = "2026-08-08T02:00:00Z".into();
+        store_verdict(&engine.store, "dismissal", dismissal, "2026-08-08T10:00:00Z");
+
+        let mut notice = verdict("case-csam", Disposition::OpenCase, "csam");
+        notice.decided_at = "2026-08-08T01:00:00Z".into();
+        store_verdict(&engine.store, "notice", notice, "2026-08-08T11:00:00Z");
+
+        let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
+        assert!(!intended.bits.case_open, "the case was closed before that notice was written");
+        assert!(!intended.bits.banned);
+    }
+
+    /// And in-order delivery still behaves: a reversal decided after a
+    /// ban lifts it.
+    #[test]
+    fn a_reversal_decided_after_a_ban_still_lifts_it() {
+        let engine = engine();
+
+        let mut ban = verdict("case-csam", Disposition::Ban, "csam");
+        ban.decided_at = "2026-08-08T01:00:00Z".into();
+        store_verdict(&engine.store, "ban", ban, "2026-08-08T01:00:00Z");
+        assert!(engine.intended_marks(DEVICE, now()).unwrap().unwrap().bits.banned);
+
+        let mut reversal = verdict("case-csam", Disposition::Dismiss, "csam");
+        reversal.decided_at = "2026-08-08T02:00:00Z".into();
+        store_verdict(&engine.store, "reversal", reversal, "2026-08-08T02:00:00Z");
+
+        assert!(!engine.intended_marks(DEVICE, now()).unwrap().unwrap().bits.banned);
     }
 
 }

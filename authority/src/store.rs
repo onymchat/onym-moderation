@@ -694,6 +694,7 @@ impl Store {
         raw: &[u8],
         at: &str,
         event_detail: &str,
+        evidence_summary: &str,
     ) -> Result<bool, Error> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -749,6 +750,13 @@ impl Store {
             "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
             params![case.case_id, at, "case_opened", event_detail],
         )?;
+        // What this notice put before the accused, so a later join
+        // carrying the same material can be recognised as alleging
+        // nothing new.
+        tx.execute(
+            "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
+            params![case.case_id, at, "notice_evidence", evidence_summary],
+        )?;
         tx.commit()?;
         Ok(true)
     }
@@ -767,14 +775,21 @@ impl Store {
         raw: &[u8],
         at: &str,
         event_detail: &str,
+        evidence_summary: &str,
     ) -> Result<bool, Error> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        // `decision_deadline > ?4` is the point. A report arriving
+        // after the deadline but before the sweep ran would otherwise
+        // move the horizon forward on a case the contract had already
+        // ended in the accused's favour — the same "undecided is
+        // dismissal" race the deciders were fixed for, reached through
+        // intake instead.
         let revised = tx.execute(
             "UPDATE cases
                 SET response_deadline = ?2, decision_deadline = ?3
-              WHERE case_id = ?1 AND stage = 'open'",
-            params![case.case_id, case.response_deadline, case.decision_deadline],
+              WHERE case_id = ?1 AND stage = 'open' AND decision_deadline > ?4",
+            params![case.case_id, case.response_deadline, case.decision_deadline, at],
         )?;
         if revised == 0 {
             return Ok(false);
@@ -799,6 +814,11 @@ impl Store {
         tx.execute(
             "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
             params![case.case_id, at, "report_joined", event_detail],
+        )?;
+        // What this revised notice put before the accused.
+        tx.execute(
+            "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
+            params![case.case_id, at, "notice_evidence", evidence_summary],
         )?;
         tx.commit()?;
         Ok(true)
@@ -998,18 +1018,87 @@ impl Store {
     /// Whether the interface acknowledged the interim verdict that
     /// carries this case's notice. A sanction cannot rely on a response
     /// window the accused's interface never learned existed.
+    /// How many notices this case has issued, and whether any of them
+    /// already covers this exact evidence.
+    ///
+    /// The same accused-signed material, re-filed under a fresh report
+    /// id, produced a fresh notice and restarted the windows — so a
+    /// reporter could hold a case open, and its mark on, indefinitely
+    /// without ever alleging anything new.
+    pub fn notice_status(&self, case_id: &str, evidence_summary: &str) -> Result<(i64, bool), Error> {
+        let conn = self.conn.lock().unwrap();
+        let notices: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM case_events WHERE case_id = ?1 AND kind = 'notice_evidence'",
+            params![case_id],
+            |row| row.get(0),
+        )?;
+        let seen: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM case_events
+              WHERE case_id = ?1 AND kind = 'notice_evidence' AND detail = ?2",
+            params![case_id, evidence_summary],
+            |row| row.get(0),
+        )?;
+        Ok((notices, seen > 0))
+    }
+
+    /// Attach a joined report to a case without re-noticing it: the
+    /// evidence it carries is already before the accused.
+    pub fn attach_joined_report(
+        &self,
+        reporter: &str,
+        report_id: &str,
+        case_id: &str,
+        at: &str,
+        detail: &str,
+    ) -> Result<(), Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE reports SET case_id = ?3
+             WHERE reporter = ?1 AND report_id = ?2 AND case_id IS NULL",
+            params![reporter, report_id, case_id],
+        )?;
+        tx.execute(
+            "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
+            params![case_id, at, "report_joined", detail],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Test-only: put every one of a case's notices back in the queue.
+    #[cfg(test)]
+    pub fn undeliver_open_case_verdicts(&self, case_id: &str) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE verdicts SET delivered = 0 WHERE case_id = ?1 AND disposition = 'open-case'",
+            params![case_id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether **every** notice this case has issued has reached the
+    /// interface.
+    ///
+    /// Not just the latest. Each joined report emits its own
+    /// `open-case` verdict whose reasoning hashes only that report's
+    /// evidence, so checking the newest one let an undelivered earlier
+    /// notice's allegations sit in the case — attached, credited, and
+    /// available to support a ban — while the accused had never been
+    /// served with them. Two joins were enough to recreate exactly the
+    /// notice-free evidence this guard exists to prevent.
+    ///
+    /// A case with no notice at all answers `false`: there is nothing
+    /// to have been served.
     pub fn open_case_verdict_delivered(&self, case_id: &str) -> Result<bool, Error> {
         let conn = self.conn.lock().unwrap();
-        let delivered: Option<i64> = conn
-            .query_row(
-                "SELECT delivered FROM verdicts
-                  WHERE case_id = ?1 AND disposition = 'open-case'
-                  ORDER BY issued_at DESC, rowid DESC LIMIT 1",
-                params![case_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(delivered == Some(1))
+        let (total, delivered): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(delivered), 0) FROM verdicts
+              WHERE case_id = ?1 AND disposition = 'open-case'",
+            params![case_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(total > 0 && total == delivered)
     }
 
     /// Record a failed delivery. `refused` distinguishes the interface

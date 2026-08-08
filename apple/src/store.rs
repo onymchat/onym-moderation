@@ -46,6 +46,10 @@ pub struct MandateRecord {
 pub struct StoredVerdict {
     pub verdict_ref: String,
     pub case_id: String,
+    /// The verdict's own signed `decidedAt`. The fold orders by this,
+    /// not by arrival: the authority decides the sequence, and delivery
+    /// can reorder it.
+    pub decided_at: String,
     pub mandate_ref: String,
     pub device_binding: String,
     pub raw: Vec<u8>,
@@ -141,7 +145,14 @@ impl Store {
                 executed       INTEGER NOT NULL DEFAULT 0,
                 superseded     INTEGER NOT NULL DEFAULT 0,
                 raw            BLOB NOT NULL,
-                received_at    TEXT NOT NULL
+                received_at    TEXT NOT NULL,
+                -- The verdict's own signed `decidedAt`. Causality
+                -- belongs to the authority that decided, not to the
+                -- order packets happened to arrive in: a ban and its
+                -- reversal can be committed in order and delivered out
+                -- of it, and folding by arrival let the ban come back
+                -- after the reversal that lifted it.
+                decided_at     TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS verdicts_by_device
                 ON verdicts (device_binding);
@@ -162,7 +173,37 @@ impl Store {
             "#,
         )
         .map_err(|e| Error::Internal(format!("migrate: {e}")))?;
+
+        // `CREATE TABLE IF NOT EXISTS` does nothing to a table that
+        // already exists, so a column added above never reaches a store
+        // opened by an earlier build — and every read selecting it then
+        // fails. On a deployment holding live marks that means coming
+        // back up dead.
+        for (table, column, definition) in
+            [("verdicts", "decided_at", "TEXT NOT NULL DEFAULT ''")]
+        {
+            Self::add_column(&conn, table, column, definition)?;
+        }
         Ok(())
+    }
+
+    /// Add a column, treating "already there" as success. SQLite has no
+    /// `ADD COLUMN IF NOT EXISTS`; the duplicate-column error is the
+    /// check.
+    fn add_column(
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        definition: &str,
+    ) -> Result<(), Error> {
+        match conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), []) {
+            Ok(_) => {
+                tracing::info!(%table, %column, "added column to an existing store");
+                Ok(())
+            }
+            Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+            Err(e) => Err(Error::Internal(format!("migrate {table}.{column}: {e}"))),
+        }
     }
 
     // ─── Enrollments ─────────────────────────────────────────────────
@@ -325,8 +366,8 @@ impl Store {
         conn.execute(
             "INSERT INTO verdicts
              (verdict_ref, case_id, mandate_ref, device_binding, disposition,
-              ban_expires, execute_after, executed, superseded, raw, received_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              ban_expires, execute_after, executed, superseded, raw, received_at, decided_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 verdict.verdict_ref,
                 verdict.case_id,
@@ -338,7 +379,8 @@ impl Store {
                 verdict.executed as i32,
                 verdict.superseded as i32,
                 verdict.raw,
-                now
+                now,
+                verdict.decided_at
             ],
         )?;
         Ok(())
@@ -353,18 +395,27 @@ impl Store {
         Ok(())
     }
 
-    /// Every verdict for a device, newest first. Terminal verdicts
-    /// supersede the interim `open-case` one for the same case, which
-    /// the caller resolves.
+    /// Every verdict for a device, newest **decided** first.
+    ///
+    /// Ordered by the authority's signed `decidedAt`, not by when the
+    /// verdict happened to arrive. Delivery is at-least-once and not
+    /// single-flight, so a ban and the reversal that lifts it can be
+    /// committed in order and land out of it — and ordering by arrival
+    /// let the ban become the newest fold input again and reinstate
+    /// itself after being reversed. The same shape let a stale
+    /// `open-case` land after a dismissal and reopen the case.
+    ///
+    /// `received_at` and `rowid` remain as tie-breaks, so ordering is
+    /// still total when two verdicts share a `decidedAt`.
     pub fn verdicts_for_device(&self, device_binding: &str) -> Result<Vec<StoredVerdict>, Error> {
         let conn = self.conn.lock().unwrap();
         // `rowid` breaks ties when two verdicts land in the same second,
         // so ordering is total rather than merely mostly-ordered.
         let mut statement = conn.prepare(
             "SELECT verdict_ref, case_id, mandate_ref, device_binding, raw, disposition,
-                    ban_expires, execute_after, executed, superseded
+                    ban_expires, execute_after, executed, superseded, decided_at
              FROM verdicts WHERE device_binding = ?1
-             ORDER BY received_at DESC, rowid DESC",
+             ORDER BY decided_at DESC, received_at DESC, rowid DESC",
         )?;
         let rows = statement.query_map(params![device_binding], |row| {
             Ok(StoredVerdict {
@@ -378,6 +429,7 @@ impl Store {
                 execute_after: row.get(7)?,
                 executed: row.get::<_, i32>(8)? != 0,
                 superseded: row.get::<_, i32>(9)? != 0,
+                decided_at: row.get(10)?,
             })
         })?;
         let mut out = Vec::new();
