@@ -6,7 +6,7 @@
   "moderationProfileId": "onym:moderation-profile:consent-bound-v1",
   "modelProfile": {
     "id": "qwen3guard-8b",
-    "digest": "9de986ce0e21d361c9bd049a10c6cce7833716cec9c53d1750fbcca24b7a7013"
+    "digest": "00d7a92a7dd464beb29bb7fa768d484619ef71ba7cfcb7386070f056dd5a6c71"
   },
   "violationClasses": [
     {

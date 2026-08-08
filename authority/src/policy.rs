@@ -19,7 +19,7 @@
 /// document to `AUTHORITY_POLICY_PATH` and have this checked at boot;
 /// see `Config`.
 pub const REFERENCE_POLICY_SHA256: &str =
-    "7ab0681bff4a453f9f14973c9b28671bf507dad81c180c9cf29c46d594a41c75";
+    "8609e064f9615e29fad4fb97e3feed533dd4a01986f9fc73e3a2d3fd60f4c08b";
 
 /// One canonical rule, in the three parts the policy states it in.
 ///

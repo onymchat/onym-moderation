@@ -760,7 +760,7 @@ fn shieldstral_3b() -> ModelProfile {
     ModelProfile {
         id: "shieldstral-3b".into(),
         display_name: "Shieldstral-3B Reference Authority".into(),
-        profile_digest: "02330b6bb6686b02c38773561f4f7366d50edeb5944dbb5e2a0302fd74ce2a4e".into(),
+        profile_digest: "572e1e9348faa506d3ab6c0d1bfa8830133dd695a6c4c77ffba7962a92d3fd02".into(),
         policy_digest: POLICY_DIGEST.into(),
         repository: "mistralai/Shieldstral-1.0-3B".into(),
         revision: "003ec7e2b0bab5f0e6307edbaf186fa5822b76f5".into(),
@@ -796,7 +796,7 @@ fn gpt_oss_safeguard_20b() -> ModelProfile {
     ModelProfile {
         id: "gpt-oss-safeguard-20b".into(),
         display_name: "GPT-OSS-Safeguard-20B Reference Authority".into(),
-        profile_digest: "79b0f79f104197aa508d181cdce0b409dc68c73d2b941646092b6738801635a3".into(),
+        profile_digest: "6e21fa551713739f61f30a17259ca6048a8967396005fdccd67b4dc497330fe1".into(),
         policy_digest: POLICY_DIGEST.into(),
         repository: "openai/gpt-oss-safeguard-20b".into(),
         revision: "8a11e17b25c973a24099d4016bf2e17dd7ec1574".into(),
@@ -829,7 +829,7 @@ fn qwen3guard_8b() -> ModelProfile {
     ModelProfile {
         id: "qwen3guard-8b".into(),
         display_name: "Qwen3Guard-8B Reference Authority".into(),
-        profile_digest: "9de986ce0e21d361c9bd049a10c6cce7833716cec9c53d1750fbcca24b7a7013".into(),
+        profile_digest: "00d7a92a7dd464beb29bb7fa768d484619ef71ba7cfcb7386070f056dd5a6c71".into(),
         policy_digest: POLICY_DIGEST.into(),
         repository: "Qwen/Qwen3Guard-Gen-8B".into(),
         revision: "4505cb1a6f1864f21f8b27f7daf1b9a1aab6edbb".into(),
@@ -883,7 +883,7 @@ fn nemotron_35_content_safety_4b() -> ModelProfile {
     ModelProfile {
         id: "nemotron-3.5-content-safety-4b".into(),
         display_name: "Nemotron-3.5-Content-Safety-4B Reference Authority".into(),
-        profile_digest: "deb23fb1d02857a2220aece1dfe5c6f0c0b6836281626aed9dd3c260b85b6a75".into(),
+        profile_digest: "994d46671aca326c18176922aa2ffad8eac3990c19c33b53221ae84d16ada534".into(),
         policy_digest: POLICY_DIGEST.into(),
         repository: "nvidia/Nemotron-3.5-Content-Safety".into(),
         revision: "35645ed3543b7e7ffaed2e788699e57a5051497c".into(),
@@ -928,7 +928,7 @@ fn llama_guard_4_12b() -> ModelProfile {
     ModelProfile {
         id: "llama-guard-4-12b".into(),
         display_name: "Llama-Guard-4-12B Reference Authority".into(),
-        profile_digest: "ba9542602253be24e2aff371072ef6f354737a47391efb1a21edd9f69c99f6fa".into(),
+        profile_digest: "9bcd00f252abda2b743797b74aa38512e3909c239039bafe586d41e9c4d520e8".into(),
         policy_digest: POLICY_DIGEST.into(),
         repository: "meta-llama/Llama-Guard-4-12B".into(),
         revision: "87acb4b94e930c3d679e6e7ee9d57e2feab9ea71".into(),
@@ -962,7 +962,7 @@ fn shieldgemma_9b() -> ModelProfile {
     ModelProfile {
         id: "shieldgemma-9b".into(),
         display_name: "ShieldGemma-9B Reference Authority".into(),
-        profile_digest: "b7a0d6ead322b229edba89be412be50dc453e95d48ec4600cdf8677070c570b5".into(),
+        profile_digest: "94d45f96d5c03e0f7996c11d646b925a59279245d3d36022c37fb1ef6fcb5fb5".into(),
         policy_digest: POLICY_DIGEST.into(),
         repository: "google/shieldgemma-9b".into(),
         revision: "b8b636016df4540721a098c7aab91c97ec6ee508".into(),
@@ -1368,7 +1368,7 @@ mod tests {
             "id": "house-classifier-v3",
             "displayName": "In-house classifier",
             "profileDigest": "aa11223344556677889900aabbccddeeff00112233445566778899aabbccddee",
-            "policyDigest": "7ab0681bff4a453f9f14973c9b28671bf507dad81c180c9cf29c46d594a41c75",
+            "policyDigest": "8609e064f9615e29fad4fb97e3feed533dd4a01986f9fc73e3a2d3fd60f4c08b",
             "repository": "example-org/house-classifier",
             "revision": "0123456789012345678901234567890123456789",
             "servedModel": "house-classifier",
@@ -1450,5 +1450,7 @@ mod tests {
             Outcome::Ban
         );
     }
+
+
 
 }
