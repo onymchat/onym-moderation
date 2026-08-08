@@ -354,6 +354,10 @@ mod tests {
                 credited_reporters: &[],
                 expect_stage: "open",
                 expect_disposition: None,
+                expect_revision: None,
+                appeal_state: None,
+                new_holder_state: None,
+                extra_event: None,
             })
             .unwrap();
 
