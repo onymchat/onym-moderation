@@ -607,18 +607,6 @@ async fn respond(
     if case.stage != "open" {
         return Err(Error::CaseState("case is already decided".into()));
     }
-    // The accused may answer more than once — further evidence within
-    // the window travels the same path — but not without limit. This
-    // is storage hygiene rather than a security boundary: the caller
-    // is signature-authenticated as the accused, so the cost of
-    // exceeding it falls on someone with nothing to gain.
-    if state.store.responses(&case_id)?.len() >= MAX_RESPONSES_PER_CASE {
-        return Err(Error::CaseState(format!(
-            "this case already holds {MAX_RESPONSES_PER_CASE} responses; further material \
-             belongs in one of them rather than in another filing"
-        )));
-    }
-
     // Counter-evidence must verify against the accused's own key, the
     // same rule the reporter's evidence is held to.
     for (index, item) in response.evidence.iter().enumerate() {
@@ -647,6 +635,7 @@ async fn respond(
         &stamp,
         if late { "response_late" } else { "response" },
         &response.statement,
+        MAX_RESPONSES_PER_CASE,
     )?;
 
     Ok(Json(json!({ "caseId": case_id, "recorded": true, "late": late })))
@@ -720,21 +709,18 @@ async fn appeal(
         // reaches the caller: a claim about a case that does not exist
         // answers exactly as one about a case that does.
         let case = state.store.case(&case_id)?;
-        let claims = state
-            .store
-            .events(&case_id)?
-            .iter()
-            .filter(|(_, kind, _)| kind == "new_holder_claim")
-            .count();
-        let actionable = case.as_ref().and_then(|c| c.disposition.as_deref()) == Some("ban")
-            && claims < MAX_NEW_HOLDER_CLAIMS;
+        let actionable = case.as_ref().and_then(|c| c.disposition.as_deref()) == Some("ban");
         if actionable {
             let stamp = util::format_timestamp(OffsetDateTime::now_utc());
-            state.store.append_event(
+            // Count and insert share one store lock. This endpoint is
+            // unauthenticated, so a check followed by a separate write
+            // would let a concurrent burst overrun the advertised cap.
+            let _ = state.store.append_event_bounded(
                 &case_id,
                 &stamp,
                 "new_holder_claim",
                 &submission.statement,
+                MAX_NEW_HOLDER_CLAIMS,
             )?;
             tracing::info!(%case_id, "new-holder claim filed");
         }
@@ -914,6 +900,13 @@ async fn decide(
         "ban" => {
             if case.stage != "open" {
                 return Err(Error::CaseState("case is already decided".into()));
+            }
+            if !state.store.open_case_verdict_delivered(&case_id)? {
+                return Err(Error::CaseState(
+                    "the opening verdict has not reached the interface; banning before notice \
+                     would run the response window silently"
+                        .into(),
+                ));
             }
             // The decision deadline is not advisory: once it passes the
             // case is dismissed by default, whether or not the sweep
@@ -1271,7 +1264,11 @@ mod tests {
         let body = signed(report_json(&reporter_mandate, "r-1"), "signature", &[REPORTER_SEED]);
         let (status, response) = harness.post("/v1/reports", body).await;
         assert_eq!(status, StatusCode::OK, "{response}");
-        response["caseId"].as_str().unwrap().to_string()
+        let case_id = response["caseId"].as_str().unwrap().to_string();
+        let opening = harness.state.store.undelivered_verdicts().unwrap();
+        assert_eq!(opening.len(), 1);
+        harness.state.store.mark_delivered(&opening[0].verdict_ref).unwrap();
+        case_id
     }
 
     // ─── Jurisdiction ────────────────────────────────────────────────
@@ -1561,6 +1558,28 @@ mod tests {
             harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(response["error"], "case_state");
+    }
+
+    #[tokio::test]
+    async fn a_ban_is_refused_until_the_opening_verdict_is_delivered() {
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+        let body = signed(report_json(&reporter_mandate, "r-1"), "signature", &[REPORTER_SEED]);
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let case_id = response["caseId"].as_str().unwrap().to_string();
+
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+
+        let (status, response) = harness
+            .decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"}))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{response}");
+        assert_eq!(response["error"], "case_state");
+        assert_eq!(harness.state.store.case(&case_id).unwrap().unwrap().stage, "open");
     }
 
     /// An answered case does not shorten the window. The accused was

@@ -553,9 +553,21 @@ impl Store {
         filed_at: &str,
         event_kind: &str,
         event_detail: &str,
+        limit: usize,
     ) -> Result<(), Error> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM responses WHERE case_id = ?1",
+            params![case.case_id],
+            |row| row.get(0),
+        )?;
+        if count >= limit as i64 {
+            return Err(Error::CaseState(format!(
+                "this case already holds {limit} responses; further material belongs in one of \
+                 them rather than in another filing"
+            )));
+        }
         tx.execute(
             "INSERT INTO responses (case_id, raw, late, filed_at) VALUES (?1, ?2, ?3, ?4)",
             params![case.case_id, raw, late as i32, filed_at],
@@ -923,6 +935,22 @@ impl Store {
         Ok(())
     }
 
+    /// Whether the interface acknowledged the interim verdict that
+    /// carries this case's notice. A sanction cannot rely on a response
+    /// window the accused's interface never learned existed.
+    pub fn open_case_verdict_delivered(&self, case_id: &str) -> Result<bool, Error> {
+        let conn = self.conn.lock().unwrap();
+        let delivered: i64 = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM verdicts
+                  WHERE case_id = ?1 AND disposition = 'open-case' AND delivered = 1
+             )",
+            params![case_id],
+            |row| row.get(0),
+        )?;
+        Ok(delivered != 0)
+    }
+
     /// Record a failed delivery. `refused` distinguishes the interface
     /// rejecting the verdict itself from it being unreachable, and only
     /// refusals are counted toward giving up: an interface down for
@@ -1139,14 +1167,86 @@ mod tests {
         case.stage = "open".into();
         store.put_case(&case).unwrap();
 
-        store.put_response(&case, b"{\"statement\":\"one\"}", false, "t1", "response", "one").unwrap();
-        store.put_response(&case, b"{\"statement\":\"two\"}", true, "t2", "response_late", "two").unwrap();
+        store
+            .put_response(
+                &case,
+                b"{\"statement\":\"one\"}",
+                false,
+                "t1",
+                "response",
+                "one",
+                2,
+            )
+            .unwrap();
+        store
+            .put_response(
+                &case,
+                b"{\"statement\":\"two\"}",
+                true,
+                "t2",
+                "response_late",
+                "two",
+                2,
+            )
+            .unwrap();
+        assert!(
+            store
+                .put_response(
+                    &case,
+                    b"{\"statement\":\"three\"}",
+                    false,
+                    "t3",
+                    "response",
+                    "three",
+                    2,
+                )
+                .is_err(),
+            "the count and insert enforce the bound under one store lock"
+        );
 
         let stored = store.responses("c1").unwrap();
         assert_eq!(stored.len(), 2);
         assert_eq!(stored[0].0, b"{\"statement\":\"one\"}");
         assert!(!stored[0].1);
         assert!(stored[1].1, "the second response was filed late");
+    }
+
+    #[test]
+    fn bounded_events_hold_their_cap_under_concurrency() {
+        let store = std::sync::Arc::new(Store::in_memory().unwrap());
+        store.put_case(&sample_case("c1")).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(32));
+        let mut workers = Vec::new();
+        for index in 0..32 {
+            let store = std::sync::Arc::clone(&store);
+            let barrier = std::sync::Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .append_event_bounded(
+                        "c1",
+                        "t1",
+                        "new_holder_claim",
+                        &format!("claim {index}"),
+                        8,
+                    )
+                    .unwrap()
+            }));
+        }
+        let inserted = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap() as usize)
+            .sum::<usize>();
+        assert_eq!(inserted, 8);
+        assert_eq!(
+            store
+                .events("c1")
+                .unwrap()
+                .iter()
+                .filter(|(_, kind, _)| kind == "new_holder_claim")
+                .count(),
+            8
+        );
     }
 
     #[test]

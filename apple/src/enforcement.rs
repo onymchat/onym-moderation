@@ -170,7 +170,7 @@ impl Engine {
         // takes case A's notice down with it: `gate_check` only serves
         // notices when the bit is set, so the accused would stop being
         // told about a case they are still expected to answer.
-        let mut open_cases: Vec<String> = Vec::new();
+        let mut open_cases: Vec<(String, String)> = Vec::new();
         // More than one consented class can produce a live ban on the
         // same device. Keep them by case while folding so a dismissal
         // reverses only the case it names rather than clearing an
@@ -196,18 +196,18 @@ impl Engine {
             // unrelated write succeeded.
             match verdict.disposition {
                 crate::types::Disposition::OpenCase => {
-                    if !open_cases.contains(&verdict.case_id) {
-                        open_cases.push(verdict.case_id.clone());
+                    if !open_cases.iter().any(|(case_id, _)| case_id == &verdict.case_id) {
+                        open_cases.push((verdict.case_id.clone(), stored.verdict_ref.clone()));
+                        realizes.push(stored.verdict_ref.clone());
                     }
                     authorized_by = stored.verdict_ref.clone();
-                    realizes.push(stored.verdict_ref.clone());
                 }
                 crate::types::Disposition::Dismiss => {
                     // Terminal for its own case, and only its own:
                     // this case stops contributing to the aggregate
                     // bit, and the dismissal is a ban reversal only
                     // here.
-                    open_cases.retain(|case_id| case_id != &verdict.case_id);
+                    Self::close_open_case(&mut open_cases, &mut realizes, &verdict.case_id);
                     let mut removed_refs = Vec::new();
                     bans.retain(|(verdict_ref, active, _)| {
                         if active.case_id == verdict.case_id {
@@ -230,7 +230,7 @@ impl Engine {
                     // while the verdict itself declares
                     // `case-open: false`. The mark and the document
                     // authorizing it have to agree.
-                    open_cases.retain(|case_id| case_id != &verdict.case_id);
+                    Self::close_open_case(&mut open_cases, &mut realizes, &verdict.case_id);
 
                     if !Self::ban_in_force(stored, now) {
                         // Either not yet at executeAfter, or expired.
@@ -267,9 +267,6 @@ impl Engine {
                     });
                     realizes.retain(|verdict_ref| !removed_refs.contains(verdict_ref));
 
-                    // Decided, so no longer an open case — but again,
-                    // only this one.
-                    open_cases.retain(|case_id| case_id != &verdict.case_id);
                     bans.push((stored.verdict_ref.clone(), verdict, stored.executed));
                     authorized_by = stored.verdict_ref.clone();
                     realizes.push(stored.verdict_ref.clone());
@@ -307,6 +304,20 @@ impl Engine {
             realizes,
             ban_executed,
         }))
+    }
+
+    fn close_open_case(
+        open_cases: &mut Vec<(String, String)>,
+        realizes: &mut Vec<String>,
+        case_id: &str,
+    ) {
+        let removed_refs: Vec<String> = open_cases
+            .iter()
+            .filter(|(open_case_id, _)| open_case_id == case_id)
+            .map(|(_, verdict_ref)| verdict_ref.clone())
+            .collect();
+        open_cases.retain(|(open_case_id, _)| open_case_id != case_id);
+        realizes.retain(|verdict_ref| !removed_refs.contains(verdict_ref));
     }
 
     /// A ban is in force when execution has begun and expiry hasn't
@@ -571,6 +582,46 @@ mod tests {
         let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
         assert!(!intended.bits.banned);
         assert!(intended.ban.is_none());
+    }
+
+    #[test]
+    fn a_terminal_verdict_does_not_realize_its_superseded_open_case_ref() {
+        let engine = engine();
+        let open = verdict("case-csam", Disposition::OpenCase, "csam");
+        let dismiss = verdict("case-csam", Disposition::Dismiss, "csam");
+        for (verdict_ref, value, received_at) in [
+            ("open-csam", open, "2026-08-08T00:00:00Z"),
+            ("dismiss-csam", dismiss, "2026-08-08T01:00:00Z"),
+        ] {
+            let raw = serde_json::to_vec(&value).unwrap();
+            engine
+                .store
+                .put_verdict(
+                    &StoredVerdict {
+                        verdict_ref: verdict_ref.into(),
+                        case_id: value.case_id,
+                        mandate_ref: MANDATE.into(),
+                        device_binding: DEVICE.into(),
+                        raw,
+                        disposition: match value.disposition {
+                            Disposition::OpenCase => "open-case",
+                            Disposition::Dismiss => "dismiss",
+                            Disposition::Ban => "ban",
+                        }
+                        .into(),
+                        ban_expires: value.ban_expires,
+                        execute_after: value.execute_after,
+                        executed: false,
+                        superseded: false,
+                    },
+                    received_at,
+                )
+                .unwrap();
+        }
+
+        let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
+        assert!(!intended.realizes.iter().any(|reference| reference == "open-csam"));
+        assert!(intended.realizes.iter().any(|reference| reference == "dismiss-csam"));
     }
 
     /// The other half of the same fold. Two cases open at once — they
