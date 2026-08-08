@@ -1,0 +1,18 @@
+{
+	email {$CADDY_EMAIL}
+}
+
+{$AUTHORITY_HOST} {
+	encode zstd gzip
+
+	# `/manifest.json` is deliberately public: users must be able to
+	# read the classes, terms, and appeal path *before* consenting, and
+	# anyone should be able to check a mandate's pinned hash against
+	# what this authority publishes.
+	reverse_proxy authority:8080
+
+	log {
+		output stdout
+		format console
+	}
+}

@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "componentId": "onym:component:example-authority",
+  "seat": "moderation",
+  "operator": "onym:key:0000000000000000000000000000000000000000000000000000000000000000",
+  "moderationProfileId": "onym:moderation-profile:consent-bound-v1",
+  "violationClasses": [
+    {
+      "classId": "csam",
+      "definition": "https://example-authority.org/definitions/csam",
+      "responseWindow": "P3D",
+      "decisionDeadline": "P7D",
+      "banTerm": "permanent",
+      "appealWindow": "P30D",
+      "appealEffect": "non-suspensive",
+      "lawfulReporting": "https://example-authority.org/lawful-reporting"
+    },
+    {
+      "classId": "credible-violence",
+      "definition": "https://example-authority.org/definitions/credible-violence",
+      "responseWindow": "P7D",
+      "decisionDeadline": "P14D",
+      "banTerm": "P365D",
+      "appealWindow": "P30D",
+      "appealEffect": "non-suspensive"
+    },
+    {
+      "classId": "unsolicited-pornography",
+      "definition": "https://example-authority.org/definitions/unsolicited-pornography",
+      "responseWindow": "P7D",
+      "decisionDeadline": "P14D",
+      "banTerm": "P90D",
+      "appealWindow": "P30D",
+      "appealEffect": "suspensive"
+    }
+  ],
+  "evidenceRules": "https://example-authority.org/evidence-rules",
+  "reputationPolicy": "https://example-authority.org/reputation-policy",
+  "newHolderAppeal": "https://example-authority.org/new-holder",
+  "appellate": "onym:component:example-appellate",
+  "confidentiality": "https://example-authority.org/confidentiality",
+  "statistics": "https://example-authority.org/transparency",
+  "validUntil": "2027-06-30T23:59:59Z"
+}

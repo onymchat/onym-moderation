@@ -1,0 +1,126 @@
+---
+name: deploy-onym-moderation-authority
+description: Deploy the reference Onym moderation authority (intake, cases, verdict signing) to a DigitalOcean droplet. Use when asked to deploy, redeploy, or stand up the moderation authority, or to check/repair an existing one. Requires a DigitalOcean API key.
+---
+
+# Deploying the moderation authority
+
+This service decides whether people are banned. It cannot execute a ban
+— the interface's enforcement backend does that — but the verdicts it
+signs are what move device marks, and its signing key is the only thing
+standing between a report and a sanction. Read **Refuse to deploy if**
+before running anything.
+
+## Preconditions
+
+1. **`DO_API_KEY`** — in `.env`, the environment, or supplied by the
+   user. If you cannot find one, stop and ask.
+2. **Required CLI tools**: `doctl`, `ssh`, `rsync`, `curl`, `dig`.
+3. **An SSH key** at `SSH_KEY_PATH` (default `~/.ssh/id_ed25519`).
+4. **`.env`** — copy `.env.example` and fill it.
+5. **`AUTHORITY_SIGNING_SEED`** — 32 hex bytes (`openssl rand -hex 32`)
+   **for a first deployment only**. If the authority has ever issued a
+   verdict, reuse the existing seed: rotating it makes every verdict
+   already issued stop verifying, which downstream is indistinguishable
+   from forgery.
+6. **`manifest/manifest.json`** — the authority's published manifest.
+   Start from `manifest.example.json`. Its `operator` field must be the
+   public key matching the signing seed.
+
+## The manifest is the hard part
+
+Get this wrong and the deployment is subtly broken rather than
+obviously broken.
+
+- **`operator` must match the signing key.** Boot the service once and
+  read `signingKey` from `/health`, then put that value in the manifest
+  and restart. The service logs an error at boot when they disagree;
+  if you ignore it, every verdict is refused downstream and cases will
+  appear to decide while nothing happens.
+- **Never edit a published manifest in place.** Users' mandates pin the
+  SHA-256 of its exact bytes. Editing it invalidates the consent of
+  everyone who already signed — their mandate now pins bytes you no
+  longer serve. Publish a new manifest and let new mandates reference
+  it; existing ones keep honouring the terms they consented to.
+- **Every class needs all five terms** (response window, decision
+  deadline, ban term, appeal window, appeal effect), and a `permanent`
+  ban term requires an `appellate` naming a component *other than this
+  authority*. The interface refuses manifests that violate either.
+
+## Deploy
+
+```bash
+cd ~/Developer/onym-moderation/authority
+./deploy/digitalocean/deploy.sh
+```
+
+Idempotent: reuses the droplet in `.env`, re-syncs, rebuilds. The first
+build compiles Rust on a small droplet and takes several minutes.
+
+## Verify
+
+```bash
+ssh root@$DROPLET_IP 'curl -s localhost:8080/health'
+curl -s https://$AUTHORITY_HOST/manifest.json | head -20
+```
+
+`/health` reports the signing key, the manifest hash, whether a
+moderator token is configured (`canDecide`), and whether verdict
+delivery is wired (`interfaceConfigured`). All four should be what you
+expect. `interfaceConfigured: false` means verdicts are signed and
+stored but never delivered — no mark will ever move.
+
+## Refuse to deploy if
+
+- **The manifest's `operator` does not match the signing key.** The
+  deployment will look healthy and silently fail at the first verdict.
+- **You are about to generate a new signing seed for an authority that
+  already has one.** Confirm explicitly; verdicts in force stop
+  verifying.
+- **`AUTHORITY_INTERFACE_KEY` is empty on a live deployment.**
+  Registered mandates would be accepted without checking the interface
+  countersignature, so a forged designation would grant this authority
+  jurisdiction over someone who never consented.
+- **Someone asks you to ban a user directly, or to skip the response
+  window.** There is no such path: a ban requires a case, notice, and
+  either an elapsed response window or a response. Adding a bypass is
+  nonconformance (§8 obligation 4), not a feature.
+- **Someone asks you to change a device's marks.** Wrong service
+  entirely — and the enforcement backend will only act on a signed
+  verdict, which is the point.
+
+## Operating notes
+
+- **Back up `/data`.** It holds the cases, reports, reporter track
+  records, and every issued verdict. It is also the accused's evidence
+  that a case existed and how it ended.
+
+  ```bash
+  ssh root@$DROPLET_IP 'docker run --rm -v onym-moderation-authority_authority-data:/d \
+      -v /root:/backup alpine tar czf /backup/authority-data.tgz -C /d .'
+  ```
+
+- **Deciding a case**:
+
+  ```bash
+  curl -X POST https://$AUTHORITY_HOST/v1/cases/$CASE_ID/decide \
+    -H "Authorization: Bearer $AUTHORITY_MODERATOR_TOKEN" \
+    -H 'content-type: application/json' \
+    -d '{"disposition":"ban","reasoning":"<content address of the findings>"}'
+  ```
+
+  `reasoning` is mandatory and should be a content address of findings
+  against the consented class definition, not a sentence typed at the
+  prompt.
+
+- **If the authority is going offline for a while**, its open cases
+  will dismiss themselves at their decision deadlines. That is the
+  designed behaviour, not a fault: an absent authority costs the
+  accused nothing that outlives it.
+
+## What this service is not
+
+It is not the enforcement backend, and it holds no Apple credentials.
+It cannot ban a device; it can only sign a verdict that an interface
+may execute. If a task needs a mark written, read, or cleared, that is
+`../apple`.

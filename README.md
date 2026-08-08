@@ -16,17 +16,23 @@ implementation profile per device-mark platform.
 | Directory | What it implements | Owner in the contract |
 |---|---|---|
 | [`apple/`](apple) | The enforcement backend for the Apple DeviceCheck profile | Interface vendor |
+| [`authority/`](authority) | Intake, cases, notices, verdict signing | Independent authority operator |
 
 `apple/` is the interface vendor's half: it holds the DeviceCheck key
 and therefore the only write path to any device's bits. It executes
 verdicts; it does not decide them.
 
-The **authority's** half — intake, cases, notices, verdict signing — is
-a separate service, owned by a separate operator, and is not in this
-repo yet. That separation is the point of the seat rather than an
-accident of layout: an authority that could write marks, or an
-interface that could originate verdicts, would collapse exactly the
-power this contract splits.
+`authority/` is the other half: it opens cases, serves notice, and
+signs verdicts. It has no Apple credentials and no code path to a
+device mark.
+
+They are two directories here for convenience, but **they are meant to
+be run by different operators**. That separation is the point of the
+seat rather than an accident of layout: an authority that could write
+marks, or an interface that could originate verdicts, would collapse
+exactly the power this contract splits. The two services deliberately
+do not share a library — they must agree on *bytes*, not on code, and
+each pins that agreement with its own tests.
 
 Android's sibling profile (Play Integrity device recall) would live
 here too, as `android/`, and deliberately shares the enforcement
