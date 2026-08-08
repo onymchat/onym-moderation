@@ -237,6 +237,7 @@ impl Engine {
                         // A pending replacement does not end an
                         // already-active ban for the same case. An
                         // expired verdict does.
+                        authorized_by = stored.verdict_ref.clone();
                         if Self::ban_expired(stored, now) {
                             let mut removed_refs = Vec::new();
                             bans.retain(|(verdict_ref, active, _)| {
@@ -906,6 +907,7 @@ mod tests {
         let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
         assert!(!intended.bits.banned, "the ban has not begun");
         assert!(!intended.bits.case_open, "but the case is decided, not open");
+        assert_eq!(intended.authorized_by, "ban-csam");
     }
 
 
