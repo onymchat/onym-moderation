@@ -711,7 +711,7 @@ async fn open_case(
         return Ok(None);
     }
 
-    flush_soon(state);
+    crate::delivery::flush_soon(state);
     tracing::info!(case_id = %case.case_id, "case opened");
     Ok(Some(case))
 }
@@ -917,6 +917,19 @@ async fn appeal(
             .map_err(|e| Error::Internal(format!("stored appealDeadline: {e}")))?;
         if OffsetDateTime::now_utc() > deadline {
             return Err(Error::WindowClosed("the appeal window has closed".into()));
+        }
+
+        // One appeal per case. Re-filing was accepted unconditionally
+        // and reset `appeal_state` to `pending`, so an accused could
+        // flip a completed review — `upheld`, or even `reversed` —
+        // back into the queue by re-POSTing the same signed object,
+        // erasing the record of a review that did happen.
+        if case.appeal_state != "none" {
+            return Err(Error::CaseState(format!(
+                "this case already has an appeal on file ({}); a decided review is not re-opened \
+                 by filing again",
+                case.appeal_state
+            )));
         }
     }
 

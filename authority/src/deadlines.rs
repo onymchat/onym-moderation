@@ -134,7 +134,10 @@ fn retry_due(attempts: i64, last_attempt: Option<&str>, now: OffsetDateTime) -> 
     now >= last + time::Duration::minutes(minutes)
 }
 
-pub async fn triage_sweep(state: &AppState, now: OffsetDateTime) -> Result<(), Error> {
+pub async fn triage_sweep(
+    state: &std::sync::Arc<AppState>,
+    now: OffsetDateTime,
+) -> Result<(), Error> {
     if state.triage.is_none() {
         return Ok(());
     }

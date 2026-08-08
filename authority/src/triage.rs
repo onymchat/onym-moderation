@@ -347,7 +347,11 @@ fn truncate(value: &str, limit: usize) -> String {
 /// window. Assessing on arrival would ask the model about a case the
 /// accused had not yet had the chance to answer, and then decide it on
 /// that reading.
-pub async fn assess_and_maybe_decide(state: &AppState, case_id: &str, now: OffsetDateTime) {
+pub async fn assess_and_maybe_decide(
+    state: &std::sync::Arc<AppState>,
+    case_id: &str,
+    now: OffsetDateTime,
+) {
     let Some(triage) = state.triage.as_ref() else { return };
     let Some(config) = state.config.triage.as_ref() else { return };
 
@@ -405,7 +409,7 @@ fn response_window_closed(case: &CaseRecord, now: OffsetDateTime) -> bool {
 }
 
 async fn apply_automated(
-    state: &AppState,
+    state: &std::sync::Arc<AppState>,
     case_id: &str,
     disposition: Disposition,
     assessment: &Assessment,
@@ -627,7 +631,7 @@ mod tests {
         let store = crate::store::Store::in_memory().unwrap();
         open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
         let state =
-            AppState::for_tests_with_triage(store, "qwen3guard-8b", &url, TriageMode::Autonomous);
+            std::sync::Arc::new(AppState::for_tests_with_triage(store, "qwen3guard-8b", &url, TriageMode::Autonomous));
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
 
         assess_and_maybe_decide(&state, "c1", now).await;
@@ -669,7 +673,7 @@ mod tests {
         let store = crate::store::Store::in_memory().unwrap();
         open_case(&store, "csam", "2026-08-04T00:00:00Z");
         let state =
-            AppState::for_tests_with_triage(store, "shieldstral-3b", &url, TriageMode::Autonomous);
+            std::sync::Arc::new(AppState::for_tests_with_triage(store, "shieldstral-3b", &url, TriageMode::Autonomous));
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
 
         assess_and_maybe_decide(&state, "c1", now).await;
@@ -699,7 +703,7 @@ mod tests {
         let store = crate::store::Store::in_memory().unwrap();
         open_case(&store, "csam", "2026-08-04T00:00:00Z");
         let state =
-            AppState::for_tests_with_triage(store, "qwen3guard-8b", &url, TriageMode::Autonomous);
+            std::sync::Arc::new(AppState::for_tests_with_triage(store, "qwen3guard-8b", &url, TriageMode::Autonomous));
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
 
         assess_and_maybe_decide(&state, "c1", now).await;
@@ -721,7 +725,7 @@ mod tests {
         let store = crate::store::Store::in_memory().unwrap();
         open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
         let state =
-            AppState::for_tests_with_triage(store, "qwen3guard-8b", &url, TriageMode::Advisory);
+            std::sync::Arc::new(AppState::for_tests_with_triage(store, "qwen3guard-8b", &url, TriageMode::Advisory));
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
 
         assess_and_maybe_decide(&state, "c1", now).await;
@@ -750,7 +754,7 @@ mod tests {
             .unwrap();
 
         let state =
-            AppState::for_tests_with_triage(store, "qwen3guard-8b", &url, TriageMode::Autonomous);
+            std::sync::Arc::new(AppState::for_tests_with_triage(store, "qwen3guard-8b", &url, TriageMode::Autonomous));
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
         assess_and_maybe_decide(&state, "c1", now).await;
 
@@ -790,12 +794,12 @@ mod tests {
         let store = crate::store::Store::in_memory().unwrap();
         open_case(&store, "csam", "2026-08-04T00:00:00Z");
         // A port nothing is listening on.
-        let state = AppState::for_tests_with_triage(
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
             store,
             "qwen3guard-8b",
             "http://127.0.0.1:1/v1/chat/completions",
             TriageMode::Autonomous,
-        );
+        ));
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
 
         assess_and_maybe_decide(&state, "c1", now).await;
@@ -845,12 +849,12 @@ mod tests {
             appeal_state: "none".into(),
         };
         store.put_case(&case).unwrap();
-        let state = AppState::for_tests_with_triage(
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
             store,
             "qwen3guard-8b",
             "http://127.0.0.1:1/v1/chat/completions",
             TriageMode::Autonomous,
-        );
+        ));
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
 
         assess_and_maybe_decide(&state, "c1", now).await;

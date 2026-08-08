@@ -71,7 +71,7 @@ impl Decider {
 /// verdict, update the case, adjust the reporter's record, and hand the
 /// verdict to the interface.
 pub async fn apply(
-    state: &AppState,
+    state: &std::sync::Arc<AppState>,
     case_id: &str,
     disposition: Disposition,
     reasoning: &str,
@@ -88,7 +88,7 @@ pub async fn apply(
 /// `pending`.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_with_appeal_state(
-    state: &AppState,
+    state: &std::sync::Arc<AppState>,
     case_id: &str,
     disposition: Disposition,
     reasoning: &str,
@@ -203,7 +203,11 @@ pub async fn apply_with_appeal_state(
         appeal_state,
     })?;
 
-    state.delivery.flush(&state.store).await?;
+    // Detached: the verdict is committed, and the caller should not
+    // wait on a backlog drained at fifteen seconds a verdict. The sweep
+    // is the reliable path; this only makes a fresh verdict leave
+    // promptly when the interface is healthy.
+    crate::delivery::flush_soon(state);
 
     tracing::info!(
         %case_id,
@@ -312,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_ban_before_the_response_window_closes_is_refused() {
-        let state = AppState::for_tests(Store::in_memory().unwrap());
+        let state = std::sync::Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
         state.store.put_case(&case(false, "2026-08-20T00:00:00Z")).unwrap();
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
 
@@ -327,7 +331,7 @@ mod tests {
     /// before the accused has spoken.
     #[tokio::test]
     async fn automation_may_not_ban_early_either() {
-        let state = AppState::for_tests(Store::in_memory().unwrap());
+        let state = std::sync::Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
         state.store.put_case(&case(false, "2026-08-20T00:00:00Z")).unwrap();
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
 
@@ -337,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_ban_after_the_window_is_allowed() {
-        let state = AppState::for_tests(Store::in_memory().unwrap());
+        let state = std::sync::Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
         state.store.put_case(&case(false, "2026-08-05T00:00:00Z")).unwrap();
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
 
@@ -351,7 +355,7 @@ mod tests {
     /// deadline their consented class declared.
     #[tokio::test]
     async fn a_response_does_not_close_the_window_early() {
-        let state = AppState::for_tests(Store::in_memory().unwrap());
+        let state = std::sync::Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
         state.store.put_case(&case(true, "2026-08-20T00:00:00Z")).unwrap();
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
 
@@ -363,7 +367,7 @@ mod tests {
     /// rather than whenever the sweep next happens to run.
     #[tokio::test]
     async fn a_ban_after_the_decision_deadline_is_refused() {
-        let state = AppState::for_tests(Store::in_memory().unwrap());
+        let state = std::sync::Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
         let mut overdue = case(false, "2026-08-05T00:00:00Z");
         overdue.decision_deadline = "2026-08-08T00:00:00Z".into();
         state.store.put_case(&overdue).unwrap();
@@ -378,7 +382,7 @@ mod tests {
     /// and making someone wait for one would be perverse.
     #[tokio::test]
     async fn a_dismissal_may_land_at_any_time() {
-        let state = AppState::for_tests(Store::in_memory().unwrap());
+        let state = std::sync::Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
         state.store.put_case(&case(false, "2026-08-20T00:00:00Z")).unwrap();
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
 
@@ -389,7 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_reasoning_is_refused_for_every_disposition() {
-        let state = AppState::for_tests(Store::in_memory().unwrap());
+        let state = std::sync::Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
         state.store.put_case(&case(false, "2026-08-05T00:00:00Z")).unwrap();
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
 
@@ -401,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_decider_is_recorded_on_the_case() {
-        let state = AppState::for_tests(Store::in_memory().unwrap());
+        let state = std::sync::Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
         state.store.put_case(&case(false, "2026-08-05T00:00:00Z")).unwrap();
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
 
