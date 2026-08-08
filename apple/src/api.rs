@@ -25,6 +25,8 @@ use crate::types::*;
 use crate::util;
 use crate::verdict::{self, Outcome, ValidationInput};
 
+const MAX_MANDATE_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
+
 pub struct AppState {
     pub config: Config,
     pub engine: Engine,
@@ -104,7 +106,6 @@ async fn countersign(
             mandate.interface, state.config.interface_component_id
         )));
     }
-
     // The user's own signature must verify before we add ours: a
     // countersignature asserts that this interface witnessed *that
     // user* consenting.
@@ -122,6 +123,7 @@ async fn countersign(
         }
     };
     verify_user_signature(&mandate.user, &signing_bytes, user_signature)?;
+    validate_mandate_consent(&mandate.classes, &mandate.accepted_at, OffsetDateTime::now_utc())?;
 
     // The device binding must be one we issued to this identity.
     match state.engine.store.device_binding_for_user(&mandate.user)? {
@@ -153,6 +155,24 @@ async fn countersign(
     Ok(Json(InterfaceCountersignature {
         signature: util::base64_encode(&signature.to_bytes()),
     }))
+}
+
+fn validate_mandate_consent(
+    classes: &[String],
+    accepted_at: &str,
+    now: OffsetDateTime,
+) -> Result<(), Error> {
+    if classes.is_empty() {
+        return Err(Error::BadRequest("mandate must consent to at least one class".into()));
+    }
+    let accepted_at = util::parse_timestamp(accepted_at)
+        .map_err(|e| Error::BadRequest(format!("acceptedAt: {e}")))?;
+    if accepted_at > now + time::Duration::seconds(MAX_MANDATE_CLOCK_SKEW_SECONDS) {
+        return Err(Error::BadRequest(
+            "acceptedAt is too far in the future".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn gate_check(
@@ -266,6 +286,11 @@ async fn receive_verdict(
         &StoredVerdict {
             verdict_ref: verdict_ref.clone(),
             case_id: parsed.case_id.clone(),
+            // The authority's own signed decision time. It is inside
+            // the signing bytes, so it cannot be reordered in transit
+            // — which is exactly why the fold uses it instead of the
+            // moment this request happened to arrive.
+            decided_at: parsed.decided_at.clone(),
             mandate_ref: parsed.mandate_ref.clone(),
             device_binding: mandate.device_binding.clone(),
             raw: verdict_bytes.clone(),
@@ -442,4 +467,19 @@ fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
         return false;
     }
     lhs.iter().zip(rhs).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mandate_consent_rejects_empty_classes_and_future_timestamps() {
+        let now = util::parse_timestamp("2026-08-08T12:00:00Z").unwrap();
+        let classes = vec!["csam".to_string()];
+
+        assert!(validate_mandate_consent(&classes, "2026-08-08T12:00:00Z", now).is_ok());
+        assert!(validate_mandate_consent(&[], "2026-08-08T12:00:00Z", now).is_err());
+        assert!(validate_mandate_consent(&classes, "2099-01-01T00:00:00Z", now).is_err());
+    }
 }

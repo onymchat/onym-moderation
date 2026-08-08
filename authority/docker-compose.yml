@@ -1,0 +1,62 @@
+name: onym-moderation-authority
+
+# The authority behind Caddy, which terminates TLS and renews
+# certificates automatically — the same shape as onym-infra and the
+# sibling enforcement backend.
+#
+# Note what is *not* here: no Apple credentials, no device-mark
+# anything. This service signs verdicts and cannot execute them. If a
+# future edit gives it a write path to a device, the seat's separation
+# is gone.
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      - CADDY_EMAIL=${CADDY_EMAIL:-}
+      - AUTHORITY_HOST=${AUTHORITY_HOST:-authority.example.org}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [internal]
+    depends_on: [authority]
+
+  authority:
+    build: .
+    image: onym-moderation-authority:latest
+    restart: unless-stopped
+    environment:
+      - AUTHORITY_BIND=0.0.0.0:8080
+      - AUTHORITY_STORE_PATH=/data/authority.sqlite
+      - AUTHORITY_MANIFEST_PATH=/manifest/manifest.json
+      - AUTHORITY_SIGNING_SEED=${AUTHORITY_SIGNING_SEED:?set in .env}
+      - AUTHORITY_INTERFACE_URL=${AUTHORITY_INTERFACE_URL:-}
+      - AUTHORITY_INTERFACE_TOKEN=${AUTHORITY_INTERFACE_TOKEN:-}
+      - AUTHORITY_INTERFACE_KEY=${AUTHORITY_INTERFACE_KEY:-}
+      - AUTHORITY_MODERATOR_TOKEN=${AUTHORITY_MODERATOR_TOKEN:-}
+      - AUTHORITY_DEADLINE_SWEEP_SECS=${AUTHORITY_DEADLINE_SWEEP_SECS:-300}
+      - RUST_LOG=${RUST_LOG:-info}
+    volumes:
+      # Cases, reports, reporter track records, and issued verdicts.
+      # Losing this loses the record behind every mark the interface is
+      # holding — and an accused person's evidence that a case existed.
+      - authority-data:/data
+      # The published manifest. Users' mandates pin the SHA-256 of
+      # these exact bytes, so editing this file after anyone has
+      # consented silently invalidates their mandates.
+      - ./manifest:/manifest:ro
+    networks: [internal]
+
+networks:
+  internal:
+
+volumes:
+  caddy-data:
+  caddy-config:
+  authority-data:

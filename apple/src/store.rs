@@ -46,6 +46,10 @@ pub struct MandateRecord {
 pub struct StoredVerdict {
     pub verdict_ref: String,
     pub case_id: String,
+    /// The verdict's own signed `decidedAt`. The fold orders by this,
+    /// not by arrival: the authority decides the sequence, and delivery
+    /// can reorder it.
+    pub decided_at: String,
     pub mandate_ref: String,
     pub device_binding: String,
     pub raw: Vec<u8>,
@@ -80,7 +84,7 @@ impl Store {
             .map_err(|e| Error::Internal(format!("set WAL: {e}")))?;
         conn.pragma_update(None, "foreign_keys", "ON").ok();
         let store = Self { conn: Mutex::new(conn) };
-        store.migrate()?;
+        store.initialize_schema()?;
         Ok(store)
     }
 
@@ -89,11 +93,14 @@ impl Store {
         let conn = Connection::open_in_memory()
             .map_err(|e| Error::Internal(format!("open in-memory store: {e}")))?;
         let store = Self { conn: Mutex::new(conn) };
-        store.migrate()?;
+        store.initialize_schema()?;
         Ok(store)
     }
 
-    fn migrate(&self) -> Result<(), Error> {
+    /// Initialize the prerelease schema. There are no deployed
+    /// Interface databases yet, so schema changes currently require a
+    /// fresh database rather than carrying unexercised migrations.
+    fn initialize_schema(&self) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             r#"
@@ -141,7 +148,19 @@ impl Store {
                 executed       INTEGER NOT NULL DEFAULT 0,
                 superseded     INTEGER NOT NULL DEFAULT 0,
                 raw            BLOB NOT NULL,
-                received_at    TEXT NOT NULL
+                received_at    TEXT NOT NULL,
+                -- The verdict's own signed `decidedAt`. Causality
+                -- belongs to the authority that decided, not to the
+                -- order packets happened to arrive in: a ban and its
+                -- reversal can be committed in order and delivered out
+                -- of it, and folding by arrival let the ban come back
+                -- after the reversal that lifted it.
+                decided_at         TEXT NOT NULL,
+                -- Parsed, normalized components of `decided_at`.
+                -- RFC 3339 text is not chronologically sortable when
+                -- offsets or fractional spellings differ.
+                decided_at_seconds INTEGER NOT NULL,
+                decided_at_nanos   INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS verdicts_by_device
                 ON verdicts (device_binding);
@@ -161,7 +180,7 @@ impl Store {
             );
             "#,
         )
-        .map_err(|e| Error::Internal(format!("migrate: {e}")))?;
+        .map_err(|e| Error::Internal(format!("initialize schema: {e}")))?;
         Ok(())
     }
 
@@ -304,11 +323,36 @@ impl Store {
 
     pub fn put_verdict(&self, verdict: &StoredVerdict, now: &str) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
+        let decided_at = util::parse_timestamp(&verdict.decided_at)
+            .map_err(|e| Error::VerdictInvalid(format!("decidedAt: {e}")))?;
+        let existing: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT raw FROM verdicts WHERE verdict_ref = ?1",
+                params![verdict.verdict_ref],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = existing {
+            let stored_signing_bytes = crate::canonical::verdict_signing_bytes(&raw)?;
+            let incoming_signing_bytes =
+                crate::canonical::verdict_signing_bytes(&verdict.raw)?;
+            if stored_signing_bytes == incoming_signing_bytes {
+                // The signature envelope may legitimately differ while
+                // the signed decision — and verdictRef — is identical.
+                // Preserve execution, supersession, and receipt order.
+                return Ok(());
+            }
+            return Err(Error::VerdictInvalid(format!(
+                "verdictRef {:?} is already on file with different contents",
+                verdict.verdict_ref
+            )));
+        }
         conn.execute(
-            "INSERT OR REPLACE INTO verdicts
+            "INSERT INTO verdicts
              (verdict_ref, case_id, mandate_ref, device_binding, disposition,
-              ban_expires, execute_after, executed, superseded, raw, received_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              ban_expires, execute_after, executed, superseded, raw, received_at, decided_at,
+              decided_at_seconds, decided_at_nanos)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 verdict.verdict_ref,
                 verdict.case_id,
@@ -320,7 +364,10 @@ impl Store {
                 verdict.executed as i32,
                 verdict.superseded as i32,
                 verdict.raw,
-                now
+                now,
+                verdict.decided_at,
+                decided_at.unix_timestamp(),
+                i64::from(decided_at.nanosecond()),
             ],
         )?;
         Ok(())
@@ -335,18 +382,34 @@ impl Store {
         Ok(())
     }
 
-    /// Every verdict for a device, newest first. Terminal verdicts
-    /// supersede the interim `open-case` one for the same case, which
-    /// the caller resolves.
+    /// Every verdict for a device, newest **decided** first.
+    ///
+    /// Ordered by the authority's signed `decidedAt`, not by when the
+    /// verdict happened to arrive. Delivery is at-least-once and not
+    /// single-flight, so a ban and the reversal that lifts it can be
+    /// committed in order and land out of it — and ordering by arrival
+    /// let the ban become the newest fold input again and reinstate
+    /// itself after being reversed. The same shape let a stale
+    /// `open-case` land after a dismissal and reopen the case.
+    ///
+    /// Same-instant decisions use terminal precedence (open, ban,
+    /// dismiss/reverse). The reference authority emits second-precision
+    /// times, so arrival must not decide this tie either.
     pub fn verdicts_for_device(&self, device_binding: &str) -> Result<Vec<StoredVerdict>, Error> {
         let conn = self.conn.lock().unwrap();
-        // `rowid` breaks ties when two verdicts land in the same second,
-        // so ordering is total rather than merely mostly-ordered.
         let mut statement = conn.prepare(
             "SELECT verdict_ref, case_id, mandate_ref, device_binding, raw, disposition,
-                    ban_expires, execute_after, executed, superseded
+                    ban_expires, execute_after, executed, superseded, decided_at
              FROM verdicts WHERE device_binding = ?1
-             ORDER BY received_at DESC, rowid DESC",
+             ORDER BY decided_at_seconds DESC,
+                      decided_at_nanos DESC,
+                      CASE disposition
+                          WHEN 'dismiss' THEN 2
+                          WHEN 'ban' THEN 1
+                          ELSE 0
+                      END DESC,
+                      received_at DESC,
+                      rowid DESC",
         )?;
         let rows = statement.query_map(params![device_binding], |row| {
             Ok(StoredVerdict {
@@ -360,6 +423,7 @@ impl Store {
                 execute_after: row.get(7)?,
                 executed: row.get::<_, i32>(8)? != 0,
                 superseded: row.get::<_, i32>(9)? != 0,
+                decided_at: row.get(10)?,
             })
         })?;
         let mut out = Vec::new();
