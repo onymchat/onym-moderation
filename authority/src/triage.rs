@@ -240,7 +240,21 @@ impl Triage {
         // bearing on the decision that banned them.
         let current = casedoc::build(&state.store, case)?;
         if current.digest != document.digest {
-            return self.record(
+            // Deliberately *not* charged to the attempt budget. The
+            // model answered and the case is fine — the record simply
+            // moved underneath the reading. Counting it let the accused
+            // spend the budget for us: a late response is accepted for
+            // as long as the case is open, so landing one during each
+            // inference would exhaust the 24 attempts and run the case
+            // to its decision deadline, where it dismisses by default.
+            // A guard added to stop a decision being made on evidence
+            // nobody had answered would have become a way to guarantee
+            // acquittal.
+            //
+            // The loop is still bounded, by the cap on how many times
+            // the record can change: responses are capped per case, and
+            // reports need a mandate and a signature.
+            return self.record_with(
                 state,
                 case,
                 profile,
@@ -256,6 +270,7 @@ impl Triage {
                         .into(),
                 },
                 now,
+                false,
             );
         }
 
@@ -274,6 +289,23 @@ impl Triage {
         document: &casedoc::CaseDocument,
         assessed: Assessed,
         now: OffsetDateTime,
+    ) -> Result<Assessment, Error> {
+        self.record_with(state, case, profile, raw_output, document, assessed, now, true)
+    }
+
+    /// As `record`, but able to say the reading should not be charged
+    /// to the case's attempt budget.
+    #[allow(clippy::too_many_arguments)]
+    fn record_with(
+        &self,
+        state: &AppState,
+        case: &CaseRecord,
+        profile: &ModelProfile,
+        raw_output: &str,
+        document: &casedoc::CaseDocument,
+        assessed: Assessed,
+        now: OffsetDateTime,
+        counted: bool,
     ) -> Result<Assessment, Error> {
         let assessment = Assessment {
             profile_id: profile.id.clone(),
@@ -295,7 +327,13 @@ impl Triage {
 
         let raw = serde_json::to_vec(&assessment)
             .map_err(|e| Error::Internal(format!("encode assessment: {e}")))?;
-        state.store.put_assessment(&case.case_id, &raw, &assessment.outcome, &document.text)?;
+        state.store.put_assessment(
+            &case.case_id,
+            &raw,
+            &assessment.outcome,
+            &document.text,
+            counted,
+        )?;
         state.store.append_event_bounded(
             &case.case_id,
             &util::format_timestamp(now),
@@ -983,8 +1021,7 @@ mod tests {
         let reply = serde_json::json!({"caseId": "c1", "statement": "they asked me to"});
         state
             .store
-            .put_response(&case, &serde_json::to_vec(&reply).unwrap(), true,
-                          "2026-08-11T00:00:00Z", "response_late", "they asked me to")
+            .put_response(&crate::store::ResponseFiling { case: &case, raw: &serde_json::to_vec(&reply).unwrap(), late: true, filed_at: "2026-08-11T00:00:00Z", event_kind: "response_late", event_detail: "they asked me to", limit: 32 })
             .unwrap();
         assessing.await.unwrap();
 
@@ -1109,6 +1146,81 @@ mod tests {
             util::sha256_hex(document.as_bytes()),
             "the kept document must be the one the digest names"
         );
+    }
+
+
+    /// The attempt budget exists to stop hammering an unhealthy model.
+    /// Charging a stale reading to it handed the accused a way to spend
+    /// it: a late response is accepted for as long as the case is open,
+    /// so landing one during each inference would exhaust the 24
+    /// attempts and run the case to its decision deadline, where it
+    /// dismisses by default. A guard added to stop a decision being
+    /// made on unanswered evidence would have become a way to
+    /// guarantee acquittal.
+    #[tokio::test]
+    async fn a_stale_reading_does_not_spend_the_attempt_budget() {
+        let (url, _) = slow_stub_model(
+            serde_json::json!({
+                "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Sexual Content or Sexual Acts"}}]
+            }),
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        let case = open_case(&store, "unsolicited-pornography", "2026-08-04T00:00:00Z");
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        // Three readings, each invalidated by a response landing while
+        // the model holds the request.
+        for round in 0..3 {
+            let assessing = {
+                let state = std::sync::Arc::clone(&state);
+                tokio::spawn(async move { assess_and_maybe_decide(&state, "c1", now).await })
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            let reply = serde_json::json!({"caseId": "c1", "statement": format!("round {round}")});
+            state
+                .store
+                .put_response(&crate::store::ResponseFiling { case: &case, raw: &serde_json::to_vec(&reply).unwrap(), late: true, filed_at: "2026-08-11T00:00:00Z", event_kind: "response_late", event_detail: "late", limit: 32 })
+                .unwrap();
+            assessing.await.unwrap();
+        }
+
+        // Still open, still assessable, and the budget untouched.
+        assert_eq!(state.store.case("c1").unwrap().unwrap().stage, "open");
+        let due = state.store.cases_awaiting_assessment("2026-08-12T00:00:00Z").unwrap();
+        assert_eq!(due.len(), 1, "the case must still be in the queue");
+        assert_eq!(
+            due[0].1, 0,
+            "three stale readings, no attempts spent: the model answered every time and the case \
+             was never at fault"
+        );
+    }
+
+    /// The counterpart: a reading the model genuinely failed *is*
+    /// charged, because that is the failure the budget is for.
+    #[tokio::test]
+    async fn a_failed_reading_does_spend_the_budget() {
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "csam", "2026-08-04T00:00:00Z");
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            "http://127.0.0.1:1/v1/chat/completions",
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let due = state.store.cases_awaiting_assessment("2026-08-12T00:00:00Z").unwrap();
+        assert_eq!(due[0].1, 1);
     }
 
 }

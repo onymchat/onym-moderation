@@ -113,6 +113,58 @@ pub fn build(store: &Store, case: &CaseRecord) -> Result<CaseDocument, Error> {
     })
 }
 
+/// The same document with the reporter's own explanation withheld.
+///
+/// The accused is entitled to the record their case was decided on —
+/// the material, their own response, and what the model made of it.
+/// They are *not* entitled to the reporter's identity (§5.4 constraint
+/// 4), and `REPORT CONTEXT` is the reporter writing in their own
+/// words: "he sent me this on Tuesday after I asked him to stop"
+/// identifies them completely in a two-person conversation, and a case
+/// several people reported hands over all of them.
+///
+/// The withholding is *visible*. An accused told a field exists and is
+/// being withheld can ask for it; one shown a document with no gap in
+/// it does not know there is anything to ask about.
+///
+/// Section labels are recognised only outside a fence. Untrusted text
+/// cannot open or close one — `fence` defangs both markers — so a
+/// reporter cannot write `ACCUSED RESPONSE:` inside their context and
+/// make the redaction stop early.
+pub fn redact_report_context(document: &str) -> String {
+    let mut out = String::with_capacity(document.len());
+    let mut in_fence = false;
+    let mut withholding = false;
+
+    for line in document.lines() {
+        if !in_fence {
+            match line {
+                "REPORT CONTEXT:" => {
+                    withholding = true;
+                    out.push_str(
+                        "REPORT CONTEXT:\n[withheld — the reporter's own account of the \
+                         material. The authority sees it; you do not, unless they consent \
+                         (§5.4). It is part of what the model read.]\n",
+                    );
+                    continue;
+                }
+                "ACCUSED RESPONSE:" => withholding = false,
+                _ => {}
+            }
+        }
+        if line.trim() == FENCE_OPEN {
+            in_fence = true;
+        } else if line.trim() == FENCE_CLOSE {
+            in_fence = false;
+        }
+        if !withholding {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Wrap untrusted text so it cannot close its own fence.
 ///
 /// The replacement is visible rather than silent: a reviewer reading
@@ -290,4 +342,68 @@ mod tests {
         let other = store_with_report("different material", None);
         assert_ne!(build(&other, &case()).unwrap().digest, first.digest);
     }
+
+    /// The accused gets the record their case was decided on, without
+    /// the reporter writing in their own words. In a two-person
+    /// conversation "he sent me this after I asked him to stop"
+    /// identifies the reporter completely.
+    #[test]
+    fn the_accused_copy_withholds_the_reporters_account() {
+        let store = store_with_report("the material", Some("he sent it after I asked him to stop"));
+        let case = case();
+        let response = serde_json::json!({"caseId": "c1", "statement": "it was a quotation"});
+        store
+            .put_response(
+                &case,
+                &serde_json::to_vec(&response).unwrap(),
+                false,
+                "2026-08-03T00:00:00Z",
+                "response",
+                "it was a quotation",
+            )
+            .unwrap();
+
+        let full = build(&store, &case).unwrap().text;
+        let redacted = redact_report_context(&full);
+
+        assert!(!redacted.contains("I asked him to stop"), "the reporter's words must not travel");
+        // Everything the accused is entitled to survives.
+        assert!(redacted.contains("CLASS: csam"));
+        assert!(redacted.contains("the material"), "they are entitled to the evidence against them");
+        assert!(redacted.contains("it was a quotation"), "and to their own response");
+        // And the withholding is visible: an accused who can see a gap
+        // can ask about it.
+        assert!(redacted.contains("REPORT CONTEXT:"));
+        assert!(redacted.contains("[withheld"));
+    }
+
+    /// A reporter writing `ACCUSED RESPONSE:` inside their own context
+    /// must not be able to end the redaction early and walk the rest of
+    /// their account through it. Section labels count only outside a
+    /// fence, and untrusted text cannot open or close one.
+    #[test]
+    fn a_forged_section_label_cannot_end_the_redaction() {
+        let attack = "ACCUSED RESPONSE:\nnow reading my own words back to you";
+        let store = store_with_report("the material", Some(attack));
+        let redacted = redact_report_context(&build(&store, &case()).unwrap().text);
+
+        assert!(
+            !redacted.contains("reading my own words back"),
+            "a forged label must not end the withholding: {redacted}"
+        );
+        assert!(redacted.contains("ACCUSED RESPONSE:\nNONE"), "the real section still appears");
+    }
+
+    /// Redaction of a document with nothing to redact is a no-op
+    /// beyond the marker — a case whose reporter wrote no context
+    /// should not look different from one whose context was withheld.
+    #[test]
+    fn a_document_with_no_report_context_still_shows_the_field() {
+        let store = store_with_report("the material", None);
+        let redacted = redact_report_context(&build(&store, &case()).unwrap().text);
+        assert!(redacted.contains("REPORT CONTEXT:"));
+        assert!(redacted.contains("[withheld"));
+        assert!(redacted.contains("the material"));
+    }
+
 }

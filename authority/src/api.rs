@@ -1017,11 +1017,12 @@ async fn query_status(
     // confidentiality policy withholds. A party proves who they are by
     // signing the case id with the key that made them a party.
     authorize_case_party(&state, &case, &case_id, &headers)?;
+    let moderator = authorize_moderator(&state, &headers).is_ok();
     let is_accused = headers
         .get("x-onym-key")
         .and_then(|value| value.to_str().ok())
         == Some(case.accused.as_str())
-        || authorize_moderator(&state, &headers).is_ok();
+        || moderator;
 
     let events: Vec<Value> = state
         .store
@@ -1032,14 +1033,26 @@ async fn query_status(
 
     // The accused is entitled to the record their case was decided on;
     // a reporter is not — it contains the accused's own response.
+    //
+    // And the accused's copy is *redacted*: the document carries the
+    // reporter's own account of the material, which is the reporter
+    // writing in their own words, and the identity behind those words
+    // is the one thing this endpoint has always withheld. A moderator
+    // reading the same case in the panel sees the whole of it, because
+    // the authority is allowed to.
     let assessment = if is_accused {
         match state.store.assessment(&case_id)? {
             Some((raw, _)) => {
                 let mut value: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
-                if let (Some(object), Ok(Some(document))) =
-                    (value.as_object_mut(), state.store.assessed_document(&case_id))
-                {
-                    object.insert("document".into(), Value::String(document));
+                if let Some(object) = value.as_object_mut() {
+                    if let Ok(Some(document)) = state.store.assessed_document(&case_id) {
+                        let visible = if moderator {
+                            document
+                        } else {
+                            crate::casedoc::redact_report_context(&document)
+                        };
+                        object.insert("document".into(), Value::String(visible));
+                    }
                 }
                 value
             }
@@ -2937,6 +2950,99 @@ mod tests {
                 .any(|(_, kind, _)| kind == "appeal_reversed"),
             "the log must not claim an appeal was reversed"
         );
+    }
+
+
+    /// End to end on the disclosure: the accused resolving their
+    /// verdict's `reasoning` gets the record, and does not get the
+    /// reporter's own account of it. A moderator does.
+    #[tokio::test]
+    async fn the_accused_can_resolve_their_case_without_learning_who_reported_it() {
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+
+        // A report whose context is the reporter writing about it.
+        let mut report = report_json(&reporter_mandate, "r-1");
+        report["evidence"][0]["context"] =
+            json!("he sent it after I asked him to stop, on our group chat");
+        let body = signed(report, "signature", &[REPORTER_SEED]);
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let case_id = response["caseId"].as_str().unwrap().to_string();
+
+        // An assessment on file, as triage would leave one.
+        let case = harness.state.store.case(&case_id).unwrap().unwrap();
+        let document = crate::casedoc::build(&harness.state.store, &case).unwrap();
+        harness
+            .state
+            .store
+            .put_assessment(&case_id, br#"{"outcome":"no-decision"}"#, "no-decision", &document.text, true)
+            .unwrap();
+
+        let message = format!("query-status:{case_id}");
+        let url = format!(
+            "/v1/cases/{case_id}/status?key={}&signature={}",
+            testing::key_reference(ACCUSED_SEED),
+            urlencode(&testing::sign(ACCUSED_SEED, message.as_bytes()))
+        );
+        let (status, accused_view) =
+            harness.send(Request::get(url).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let seen = accused_view["assessment"]["document"].as_str().expect("the record is served");
+        // The evidence itself, by the words the report actually
+        // carried — not by a phrase that also appears in the
+        // withholding notice, which is how this assertion first passed
+        // while testing nothing.
+        assert!(seen.contains("prohibited thing"), "they get the evidence against them: {seen}");
+        assert!(
+            !seen.contains("I asked him to stop"),
+            "and not the reporter's own words: {seen}"
+        );
+        assert!(seen.contains("[withheld"), "the gap is visible, so it can be asked about");
+        // Nothing anywhere in the answer names the reporter.
+        assert!(!accused_view.to_string().contains(&testing::key_reference(REPORTER_SEED)));
+
+        // A moderator reviewing the same case sees all of it.
+        let (_, moderator_view) = harness
+            .send(
+                Request::get(format!("/v1/cases/{case_id}/status"))
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert!(moderator_view["assessment"]["document"]
+            .as_str()
+            .unwrap()
+            .contains("I asked him to stop"));
+    }
+
+    /// A reporter on the case is a party — they can read the status —
+    /// but the record the case was decided on includes the accused's
+    /// own response, which is not theirs to read.
+    #[tokio::test]
+    async fn a_reporter_does_not_get_the_assessed_record() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let case = harness.state.store.case(&case_id).unwrap().unwrap();
+        let document = crate::casedoc::build(&harness.state.store, &case).unwrap();
+        harness
+            .state
+            .store
+            .put_assessment(&case_id, br#"{"outcome":"ban"}"#, "ban", &document.text, true)
+            .unwrap();
+
+        let message = format!("query-status:{case_id}");
+        let url = format!(
+            "/v1/cases/{case_id}/status?key={}&signature={}",
+            testing::key_reference(REPORTER_SEED),
+            urlencode(&testing::sign(REPORTER_SEED, message.as_bytes()))
+        );
+        let (status, view) = harness.send(Request::get(url).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "a reporter is still a party");
+        assert!(view["assessment"].is_null(), "but the record is not theirs");
     }
 
 }

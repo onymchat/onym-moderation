@@ -324,11 +324,29 @@ renders it alongside the rule to apply, and `query-status` returns it
 to the accused, so the content address in a verdict's `reasoning` is
 something a party can actually resolve.
 
+**The accused's copy withholds `REPORT CONTEXT`.** That field is the
+reporter writing in their own words, and "he sent it after I asked him
+to stop" identifies them completely in a two-person conversation — a
+case several people reported would hand over all of them. The
+withholding is visible rather than silent: an accused shown a gap can
+ask about it, one shown a seamless document does not know there is
+anything to ask for. Moderators see the whole of it, because the
+authority is allowed to.
+
 Its SHA-256 goes on the assessment, and is re-checked after inference:
 a reading of a document that changed while the model held it — a late
 response, another report joining the case — decides nothing and the
 case is reassessed. Otherwise the response the accused filed would have
-had no bearing on the decision that banned them. So do the profile digest, policy
+had no bearing on the decision that banned them.
+
+A stale reading is **not** charged to the case's attempt budget. The
+model answered and the case was fine; the record simply moved
+underneath it. Charging it would let the accused spend the budget
+themselves — a late response is accepted for as long as the case is
+open, so landing one during each inference would exhaust the attempts
+and run the case to its decision deadline, where it dismisses by
+default. A guard against deciding on unanswered evidence would have
+become a way to guarantee acquittal. So do the profile digest, policy
 digest, model revision, the raw final output, and how many evidence
 items and responses were in the document — "did it see my reply?" has a
 recorded answer rather than an inferred one. Private chain-of-thought

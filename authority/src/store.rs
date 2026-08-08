@@ -1269,12 +1269,18 @@ impl Store {
         Ok(out)
     }
 
+    /// Store an assessment. `counted` is false for a reading that was
+    /// discarded through no fault of the model or the case — the
+    /// attempt budget exists to stop hammering an unhealthy model, and
+    /// spending it on something neither of them did wrong turns a
+    /// safeguard into a way to run a case out the clock.
     pub fn put_assessment(
         &self,
         case_id: &str,
         raw: &[u8],
         recommendation: &str,
         document: &str,
+        counted: bool,
     ) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -1283,11 +1289,11 @@ impl Store {
              VALUES (?1, ?2, ?3,
                      COALESCE((SELECT applied FROM assessments WHERE case_id = ?1), 0),
                      ?4,
-                     COALESCE((SELECT attempts FROM assessments WHERE case_id = ?1), 0) + 1,
+                     COALESCE((SELECT attempts FROM assessments WHERE case_id = ?1), 0) + ?6,
                      ?5)",
             params![case_id, raw, recommendation, crate::util::format_timestamp(
                 time::OffsetDateTime::now_utc()
-            ), document],
+            ), document, counted as i64],
         )?;
         Ok(())
     }
