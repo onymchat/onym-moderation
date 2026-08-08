@@ -113,9 +113,13 @@ Whatever the mode, three things do not change:
 
 - **A ban waits for the response window.** Triage may reach a ban the
   moment a report lands; the verdict is deferred until the accused's
-  consented window closes (or they answer). A classifier's certainty is
-  not a reason to shorten someone's time to reply, so the guard lives
-  in `decisions.rs` where all three callers inherit it.
+  consented window has elapsed — answering early does not release it,
+  because the window is time they were promised rather than one chance
+  to speak. A classifier's certainty is not a reason to shorten it, so
+  the guard lives in `decisions.rs` where all three callers inherit it.
+- **A ban after the decision deadline is refused.** By then the case is
+  already dismissed by default, and a decider must not win that race
+  against the sweep.
 - **A dismissal lands immediately.** It is not a sanction, and making
   someone wait for one helps nobody.
 - **Undecided is still dismissal.** If the model is down and no human

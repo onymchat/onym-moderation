@@ -699,9 +699,40 @@ impl Store {
         Ok(())
     }
 
+    /// Move a case's appeal state and log why, in one write. This is
+    /// the one case-row change that is not itself a decision: an appeal
+    /// arriving or being reviewed changes what the panel shows without
+    /// issuing a verdict. A reversal still goes through
+    /// `commit_decision`; this only records the appeal's own progress.
+    pub fn set_appeal_state(
+        &self,
+        case_id: &str,
+        appeal_state: &str,
+        at: &str,
+        event_kind: &str,
+        event_detail: &str,
+    ) -> Result<(), Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE cases SET appeal_state = ?2 WHERE case_id = ?1",
+            params![case_id, appeal_state],
+        )?;
+        if changed == 0 {
+            return Err(Error::NotFound(format!("case {case_id}")));
+        }
+        tx.execute(
+            "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
+            params![case_id, at, event_kind, event_detail],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Test-only. In the service a case row moves only inside a
     /// transaction that also writes the verdict justifying the move —
-    /// see `open_case_atomically` and `commit_decision`.
+    /// see `open_case_atomically`, `commit_decision`, and
+    /// `set_appeal_state`.
     #[cfg(test)]
     pub fn put_case(&self, case: &CaseRecord) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
@@ -1487,6 +1518,7 @@ mod tests {
             responded: false,
             disposition: None,
             appeal_deadline: None,
+            appeal_state: "none".into(),
         }
     }
 

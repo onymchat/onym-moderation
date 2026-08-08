@@ -920,26 +920,54 @@ async fn appeal(
         }
     }
 
-    let stamp = util::format_timestamp(OffsetDateTime::now_utc());
-    let filed = state.store.append_event_bounded(
-        &case_id,
-        &stamp,
-        "appeal_filed",
-        &submission.statement,
-        MAX_APPEALS_PER_CASE,
-    )?;
-    if !filed {
-        return Err(Error::CaseState(format!(
-            "this case already holds {MAX_APPEALS_PER_CASE} appeals; further material belongs \
-             in one of them rather than in another filing"
-        )));
-    }
-
     // This is where a human enters. Triage decides in the first
-    // instance; an appeal puts the file in the moderator panel's queue.
-    let mut case = case;
-    case.appeal_state = "pending".into();
-    state.store.put_case(&case)?;
+    // instance; an appeal puts the file in the moderator panel's
+    // queue. (New-holder claims returned above — they are tracked in
+    // their own field, because they are not appeals.)
+    //
+    // Two rules, from two different findings, and they compose:
+    //
+    // - A *decided* review is not re-opened by filing again. Resetting
+    //   `appeal_state` to `pending` let an accused flip an `upheld` —
+    //   or even a `reversed` — back into the queue, erasing the record
+    //   of a review that did happen.
+    // - A *pending* one may be supplemented. The accused may find more
+    //   to say while waiting, and refusing that would make the first
+    //   filing their only chance; the count is bounded so the case log
+    //   cannot be used as storage.
+    let stamp = util::format_timestamp(OffsetDateTime::now_utc());
+    match case.appeal_state.as_str() {
+        "none" => {
+            state.store.set_appeal_state(
+                &case_id,
+                "pending",
+                &stamp,
+                "appeal_filed",
+                &submission.statement,
+            )?;
+        }
+        "pending" => {
+            let filed = state.store.append_event_bounded(
+                &case_id,
+                &stamp,
+                "appeal_filed",
+                &submission.statement,
+                MAX_APPEALS_PER_CASE,
+            )?;
+            if !filed {
+                return Err(Error::CaseState(format!(
+                    "this case already holds {MAX_APPEALS_PER_CASE} appeal filings; further \
+                     material belongs in one of them rather than in another"
+                )));
+            }
+        }
+        decided => {
+            return Err(Error::CaseState(format!(
+                "this case's appeal was already reviewed ({decided}); a decided review is not \
+                 re-opened by filing again"
+            )))
+        }
+    }
 
     tracing::info!(%case_id, kind = %submission.kind, "appeal filed");
     Ok(Json(json!({

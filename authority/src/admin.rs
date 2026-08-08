@@ -342,7 +342,7 @@ async fn review(
         return Err(Error::BadRequest("reasoning is required".into()));
     }
 
-    let mut case = state
+    state
         .store
         .case(&case_id)?
         .ok_or_else(|| Error::NotFound(format!("case {case_id}")))?;
@@ -351,9 +351,13 @@ async fn review(
 
     match form.outcome.as_str() {
         "uphold" => {
-            case.appeal_state = "upheld".into();
-            state.store.put_case(&case)?;
-            state.store.append_event(&case_id, &stamp, "appeal_upheld", &form.reasoning)?;
+            state.store.set_appeal_state(
+                &case_id,
+                "upheld",
+                &stamp,
+                "appeal_upheld",
+                &form.reasoning,
+            )?;
         }
         "reverse" => {
             // The reviewer saw the classifier's assessment on the way
@@ -368,13 +372,13 @@ async fn review(
                 now,
             )
             .await?;
-            let mut case = state
-                .store
-                .case(&case_id)?
-                .ok_or_else(|| Error::NotFound(format!("case {case_id}")))?;
-            case.appeal_state = "reversed".into();
-            state.store.put_case(&case)?;
-            state.store.append_event(&case_id, &stamp, "appeal_reversed", &form.reasoning)?;
+            state.store.set_appeal_state(
+                &case_id,
+                "reversed",
+                &stamp,
+                "appeal_reversed",
+                &form.reasoning,
+            )?;
         }
         other => return Err(Error::BadRequest(format!("unknown outcome {other:?}"))),
     }

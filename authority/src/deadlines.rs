@@ -104,9 +104,11 @@ async fn sweep_overdue(
 /// The deferral is the whole point. Triage may reach a ban the moment a
 /// report lands, but the accused is owed their consented window to
 /// answer first, so the recommendation waits here rather than being
-/// applied early. If they respond, `decisions::apply` lets it through
-/// sooner; if the classifier never comes back, the decision deadline
-/// dismisses the case.
+/// applied early — and answering does not release it early either: the
+/// window is time the accused was promised, not one chance to speak. If
+/// the classifier never comes back, the decision deadline dismisses the
+/// case; and because the dismissal sweep runs before this one, an
+/// overdue case is dismissed rather than banned.
 pub async fn triage_sweep(state: &AppState, now: OffsetDateTime) -> Result<(), Error> {
     if state.triage.is_none() {
         return Ok(());
