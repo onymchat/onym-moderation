@@ -30,6 +30,14 @@ pub struct Decision<'a> {
     /// decision says nothing about them: a deadline dismissal is the
     /// authority's failure, and a reversal is its own error.
     pub credited_reporters: &'a [String],
+    /// The stage the caller checked before building this verdict, and
+    /// the disposition it expected to find. Re-asserted inside the
+    /// transaction: the guards run against a case read under one lock
+    /// and the write happens under another, so a moderator's decision
+    /// racing the autonomous sweep would otherwise produce two signed
+    /// verdicts for one case and credit its reporters twice.
+    pub expect_stage: &'a str,
+    pub expect_disposition: Option<&'a str>,
 }
 
 /// A verdict awaiting delivery, carrying the manifest bytes the case
@@ -238,7 +246,51 @@ impl Store {
             "#,
         )
         .map_err(|e| Error::Internal(format!("migrate: {e}")))?;
+
+        // `CREATE TABLE IF NOT EXISTS` does nothing to a table that
+        // already exists, so a column added to one of the definitions
+        // above never reaches a store that has been opened before.
+        // Every read that selects it then fails, which on a deployment
+        // holding live cases means the service comes back up dead.
+        //
+        // So: add columns explicitly, tolerating the duplicate when
+        // they are already there. New *tables* are fine above — it is
+        // only new columns in old tables that need this.
+        for (table, column, definition) in [
+            // The manifest a mandate pinned. Without it a case cannot
+            // be judged by the terms its accused actually agreed to.
+            ("mandates", "manifest_hash", "TEXT NOT NULL DEFAULT ''"),
+            // Delivery bookkeeping, so a verdict the interface refuses
+            // becomes visibly stuck instead of retrying forever.
+            ("verdicts", "attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("verdicts", "last_error", "TEXT"),
+            ("verdicts", "undeliverable", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            Self::add_column(&conn, table, column, definition)?;
+        }
+
         Ok(())
+    }
+
+    /// Add a column, treating "it is already there" as success.
+    ///
+    /// SQLite has no `ADD COLUMN IF NOT EXISTS`, and checking
+    /// `pragma_table_info` first would be a race with nothing; the
+    /// duplicate-column error is the check.
+    fn add_column(
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        definition: &str,
+    ) -> Result<(), Error> {
+        match conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), []) {
+            Ok(_) => {
+                tracing::info!(%table, %column, "added column to an existing store");
+                Ok(())
+            }
+            Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+            Err(e) => Err(Error::Internal(format!("migrate {table}.{column}: {e}"))),
+        }
     }
 
     // ─── Mandates ────────────────────────────────────────────────────
@@ -695,16 +747,53 @@ impl Store {
     /// no decided case — or a decided case with no verdict to justify
     /// it. Either is a record the accused cannot appeal against.
     pub fn commit_decision(&self, decision: &Decision<'_>) -> Result<(), Error> {
-        let Decision { case, verdict_ref, disposition, raw, at, event_kind, event_detail, credited_reporters } =
-            decision;
+        let Decision {
+            case,
+            verdict_ref,
+            disposition,
+            raw,
+            at,
+            event_kind,
+            event_detail,
+            credited_reporters,
+            expect_stage,
+            expect_disposition,
+        } = decision;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+
+        // Move the case first, conditioned on it still being where the
+        // caller found it. Nothing else in this transaction happens if
+        // it has moved — no verdict is stored, no reporter is credited.
+        let moved = tx.execute(
+            "UPDATE cases
+                SET stage = ?2, responded = ?3, disposition = ?4, appeal_deadline = ?5
+              WHERE case_id = ?1
+                AND stage = ?6
+                AND (?7 IS NULL OR disposition IS ?7)",
+            params![
+                case.case_id,
+                case.stage,
+                case.responded as i32,
+                case.disposition,
+                case.appeal_deadline,
+                expect_stage,
+                expect_disposition,
+            ],
+        )?;
+        if moved == 0 {
+            return Err(Error::CaseState(format!(
+                "case {} is no longer {expect_stage}; it was decided by someone else while this \
+                 decision was being made",
+                case.case_id
+            )));
+        }
+
         tx.execute(
             "INSERT OR REPLACE INTO verdicts (verdict_ref, case_id, disposition, raw, issued_at, delivered)
              VALUES (?1, ?2, ?3, ?4, ?5, COALESCE((SELECT delivered FROM verdicts WHERE verdict_ref = ?1), 0))",
             params![verdict_ref, case.case_id, disposition, raw, at],
         )?;
-        Self::write_case(&tx, case)?;
         tx.execute(
             "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
             params![case.case_id, at, event_kind, event_detail],
@@ -846,6 +935,12 @@ mod tests {
 
     fn decide(store: &Store, case_id: &str, disposition: &str, reporters: &[&str]) {
         let credited: Vec<String> = reporters.iter().map(|r| r.to_string()).collect();
+        // The case has to exist and be open: a decision now asserts
+        // that inside its own transaction rather than trusting a read
+        // taken under a lock it has since released.
+        let mut open = sample_case(case_id);
+        open.stage = "open".into();
+        store.put_case(&open).unwrap();
         store
             .commit_decision(&Decision {
                 case: &sample_case(case_id),
@@ -856,6 +951,8 @@ mod tests {
                 event_kind: "decided",
                 event_detail: disposition,
                 credited_reporters: &credited,
+                expect_stage: "open",
+                expect_disposition: None,
             })
             .unwrap();
     }
@@ -958,4 +1055,127 @@ mod tests {
         store.put_case(&case).unwrap();
         assert!(store.cases_overdue("2026-08-09T00:00:00Z").unwrap().is_empty());
     }
+
+    /// The upgrade path, which is the one `CREATE TABLE IF NOT EXISTS`
+    /// silently does not cover. A store opened by an older build has
+    /// the old `cases`, `mandates` and `verdicts` tables; adding a
+    /// column to their definitions does nothing to it, and the first
+    /// read that selects the new column fails. On a deployment holding
+    /// live cases that means the service comes back up dead.
+    #[test]
+    fn an_old_store_gains_the_columns_added_since() {
+        let file = std::env::temp_dir().join(format!(
+            "onym-authority-migrate-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&file);
+
+        // A store as an earlier build left it: the tables, without any
+        // of the columns added since.
+        {
+            let conn = Connection::open(&file).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE mandates (
+                    mandate_ref    TEXT PRIMARY KEY,
+                    user_key       TEXT NOT NULL,
+                    device_binding TEXT NOT NULL,
+                    classes        TEXT NOT NULL,
+                    raw            BLOB NOT NULL,
+                    accepted_at    TEXT NOT NULL
+                );
+                CREATE TABLE verdicts (
+                    verdict_ref TEXT PRIMARY KEY,
+                    case_id     TEXT NOT NULL,
+                    disposition TEXT NOT NULL,
+                    raw         BLOB NOT NULL,
+                    issued_at   TEXT NOT NULL,
+                    delivered   INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO mandates VALUES ('m1', 'onym:key:u', 'd1', 'csam', X'7b7d', 't0');
+                INSERT INTO verdicts VALUES ('v1', 'c1', 'dismiss', X'7b7d', 't0', 0);
+                "#,
+            )
+            .unwrap();
+        }
+
+        // Opening it runs the migration...
+        let store = Store::open(file.to_str().unwrap()).unwrap();
+
+        // ...and the reads that select the new columns work, on rows
+        // written before those columns existed.
+        let mandate = store.mandate("m1").unwrap().expect("the old mandate survives");
+        assert_eq!(mandate.user_key, "onym:key:u");
+        assert_eq!(mandate.manifest_hash, "", "no snapshot was kept for it, and that is the truth");
+        assert_eq!(store.undelivered_verdicts().unwrap().len(), 1);
+        assert!(store.undeliverable_verdicts().unwrap().is_empty());
+
+        // Migrating twice is not an error.
+        drop(store);
+        let reopened = Store::open(file.to_str().unwrap()).unwrap();
+        assert!(reopened.mandate("m1").unwrap().is_some());
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+
+    /// Two deciders racing — a moderator's `/decide` and the deadline
+    /// sweep, say — must not both land. The guards read the case under
+    /// one lock and the write happens under another, so without a
+    /// re-assertion inside the transaction the loser would store a
+    /// second signed verdict for the same case and credit its
+    /// reporters twice.
+    #[test]
+    fn a_second_decision_on_the_same_case_is_refused() {
+        let store = Store::in_memory().unwrap();
+        decide(&store, "c1", "ban", &["onym:key:aa"]);
+
+        // The second decider still holds a case it read as open.
+        let stale = sample_case("c1");
+        let second = store.commit_decision(&Decision {
+            case: &stale,
+            verdict_ref: "v-second",
+            disposition: "dismiss",
+            raw: b"{}",
+            at: "2026-08-06T00:00:00Z",
+            event_kind: "decided",
+            event_detail: "dismiss",
+            credited_reporters: &["onym:key:aa".to_string()],
+            expect_stage: "open",
+            expect_disposition: None,
+        });
+
+        assert!(matches!(second, Err(Error::CaseState(_))), "{second:?}");
+        // And nothing from the losing decision survives: no verdict,
+        // and no second credit.
+        assert_eq!(store.undelivered_verdicts().unwrap().len(), 1);
+        let reporter = store.reporter("onym:key:aa").unwrap();
+        assert_eq!((reporter.upheld, reporter.dismissed), (1, 0));
+    }
+
+    /// A reversal expects to find the case decided *and* banned —
+    /// reversing something that was already reversed, or dismissed, is
+    /// the same race in a different direction.
+    #[test]
+    fn a_reversal_expects_the_ban_it_is_reversing() {
+        let store = Store::in_memory().unwrap();
+        decide(&store, "c1", "dismiss", &[]);
+
+        let mut reversed = sample_case("c1");
+        reversed.disposition = Some("reversed".into());
+        let result = store.commit_decision(&Decision {
+            case: &reversed,
+            verdict_ref: "v-reversal",
+            disposition: "dismiss",
+            raw: b"{}",
+            at: "2026-08-06T00:00:00Z",
+            event_kind: "decided",
+            event_detail: "reverse",
+            credited_reporters: &[],
+            expect_stage: "decided",
+            expect_disposition: Some("ban"),
+        });
+        assert!(matches!(result, Err(Error::CaseState(_))), "a dismissal is not a ban to reverse");
+    }
+
 }

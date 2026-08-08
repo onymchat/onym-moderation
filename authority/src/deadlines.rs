@@ -57,6 +57,10 @@ pub async fn sweep(state: &AppState, now: OffsetDateTime) -> Result<usize, Error
             event_kind: "decision_overdue",
             event_detail: "dismissed by default",
             credited_reporters: &[],
+            // The sweep found it open; if a moderator decided it in the
+            // meantime, theirs stands and this one does not land.
+            expect_stage: "open",
+            expect_disposition: None,
         })?;
 
         tracing::warn!(

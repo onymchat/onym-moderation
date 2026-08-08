@@ -859,6 +859,10 @@ async fn decide(
         event_kind: "decided",
         event_detail: &decision.disposition,
         credited_reporters: credited,
+        // What the guards above checked. A reversal was found decided
+        // and banned; everything else was found open.
+        expect_stage: if decision.disposition == "reverse" { "decided" } else { "open" },
+        expect_disposition: if decision.disposition == "reverse" { Some("ban") } else { None },
     })?;
 
     state.delivery.flush(&state.store).await?;
