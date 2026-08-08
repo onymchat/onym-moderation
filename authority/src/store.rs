@@ -388,6 +388,13 @@ impl Store {
         Ok(record)
     }
 
+    #[cfg(test)]
+    pub fn remove_mandate(&self, mandate_ref: &str) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM mandates WHERE mandate_ref = ?1", params![mandate_ref])?;
+        Ok(())
+    }
+
     /// Every mandate this key has registered, newest first. Standing
     /// follows any of them: a user who re-consents after a manifest is
     /// republished has not withdrawn the consent they gave under the
@@ -746,6 +753,57 @@ impl Store {
         Ok(true)
     }
 
+    /// Attach newly joined evidence, restart the case windows, and
+    /// enqueue the revised signed notice as one transaction. A joined
+    /// report must never become adjudicable before its notice does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn renotice_case_atomically(
+        &self,
+        case: &CaseRecord,
+        reporter: &str,
+        report_id: &str,
+        verdict_ref: &str,
+        disposition: &str,
+        raw: &[u8],
+        at: &str,
+        event_detail: &str,
+    ) -> Result<bool, Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let revised = tx.execute(
+            "UPDATE cases
+                SET response_deadline = ?2, decision_deadline = ?3
+              WHERE case_id = ?1 AND stage = 'open'",
+            params![case.case_id, case.response_deadline, case.decision_deadline],
+        )?;
+        if revised == 0 {
+            return Ok(false);
+        }
+        let attached = tx.execute(
+            "UPDATE reports SET case_id = ?3
+             WHERE reporter = ?1 AND report_id = ?2 AND case_id IS NULL",
+            params![reporter, report_id, case.case_id],
+        )?;
+        if attached != 1 {
+            return Err(Error::Internal(format!(
+                "joined report {report_id:?} was not available to attach to case {:?}",
+                case.case_id
+            )));
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO verdicts
+             (verdict_ref, case_id, disposition, raw, issued_at, delivered)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            params![verdict_ref, case.case_id, disposition, raw, at],
+        )?;
+        tx.execute(
+            "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
+            params![case.case_id, at, "report_joined", event_detail],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     fn case_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CaseRecord> {
         Ok(CaseRecord {
             case_id: row.get(0)?,
@@ -815,15 +873,6 @@ impl Store {
             out.push(row?);
         }
         Ok(out)
-    }
-
-    pub fn append_event(&self, case_id: &str, at: &str, kind: &str, detail: &str) -> Result<(), Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
-            params![case_id, at, kind, detail],
-        )?;
-        Ok(())
     }
 
     /// Append an event only while fewer than `limit` events of this
@@ -951,15 +1000,16 @@ impl Store {
     /// window the accused's interface never learned existed.
     pub fn open_case_verdict_delivered(&self, case_id: &str) -> Result<bool, Error> {
         let conn = self.conn.lock().unwrap();
-        let delivered: i64 = conn.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM verdicts
-                  WHERE case_id = ?1 AND disposition = 'open-case' AND delivered = 1
-             )",
-            params![case_id],
-            |row| row.get(0),
-        )?;
-        Ok(delivered != 0)
+        let delivered: Option<i64> = conn
+            .query_row(
+                "SELECT delivered FROM verdicts
+                  WHERE case_id = ?1 AND disposition = 'open-case'
+                  ORDER BY issued_at DESC, rowid DESC LIMIT 1",
+                params![case_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(delivered == Some(1))
     }
 
     /// Record a failed delivery. `refused` distinguishes the interface

@@ -59,6 +59,10 @@ const MAX_APPEALS_PER_CASE: usize = 32;
 /// not a credible consent timestamp.
 const MAX_MANDATE_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 
+/// Party credentials for status reads are short-lived and travel in
+/// headers, outside proxy access-log request URIs.
+const STATUS_CREDENTIAL_MAX_AGE_SECONDS: i64 = 5 * 60;
+
 /// How many new-holder claims one case will record. Bounded rather
 /// than capped at one: this path cannot be authenticated, so a cap of
 /// one lets any stranger consume the genuine new owner's only remedy.
@@ -338,6 +342,7 @@ async fn file_report(
             ))
         })?;
     }
+    let evidence_summary = report_evidence_summary(&report)?;
 
     let now = OffsetDateTime::now_utc();
     let stamp = util::format_timestamp(now);
@@ -373,7 +378,7 @@ async fn file_report(
     // theirs — the same thing we would have done had we looked a
     // moment later.
     let case = match state.store.open_case_for(&report.accused, &report.class_id)? {
-        Some(existing) => join_case(&state, &existing, &report, &stamp)?,
+        Some(existing) => join_case(&state, &existing, &report, now, &evidence_summary)?,
         None => {
             // Consent has a horizon at both ends. The accused's
             // consented terms must still be live — opening a case under
@@ -388,7 +393,16 @@ async fn file_report(
             if now > valid_until {
                 return Err(Error::NoJurisdiction);
             }
-            match open_case(&state, &report, &accused_mandate, &class, now).await? {
+            match open_case(
+                &state,
+                &report,
+                &accused_mandate,
+                &class,
+                now,
+                &evidence_summary,
+            )
+            .await?
+            {
                 Some(opened) => opened,
                 None => {
                     let existing = state
@@ -401,7 +415,7 @@ async fn file_report(
                                     .into(),
                             )
                         })?;
-                    join_case(&state, &existing, &report, &stamp)?
+                    join_case(&state, &existing, &report, now, &evidence_summary)?
                 }
             }
         }
@@ -483,20 +497,73 @@ fn flush_soon(state: &Arc<AppState>) {
     });
 }
 
-/// Attach a report to a case already open for this accused and class.
+fn report_evidence_summary(report: &Report) -> Result<String, Error> {
+    let evidence = serde_json::to_vec(&report.evidence)
+        .map_err(|e| Error::Internal(format!("encode evidence summary: {e}")))?;
+    Ok(format!("sha256:{}", util::sha256_hex(&evidence)))
+}
+
+/// Attach a report to an already-open case and issue a revised notice.
+/// The new allegations cannot support a sanction under the old notice's
+/// nearly-spent window, so both windows restart from this revision.
 fn join_case(
-    state: &AppState,
+    state: &Arc<AppState>,
     existing: &CaseRecord,
     report: &Report,
-    stamp: &str,
+    now: OffsetDateTime,
+    evidence_summary: &str,
 ) -> Result<CaseRecord, Error> {
-    state.store.append_event(
-        &existing.case_id,
-        stamp,
-        "report_joined",
-        &format!("report {} joined the open case", report.report_id),
+    let mandate = state.store.mandate(&existing.mandate_ref)?.ok_or_else(|| {
+        Error::Internal(format!(
+            "case {} references missing mandate {}; cannot notice joined evidence",
+            existing.case_id, existing.mandate_ref
+        ))
+    })?;
+    let manifest = consented_manifest(state, &mandate)?;
+    let valid_until = util::parse_timestamp(&manifest.valid_until)
+        .map_err(|e| Error::Internal(format!("consented manifest validUntil: {e}")))?;
+    if now > valid_until {
+        return Err(Error::NoJurisdiction);
+    }
+    let class = manifest
+        .violation_class(&existing.class_id)
+        .ok_or_else(|| Error::ClassOutsideMandate(existing.class_id.clone()))?;
+    let response_days = util::parse_days(&class.response_window)
+        .map_err(|e| Error::Internal(format!("manifest responseWindow: {e}")))?;
+    let decision_days = util::parse_days(&class.decision_deadline)
+        .map_err(|e| Error::Internal(format!("manifest decisionDeadline: {e}")))?;
+
+    let mut revised = existing.clone();
+    revised.response_deadline =
+        util::format_timestamp(now + time::Duration::days(response_days));
+    revised.decision_deadline =
+        util::format_timestamp(now + time::Duration::days(decision_days));
+    let issued = cases::open_case_verdict(
+        &revised,
+        &state.config.manifest.component_id,
+        evidence_summary,
+        now,
+        &state.signing_key,
     )?;
-    Ok(existing.clone())
+    let stamp = util::format_timestamp(now);
+    let joined = state.store.renotice_case_atomically(
+        &revised,
+        &report.reporter,
+        &report.report_id,
+        &issued.verdict_ref,
+        &issued.disposition,
+        &issued.raw,
+        &stamp,
+        &format!("report {} joined; notice and windows restarted", report.report_id),
+    )?;
+    if !joined {
+        return Err(Error::CaseState(
+            "the case was decided while joined evidence was being noticed; retry the report"
+                .into(),
+        ));
+    }
+    flush_soon(state);
+    Ok(revised)
 }
 
 /// Open a case: set the deadlines the manifest declares, issue the
@@ -510,6 +577,7 @@ async fn open_case(
     accused_mandate: &crate::store::MandateRecord,
     class: &ViolationClass,
     now: OffsetDateTime,
+    evidence_summary: &str,
 ) -> Result<Option<CaseRecord>, Error> {
     let response_days = util::parse_days(&class.response_window)
         .map_err(|e| Error::Internal(format!("manifest responseWindow: {e}")))?;
@@ -534,7 +602,7 @@ async fn open_case(
     let issued = cases::open_case_verdict(
         &case,
         &state.config.manifest.component_id,
-        &format!("intake: report {}", report.report_id),
+        evidence_summary,
         now,
         &state.signing_key,
     )?;
@@ -804,7 +872,6 @@ async fn appeal(
 async fn query_status(
     State(state): State<Arc<AppState>>,
     Path(case_id): Path<String>,
-    axum::extract::Query(query): axum::extract::Query<StatusQuery>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, Error> {
     let case = state
@@ -817,7 +884,7 @@ async fn query_status(
     // a given person is under investigation, which is exactly what the
     // confidentiality policy withholds. A party proves who they are by
     // signing the case id with the key that made them a party.
-    authorize_case_party(&state, &case, &case_id, &query, &headers)?;
+    authorize_case_party(&state, &case, &case_id, &headers)?;
 
     let events: Vec<Value> = state
         .store
@@ -953,11 +1020,14 @@ async fn decide(
                     case.response_deadline
                 )));
             }
-            let mandate = state.store.mandate(&case.mandate_ref)?;
-            let consented = match mandate.as_ref() {
-                Some(mandate) => consented_manifest(&state, mandate)?,
-                None => state.config.manifest.clone(),
-            };
+            let mandate = state.store.mandate(&case.mandate_ref)?.ok_or_else(|| {
+                Error::Internal(format!(
+                    "case {} references missing mandate {}; refusing to judge under published \
+                     terms the accused may not have consented to",
+                    case.case_id, case.mandate_ref
+                ))
+            })?;
+            let consented = consented_manifest(&state, &mandate)?;
             let class = consented
                 .violation_class(&case.class_id)
                 .ok_or_else(|| Error::ClassOutsideMandate(case.class_id.clone()))?;
@@ -1067,32 +1137,24 @@ async fn requeue_verdict(
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
-/// Credentials for `query-status`, as query parameters so the call
-/// stays a plain GET.
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct StatusQuery {
-    /// `onym:key:<hex>` of the party asking.
-    key: Option<String>,
-    /// Base64 Ed25519 signature over `query-status:<caseId>`.
-    signature: Option<String>,
-}
-
 /// A caller may read a case if they are the accused, a reporter on it,
-/// or a moderator. Proof for the first two is a signature over the case
-/// id by the key that made them a party — no session, no bearer token
-/// the authority would then have to store.
+/// or a moderator. Party proof is a fresh signature carried in headers,
+/// never in a query string that proxies and caches routinely retain.
 fn authorize_case_party(
     state: &AppState,
     case: &CaseRecord,
     case_id: &str,
-    query: &StatusQuery,
     headers: &HeaderMap,
 ) -> Result<(), Error> {
     if authorize_moderator(state, headers).is_ok() {
         return Ok(());
     }
-    let (Some(key), Some(signature)) = (query.key.as_deref(), query.signature.as_deref()) else {
+    let credential = |name: &'static str| headers.get(name).and_then(|value| value.to_str().ok());
+    let (Some(key), Some(timestamp), Some(signature)) = (
+        credential("x-onym-key"),
+        credential("x-onym-timestamp"),
+        credential("x-onym-signature"),
+    ) else {
         // Not `SignatureInvalid`. A 401 here and a 404 for a case that
         // does not exist would let anyone holding a case id tell the
         // two apart with no credential at all — the whole probe, in one
@@ -1109,8 +1171,14 @@ fn authorize_case_party(
     // case id could learn whether a given key is the accused, or a
     // reporter on the case, with no proof at all. That is precisely the
     // fact the not-found answer exists to withhold.
-    let message = format!("query-status:{case_id}");
-    let signature_valid = verify_signature(key, message.as_bytes(), signature).is_ok();
+    let now = OffsetDateTime::now_utc();
+    let fresh = util::parse_timestamp(timestamp)
+        .map(|signed_at| {
+            (now - signed_at).whole_seconds().abs() <= STATUS_CREDENTIAL_MAX_AGE_SECONDS
+        })
+        .unwrap_or(false);
+    let message = format!("query-status:{case_id}:{timestamp}");
+    let signature_valid = fresh && verify_signature(key, message.as_bytes(), signature).is_ok();
 
     let is_party = key == case.accused
         || key == case.reporter
@@ -1569,10 +1637,42 @@ mod tests {
         let case_id = open_case(&harness).await;
         let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
 
-        let body = signed(report_json(&reporter_mandate, "r-2"), "signature", &[REPORTER_SEED]);
+        let mut original_case = harness.state.store.case(&case_id).unwrap().unwrap();
+        original_case.response_deadline = "2020-01-01T00:00:00Z".into();
+        original_case.decision_deadline = "2020-01-02T00:00:00Z".into();
+        harness.state.store.put_case(&original_case).unwrap();
+
+        let mut report = report_json(&reporter_mandate, "r-2");
+        report["evidence"][0]["disclosedContent"] = json!("a different prohibited thing");
+        report["evidence"][0]["authenticityProof"] = json!(testing::sign(
+            ACCUSED_SEED,
+            b"a different prohibited thing"
+        ));
+        let body = signed(report, "signature", &[REPORTER_SEED]);
+        let expected_evidence_summary = report_evidence_summary(
+            &serde_json::from_slice::<Report>(&body).expect("the test report is valid"),
+        )
+        .unwrap();
         let (status, response) = harness.post("/v1/reports", body).await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::OK, "{response}");
         assert_eq!(response["caseId"], case_id);
+        assert!(
+            !harness.state.store.open_case_verdict_delivered(&case_id).unwrap(),
+            "the new evidence has a revised notice that must be delivered before a ban"
+        );
+        let revised_notice = harness.state.store.undelivered_verdicts().unwrap();
+        assert_eq!(revised_notice.len(), 1);
+        let notice: Value = serde_json::from_slice(&revised_notice[0].raw).unwrap();
+        assert_eq!(notice["reasoning"].as_str(), Some(expected_evidence_summary.as_str()));
+        let revised_case = harness.state.store.case(&case_id).unwrap().unwrap();
+        assert_ne!(revised_case.response_deadline, original_case.response_deadline);
+        assert_ne!(revised_case.decision_deadline, original_case.decision_deadline);
+        harness
+            .state
+            .store
+            .mark_delivered(&revised_notice[0].verdict_ref)
+            .unwrap();
+        assert!(harness.state.store.open_case_verdict_delivered(&case_id).unwrap());
     }
 
     // ─── Notice before sanction ──────────────────────────────────────
@@ -1607,6 +1707,22 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::CONFLICT, "{response}");
         assert_eq!(response["error"], "case_state");
+        assert_eq!(harness.state.store.case(&case_id).unwrap().unwrap().stage, "open");
+    }
+
+    #[tokio::test]
+    async fn a_ban_fails_closed_when_its_mandate_row_is_missing() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.state.store.remove_mandate(&case.mandate_ref).unwrap();
+
+        let (status, response) = harness
+            .decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"}))
+            .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{response}");
         assert_eq!(harness.state.store.case(&case_id).unwrap().unwrap().stage, "open");
     }
 
@@ -1897,40 +2013,54 @@ mod tests {
 
         // A stranger who signs correctly is still not a party — and
         // gets the same answer as for a case that does not exist.
-        let message = format!("query-status:{case_id}");
+        let timestamp = util::format_timestamp(OffsetDateTime::now_utc());
+        let message = format!("query-status:{case_id}:{timestamp}");
         let signature = testing::sign(STRANGER_SEED, message.as_bytes());
-        let url = format!(
-            "/v1/cases/{case_id}/status?key={}&signature={}",
-            testing::key_reference(STRANGER_SEED),
-            urlencode(&signature)
-        );
-        let (status, _) = harness.send(Request::get(url).body(Body::empty()).unwrap()).await;
+        let (status, _) = harness
+            .send(
+                Request::get(format!("/v1/cases/{case_id}/status"))
+                    .header("x-onym-key", testing::key_reference(STRANGER_SEED))
+                    .header("x-onym-timestamp", &timestamp)
+                    .header("x-onym-signature", signature)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         // The accused can read their own case.
         let signature = testing::sign(ACCUSED_SEED, message.as_bytes());
-        let url = format!(
-            "/v1/cases/{case_id}/status?key={}&signature={}",
-            testing::key_reference(ACCUSED_SEED),
-            urlencode(&signature)
-        );
-        let (status, body) = harness.send(Request::get(url).body(Body::empty()).unwrap()).await;
+        let (status, body) = harness
+            .send(
+                Request::get(format!("/v1/cases/{case_id}/status"))
+                    .header("x-onym-key", testing::key_reference(ACCUSED_SEED))
+                    .header("x-onym-timestamp", &timestamp)
+                    .header("x-onym-signature", signature)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["stage"], "open");
         // The reporter's identity is never in the answer (§5.4).
         assert!(!body.to_string().contains(&testing::key_reference(REPORTER_SEED)));
-    }
 
-    fn urlencode(value: &str) -> String {
-        value
-            .bytes()
-            .map(|b| match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    (b as char).to_string()
-                }
-                other => format!("%{other:02X}"),
-            })
-            .collect()
+        let stale = "2020-01-01T00:00:00Z";
+        let stale_signature = testing::sign(
+            ACCUSED_SEED,
+            format!("query-status:{case_id}:{stale}").as_bytes(),
+        );
+        let (status, _) = harness
+            .send(
+                Request::get(format!("/v1/cases/{case_id}/status"))
+                    .header("x-onym-key", testing::key_reference(ACCUSED_SEED))
+                    .header("x-onym-timestamp", stale)
+                    .header("x-onym-signature", stale_signature)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "a logged old credential must not replay");
     }
 
     // ─── Manifest snapshots ──────────────────────────────────────────
@@ -2035,23 +2165,25 @@ mod tests {
 
         let bogus = testing::sign(STRANGER_SEED, b"some other message");
         let ask = |key: [u8; 32]| {
-            format!(
-                "/v1/cases/{case_id}/status?key={}&signature={}",
-                testing::key_reference(key),
-                urlencode(&bogus)
-            )
+            Request::get(format!("/v1/cases/{case_id}/status"))
+                .header("x-onym-key", testing::key_reference(key))
+                .header("x-onym-timestamp", "2026-08-08T00:00:00Z")
+                .header("x-onym-signature", &bogus)
+                .body(Body::empty())
+                .unwrap()
         };
 
         // The accused, with a signature that does not verify.
-        let (party, _) =
-            harness.send(Request::get(ask(ACCUSED_SEED)).body(Body::empty()).unwrap()).await;
+        let (party, _) = harness.send(ask(ACCUSED_SEED)).await;
         // A stranger, with the same bad signature.
-        let (stranger, _) =
-            harness.send(Request::get(ask(STRANGER_SEED)).body(Body::empty()).unwrap()).await;
+        let (stranger, _) = harness.send(ask(STRANGER_SEED)).await;
         // A case that does not exist at all.
         let (missing, _) = harness
             .send(
-                Request::get("/v1/cases/case-nope/status?key=onym:key:00&signature=x")
+                Request::get("/v1/cases/case-nope/status")
+                    .header("x-onym-key", "onym:key:00")
+                    .header("x-onym-timestamp", "2026-08-08T00:00:00Z")
+                    .header("x-onym-signature", "x")
                     .body(Body::empty())
                     .unwrap(),
             )

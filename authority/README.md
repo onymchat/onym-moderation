@@ -37,9 +37,11 @@ reviewing:
 - **No sanction before notice.** A ban is refused until the consented
   response window has *elapsed* — answering early does not shorten it,
   because the accused was promised the time, not merely one chance to
-  speak. A ban is also refused once the decision deadline has passed,
-  since by then the case is already dismissed by default. The case-open
-  mark is the only pre-verdict effect.
+  speak. Joined evidence produces another signed notice and restarts
+  both the response and decision windows; the latest notice must reach
+  the interface before a ban can issue. A ban is also refused once the
+  decision deadline has passed, since by then the case is already
+  dismissed by default. The case-open mark is the only pre-verdict effect.
 - **No unexplained verdicts.** `reasoning` is required on every
   disposition, including dismissals and case openings.
 - **No case without consent to *these* terms.** Every mandate is stored
@@ -107,12 +109,18 @@ worth stating:
 `/v1/cases/:id/decide` is the only path from a report to a sanction,
 and it needs a human's token. There is no automatic escalation.
 
+Party `query-status` credentials travel in `X-Onym-Key`,
+`X-Onym-Timestamp`, and `X-Onym-Signature` headers. The signature covers
+`query-status:<caseId>:<timestamp>` and expires after five minutes; it is
+never placed in the request URI or Caddy access log.
+
 A case id is not a credential. `query-status` answers the accused, a
 reporter on the case, or a moderator; a party proves who they are by
-signing `query-status:<caseId>` with the key that made them one
-(`?key=onym:key:…&signature=…`). A stranger gets the same answer as for
-a case that does not exist, because a distinguishable refusal would
-confirm that a named person is under investigation.
+signing `query-status:<caseId>:<timestamp>` with the key that made them
+one and placing the key, timestamp, and signature in the headers above.
+A stranger gets the same answer as for a case that does not exist,
+because a distinguishable refusal would confirm that a named person is
+under investigation.
 
 Every refusal on that endpoint looks the same — bad signature, right
 key; good signature, wrong key; a case that does not exist. Checking
