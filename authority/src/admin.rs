@@ -353,9 +353,23 @@ fn review_form(case: &CaseRecord) -> String {
         return out;
     }
 
-    let reasoning_field = "<label>Reasoning — a content address of your findings against the \
+    // What this page was rendered from. A pending appeal can be
+    // supplemented without leaving `pending`, and another moderator can
+    // answer the same claim while this page sits open — neither moves
+    // the case revision. Posting the value back is what lets the
+    // decision transaction refuse a review of a file that has changed
+    // since it was read.
+    //
+    // It rides with the reasoning field so that every form on this
+    // page carries it, including any added later.
+    let reasoning_field = format!(
+        "<input type=hidden name=claim_revision value={read_at}>\
+         <label>Reasoning — a content address of your findings against the \
          consented class definition, not a sentence.<br>\
-         <input name=reasoning size=70 placeholder=\"sha256:… or https://…\" required></label><br>";
+         <input name=reasoning size=70 placeholder=\"sha256:… or https://…\" required></label><br>",
+        read_at = case.claim_revision
+    );
+    let reasoning_field = &reasoning_field;
 
     if appeal_pending {
         out.push_str(&format!(
@@ -418,6 +432,13 @@ struct ReviewForm {
     /// meant answering one left the other pending forever.
     #[serde(default)]
     subject: String,
+    /// The case's `claim_revision` when the page was rendered. Carried
+    /// into the decision transaction so a supplementary filing, or
+    /// another moderator answering the same claim, refuses this review
+    /// rather than letting it commit against a file it never read.
+    /// Absent on an older form post, which is checked as before.
+    #[serde(default)]
+    claim_revision: Option<i64>,
 }
 
 /// The human's decision on an appeal.
@@ -460,7 +481,14 @@ async fn review(
     let subject = match form.subject.as_str() {
         "appeal" => "appeal",
         "new-holder" => "new-holder",
-        "" => {
+        // `none` is what the "Correct this verdict" form posts, and it
+        // reached the `other` arm below: the one control `review_form`
+        // renders for an uncontested ban always 400'd. It resolves the
+        // same way as an absent subject, which already computes `none`
+        // for itself — so an explicit `none` posted while something is
+        // pending still answers that claim rather than reversing past
+        // it and leaving it queued forever.
+        "" | "none" => {
             // Older form posts carry no subject. Answer the appeal if
             // one is pending, else the claim; refuse when both are, so
             // an ambiguous request cannot silently pick for a reviewer.
@@ -510,6 +538,11 @@ async fn review(
                     // both pass the pending check and both record a
                     // review of it.
                     Some("pending"),
+                    // And the revision it was decided against, which
+                    // the state alone does not give: a claim filed
+                    // beside this one leaves it `pending` while adding
+                    // material this review did not read.
+                    form.claim_revision,
                     &stamp,
                     "new_holder_claim_refused",
                     &form.reasoning,
@@ -519,6 +552,7 @@ async fn review(
                     &case_id,
                     "upheld",
                     Some("pending"),
+                    form.claim_revision,
                     &stamp,
                     "appeal_upheld",
                     &form.reasoning,
@@ -560,6 +594,11 @@ async fn review(
                 } else {
                     decisions::Claim::Appeal
                 },
+                // The file this reviewer actually read. A supplement
+                // that landed after the page was rendered, or another
+                // moderator's answer to the same claim, refuses the
+                // commit instead of being decided past.
+                form.claim_revision,
             )
             .await?;
         }
@@ -724,6 +763,7 @@ mod tests {
             appeal_state: appeal_state.into(),
             new_holder_state: new_holder_state.into(),
             revision: 0,
+            claim_revision: 0,
         }
     }
 
@@ -740,7 +780,7 @@ mod tests {
             State(state.clone()),
             Path("c1".to_string()),
             signed_in(&state),
-            Form(ReviewForm { outcome: "uphold".into(), reasoning: "hash:reviewed".into(), subject: String::new() }),
+            Form(ReviewForm { outcome: "uphold".into(), reasoning: "hash:reviewed".into(), subject: String::new(), claim_revision: None }),
         )
         .await;
 
@@ -758,7 +798,7 @@ mod tests {
             State(state.clone()),
             Path("c1".to_string()),
             signed_in(&state),
-            Form(ReviewForm { outcome: "reverse".into(), reasoning: "hash:reviewed".into(), subject: String::new() }),
+            Form(ReviewForm { outcome: "reverse".into(), reasoning: "hash:reviewed".into(), subject: String::new(), claim_revision: None }),
         )
         .await;
 
@@ -776,7 +816,7 @@ mod tests {
             State(state.clone()),
             Path("c1".to_string()),
             signed_in(&state),
-            Form(ReviewForm { outcome: "uphold".into(), reasoning: "hash:reviewed".into(), subject: String::new() }),
+            Form(ReviewForm { outcome: "uphold".into(), reasoning: "hash:reviewed".into(), subject: String::new(), claim_revision: None }),
         )
         .await
         .unwrap();
@@ -797,7 +837,7 @@ mod tests {
             State(state.clone()),
             Path("c1".to_string()),
             signed_in(&state),
-            Form(ReviewForm { outcome: "uphold".into(), reasoning: "hash:reviewed".into(), subject: String::new() }),
+            Form(ReviewForm { outcome: "uphold".into(), reasoning: "hash:reviewed".into(), subject: String::new(), claim_revision: None }),
         )
         .await
         .unwrap();
@@ -826,7 +866,7 @@ mod tests {
             State(state.clone()),
             Path("c1".to_string()),
             signed_in(&state),
-            Form(ReviewForm { outcome: "reverse".into(), reasoning: "hash:reviewed".into(), subject: String::new() }),
+            Form(ReviewForm { outcome: "reverse".into(), reasoning: "hash:reviewed".into(), subject: String::new(), claim_revision: None }),
         )
         .await
         .unwrap();
@@ -863,6 +903,7 @@ mod tests {
                 outcome: "uphold".into(),
                 reasoning: "hash:appeal".into(),
                 subject: "appeal".into(),
+                claim_revision: None,
             }),
         )
         .await
@@ -886,6 +927,7 @@ mod tests {
                 outcome: "uphold".into(),
                 reasoning: "hash:claim".into(),
                 subject: "new-holder".into(),
+                claim_revision: None,
             }),
         )
         .await
@@ -913,6 +955,7 @@ mod tests {
                 outcome: "uphold".into(),
                 reasoning: "hash:r".into(),
                 subject: String::new(),
+                claim_revision: None,
             }),
         )
         .await;
@@ -962,6 +1005,7 @@ mod tests {
                 outcome: "reverse".into(),
                 reasoning: "hash:claim".into(),
                 subject: "new-holder".into(),
+                claim_revision: None,
             }),
         )
         .await
@@ -1000,6 +1044,7 @@ mod tests {
                     outcome: "uphold".into(),
                     reasoning: "hash:reviewed".into(),
                     subject: "appeal".into(),
+                    claim_revision: None,
                 }),
             )
         };
@@ -1021,4 +1066,171 @@ mod tests {
         );
     }
 
+    /// The value the "Correct this verdict" form actually posts, taken
+    /// out of the rendered HTML rather than written out again here.
+    ///
+    /// Asserting that the page *contains* `value=none` is what let this
+    /// break: the handler rejected `"none"` as an unknown subject, so
+    /// the one control rendered for an uncontested ban returned 400
+    /// every time. A test that reads the form and posts it is the only
+    /// kind that can tell.
+    #[tokio::test]
+    async fn the_form_for_an_uncontested_ban_posts_something_the_handler_accepts() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        let case = reviewable_case_with(Some("ban"), "none", "none");
+        state.store.put_case(&case).unwrap();
+        state.store.put_delivered_open_case_verdict("c1", "v-open").unwrap();
+
+        let rendered = review_form(&case);
+        let subject = rendered
+            .split("name=subject value=")
+            .nth(1)
+            .and_then(|rest| rest.split('>').next())
+            .expect("the form names a subject")
+            .to_string();
+
+        review(
+            State(state.clone()),
+            Path("c1".to_string()),
+            signed_in(&state),
+            Form(ReviewForm {
+                outcome: "reverse".into(),
+                reasoning: "hash:our-own-error".into(),
+                subject,
+                claim_revision: Some(case.claim_revision),
+            }),
+        )
+        .await
+        .expect("the panel's own form must not be refused");
+
+        let case = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(case.disposition.as_deref(), Some("reversed"));
+        assert!(
+            !state.store.events("c1").unwrap().iter().any(|(_, kind, _)| kind == "appeal_reversed"),
+            "nobody appealed; this is the authority correcting itself"
+        );
+    }
+
+    /// An explicit `none` on a case that *does* have something pending
+    /// answers it, rather than reversing past it and leaving the claim
+    /// queued against a case whose marks are already gone.
+    #[tokio::test]
+    async fn an_explicit_none_still_answers_whatever_is_pending() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        state.store.put_case(&reviewable_case_with(Some("ban"), "pending", "none")).unwrap();
+        state.store.put_delivered_open_case_verdict("c1", "v-open").unwrap();
+
+        review(
+            State(state.clone()),
+            Path("c1".to_string()),
+            signed_in(&state),
+            Form(ReviewForm {
+                outcome: "reverse".into(),
+                reasoning: "hash:reviewed".into(),
+                subject: "none".into(),
+                claim_revision: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.store.case("c1").unwrap().unwrap().appeal_state, "reversed");
+    }
+
+    /// The page carries what it was rendered from, so the decision can
+    /// be refused if the file changed underneath it.
+    #[test]
+    fn the_review_form_carries_the_claim_revision_it_was_rendered_at() {
+        let mut case = reviewable_case_with(Some("ban"), "pending", "none");
+        case.claim_revision = 7;
+        assert!(review_form(&case).contains("name=claim_revision value=7"));
+    }
+
+    /// The accused may supplement a pending appeal, which leaves it
+    /// `pending` and leaves the case document untouched — so neither
+    /// the state check nor the case revision notices. A moderator who
+    /// loaded the page before the supplement would otherwise commit a
+    /// review of a file they never read.
+    #[tokio::test]
+    async fn a_supplement_filed_after_the_page_loaded_refuses_the_review() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        state.store.put_case(&reviewable_case_with(Some("ban"), "pending", "none")).unwrap();
+        state.store.put_delivered_open_case_verdict("c1", "v-open").unwrap();
+
+        // What the page was rendered at.
+        let read_at = state.store.case("c1").unwrap().unwrap().claim_revision;
+
+        // …and then the accused files more material.
+        state
+            .store
+            .append_claim_event_bounded("c1", "2026-08-10T00:00:00Z", "appeal_filed", "and also", 8)
+            .unwrap();
+
+        for outcome in ["uphold", "reverse"] {
+            let result = review(
+                State(state.clone()),
+                Path("c1".to_string()),
+                signed_in(&state),
+                Form(ReviewForm {
+                    outcome: outcome.into(),
+                    reasoning: "hash:reviewed".into(),
+                    subject: "appeal".into(),
+                    claim_revision: Some(read_at),
+                }),
+            )
+            .await;
+            assert!(matches!(result, Err(Error::CaseState(_))), "{outcome}: {result:?}");
+        }
+
+        let case = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(case.appeal_state, "pending", "still waiting for a review of the whole file");
+        assert_eq!(case.disposition.as_deref(), Some("ban"));
+    }
+
+    /// Two moderators, one claim, and one of them reads a page rendered
+    /// before the other answered it. The state check catches an
+    /// `uphold` racing an `uphold`; it does not catch a `reverse`
+    /// racing an `uphold`, because a reversal is guarded on the
+    /// disposition, which is still `ban`.
+    #[tokio::test]
+    async fn a_reversal_cannot_commit_against_a_claim_someone_else_upheld() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        state.store.put_case(&reviewable_case_with(Some("ban"), "pending", "none")).unwrap();
+        state.store.put_delivered_open_case_verdict("c1", "v-open").unwrap();
+
+        let read_at = state.store.case("c1").unwrap().unwrap().claim_revision;
+
+        // The other moderator gets there first.
+        review(
+            State(state.clone()),
+            Path("c1".to_string()),
+            signed_in(&state),
+            Form(ReviewForm {
+                outcome: "uphold".into(),
+                reasoning: "hash:upheld".into(),
+                subject: "appeal".into(),
+                claim_revision: Some(read_at),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let result = review(
+            State(state.clone()),
+            Path("c1".to_string()),
+            signed_in(&state),
+            Form(ReviewForm {
+                outcome: "reverse".into(),
+                reasoning: "hash:reversed".into(),
+                subject: "appeal".into(),
+                claim_revision: Some(read_at),
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::CaseState(_))), "{result:?}");
+        let case = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(case.appeal_state, "upheld");
+        assert_eq!(case.disposition.as_deref(), Some("ban"), "the first review stands");
+    }
 }

@@ -120,7 +120,14 @@ shown.
 
 If the service exits with `AUTHORITY_TRIAGE_URL is ... not on this
 host`, that is deliberate: case evidence would be sent to a third
-party. Run the model locally or turn triage off; do not work around it. If they carry `this
+party. Run the model locally or turn triage off; do not work around it.
+
+A name that does not resolve at boot is allowed through — the model
+container may have started second — and the check is paid instead
+before the first request that would carry evidence. So a typo'd
+`AUTHORITY_TRIAGE_URL` shows up as `refusing to send case evidence
+to ...` in the logs and every case reaching no decision, rather than as
+a failure to start. Same cause, same fix. If they carry `this
 profile has no rule or native category for these manifest classes`,
 cases in those classes will never be decided automatically; they wait
 for a human and dismiss at their deadline.

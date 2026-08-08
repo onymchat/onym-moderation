@@ -90,7 +90,14 @@ pub async fn apply(
     apply_inner(state, case_id, disposition, reasoning, decider, now, Context::default()).await
 }
 
-/// As `apply`, naming the claim the reviewer answered.
+/// As `apply`, naming the claim the reviewer answered and the claim
+/// revision the page they answered it from was rendered at.
+///
+/// The second is not bookkeeping. A pending appeal may be supplemented
+/// without leaving `pending`, and another moderator may answer the same
+/// claim while this one reads it — neither moves the case revision, so
+/// without this the review commits as though it had read a file it
+/// never saw, or re-decides a claim already decided.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_reviewing(
     state: &std::sync::Arc<AppState>,
@@ -100,6 +107,7 @@ pub async fn apply_reviewing(
     decider: Decider,
     now: OffsetDateTime,
     reviewed: Claim,
+    read_at_claim_revision: Option<i64>,
 ) -> Result<Issued, Error> {
     apply_inner(
         state,
@@ -108,7 +116,11 @@ pub async fn apply_reviewing(
         reasoning,
         decider,
         now,
-        Context { reviewed: Some(reviewed), ..Context::default() },
+        Context {
+            reviewed: Some(reviewed),
+            expect_claim_revision: read_at_claim_revision,
+            ..Context::default()
+        },
     )
     .await
 }
@@ -147,6 +159,7 @@ pub async fn apply_at_revision(
 #[derive(Default, Clone, Copy)]
 struct Context {
     expect_revision: Option<i64>,
+    expect_claim_revision: Option<i64>,
     reviewed: Option<Claim>,
 }
 
@@ -159,7 +172,7 @@ async fn apply_inner(
     now: OffsetDateTime,
     context: Context,
 ) -> Result<Issued, Error> {
-    let Context { expect_revision, reviewed } = context;
+    let Context { expect_revision, expect_claim_revision, reviewed } = context;
     let mut case = state
         .store
         .case(case_id)?
@@ -317,6 +330,9 @@ async fn apply_inner(
         // earlier, and are the ones that can go stale. A moderator
         // decides from the page in front of them.
         expect_revision,
+        // Only a review carries one — the panel and the JSON API's
+        // reversal path. A first-instance decision answers no claim.
+        expect_claim_revision,
         appeal_state,
         new_holder_state,
         extra_event,
@@ -495,6 +511,7 @@ mod tests {
             appeal_state: "none".into(),
             new_holder_state: "none".into(),
             revision: 0,
+            claim_revision: 0,
         }
     }
 

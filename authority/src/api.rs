@@ -665,6 +665,7 @@ async fn open_case(
         appeal_state: "none".into(),
         new_holder_state: "none".into(),
         revision: 0,
+        claim_revision: 0,
     };
     let issued = cases::open_case_verdict(
         &case,
@@ -935,13 +936,20 @@ async fn appeal(
                 &case_id,
                 "pending",
                 Some("none"),
+                // A filing is not a review, so it pins no revision — it
+                // moves one.
+                None,
                 &stamp,
                 "appeal_filed",
                 &submission.statement,
             )?;
         }
         "pending" => {
-            let filed = state.store.append_event_bounded(
+            // Through the claim-aware path: a supplement leaves the
+            // appeal `pending` and the case document untouched, so
+            // moving the claim revision is the only thing that tells a
+            // review rendered before it that it is now out of date.
+            let filed = state.store.append_claim_event_bounded(
                 &case_id,
                 &stamp,
                 "appeal_filed",
@@ -1097,6 +1105,12 @@ async fn query_status(
         "appealDeadline": case.appeal_deadline,
         "appealState": case.appeal_state,
         "newHolderState": case.new_holder_state,
+        // The token a reviewer posts back with their decision. It moves
+        // whenever either claim is filed, supplemented, or answered, so
+        // `decide` can refuse a review of a file that has changed since
+        // it was read. Nothing about the case is disclosed by it — it
+        // counts events the reader can already see in `events`.
+        "claimRevision": case.claim_revision,
         // What decided the case, resolved rather than hashed. The
         // verdict's `reasoning` is a content address of exactly this,
         // and without a route that resolves it the promise that a
@@ -1130,6 +1144,14 @@ struct Decision {
     /// an assertion by the caller, which is the only party that knows.
     #[serde(default)]
     reviewed_assessment: bool,
+    /// The case's `claimRevision` when the caller read the claim it is
+    /// answering, from `query-status`. Optional, because an API caller
+    /// may be acting on a claim it has just been handed — but supplying
+    /// it is what makes the decision refuse to commit if the claim
+    /// gained a supplementary filing, or was answered by someone else,
+    /// in between. The panel always supplies it.
+    #[serde(default)]
+    claim_revision: Option<i64>,
 }
 
 /// The moderator's decision. This is the one place human judgment
@@ -1170,6 +1192,7 @@ async fn decide(
                 decider,
                 OffsetDateTime::now_utc(),
                 decisions::Claim::Appeal,
+                decision.claim_revision,
             )
             .await?
         }
@@ -1182,6 +1205,7 @@ async fn decide(
                 decider,
                 OffsetDateTime::now_utc(),
                 decisions::Claim::NewHolder,
+                decision.claim_revision,
             )
             .await?
         }
@@ -2373,6 +2397,7 @@ mod tests {
             appeal_state: "none".into(),
             new_holder_state: "none".into(),
             revision: 0,
+            claim_revision: 0,
         };
         for report_id in ["r1", "r2", "r3"] {
             store
@@ -2847,7 +2872,7 @@ mod tests {
         harness
             .state
             .store
-            .set_appeal_state(&case_id, "upheld", None, "2026-08-09T00:00:00Z", "appeal_upheld", "hash:r")
+            .set_appeal_state(&case_id, "upheld", None, None, "2026-08-09T00:00:00Z", "appeal_upheld", "hash:r")
             .unwrap();
 
         // Re-filing must not put it back in the queue.
@@ -2858,6 +2883,77 @@ mod tests {
             "upheld",
             "the completed review stands"
         );
+    }
+
+    /// The accused may supplement a pending appeal, and doing so
+    /// changes neither `appealState` nor the case revision — a
+    /// supplement is not a new claim and does not touch the document a
+    /// model would read. `claimRevision` is the only thing that moves,
+    /// which is why a decision may pin it: a review submitted against
+    /// the earlier value is a review of a shorter file than the one it
+    /// would decide.
+    #[tokio::test]
+    async fn a_decision_pinned_to_a_stale_claim_revision_is_refused() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        let appeal = |statement: &str| {
+            signed(
+                json!({"caseId": case_id, "kind": "appeal", "statement": statement}),
+                "signature",
+                &[ACCUSED_SEED],
+            )
+        };
+        let (status, _) =
+            harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal("it was a quotation")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // What a reviewer would read now.
+        let read_at = harness.state.store.case(&case_id).unwrap().unwrap().claim_revision;
+
+        // …and then more material arrives.
+        let (status, _) =
+            harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal("and here is the thread")).await;
+        assert_eq!(status, StatusCode::OK);
+        let case = harness.state.store.case(&case_id).unwrap().unwrap();
+        assert_eq!(case.appeal_state, "pending", "a supplement does not move the state");
+        assert!(case.claim_revision > read_at, "it moves the claim revision");
+
+        let stale = json!({
+            "disposition": "reverse",
+            "reasoning": "hash:r",
+            "reviewed": "appeal",
+            "claimRevision": read_at,
+        });
+        let (status, _) = harness.decide(&case_id, stale).await;
+        assert_eq!(status, StatusCode::CONFLICT, "a review of a file that has grown must not commit");
+        assert_eq!(
+            harness.state.store.case(&case_id).unwrap().unwrap().disposition.as_deref(),
+            Some("ban")
+        );
+
+        // Reading the whole file and deciding against *that* works.
+        let current = harness.state.store.case(&case_id).unwrap().unwrap().claim_revision;
+        let (status, _) = harness
+            .decide(
+                &case_id,
+                json!({
+                    "disposition": "reverse",
+                    "reasoning": "hash:r",
+                    "reviewed": "appeal",
+                    "claimRevision": current,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let case = harness.state.store.case(&case_id).unwrap().unwrap();
+        assert_eq!(case.disposition.as_deref(), Some("reversed"));
+        assert_eq!(case.appeal_state, "reversed");
     }
 
     /// A device-changed-hands claim is not an appeal against the
@@ -3152,7 +3248,7 @@ mod tests {
         harness
             .state
             .store
-            .set_appeal_state(&case_id, "upheld", None, "2026-08-09T00:00:00Z", "appeal_upheld", "hash:r")
+            .set_appeal_state(&case_id, "upheld", None, None, "2026-08-09T00:00:00Z", "appeal_upheld", "hash:r")
             .unwrap();
         let (status, _) =
             harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal("let me try again")).await;

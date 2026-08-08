@@ -110,9 +110,11 @@ moderation model triages each case, and a person reads the file when
 someone says the machine got it wrong. Appeals are the panel's queue.
 
 With triage enabled, an `AUTHORITY_TRIAGE_URL` that is not on this host
-is a **startup failure**, not a warning. Case evidence is content a
-reporter disclosed for adjudication; a log line about having sent it to
-a third party arrives after the disclosure has happened.
+is a **startup failure**, not a warning — and where the name cannot be
+resolved yet, a refusal at the first case rather than a pass. Case
+evidence is content a reporter disclosed for adjudication; a log line
+about having sent it to a third party arrives after the disclosure has
+happened.
 
 **A new-holder claim is tracked in its own field, not the appeal's.**
 It does not say the verdict was wrong — it says the device changed
@@ -176,7 +178,7 @@ is no code that knows about any particular model:
 {
   "id": "house-classifier-v3",
   "displayName": "In-house classifier",
-  "profileDigest": "<sha256 of your published profile document>",
+  "profileDigest": "<sha256 of this document's execution bytes — see below>",
   "policyDigest": "<sha256 of the policy it incorporates>",
   "repository": "example-org/house-classifier",
   "revision": "<commit>",
@@ -195,6 +197,31 @@ is no code that knows about any particular model:
 
 Four adapter kinds cover the published profiles: `firstTokenScore`,
 `exactOutput`, `labelLine`, and `nativeTaxonomy`.
+
+### Computing `profileDigest`
+
+It names the document's **execution bytes**: every field except
+`profileDigest` itself, re-serialized with sorted keys. Those are the
+bytes that decide cases, and excluding the digest field is what makes
+the value constructible — a document cannot state a hash of itself that
+includes the statement.
+
+```bash
+jq -cSj 'del(.profileDigest)' profile.json | shasum -a 256
+```
+
+Write the result into `profileDigest` and the document still hashes to
+it. The service recomputes this at boot and refuses to start if the
+declared value disagrees, so editing a prompt, threshold, adapter or
+revision without recomputing is a startup failure rather than a live
+deployment judging old mandates under replacement terms. Leaving the
+field empty means the computed value is adopted with nothing to check
+it against — fine while you are iterating, not something to ship, and
+not something to name in a manifest.
+
+Built-in profiles are the exception: their digest names the published
+prose document in [`../authorities/`](../authorities/), which is what
+users were shown, and a test pins each constant to its file.
 
 ### The manifest names the profile, and the case binds to it
 
@@ -267,6 +294,15 @@ to be judged under, and the outcome is no decision — never a ban.
 enabled the service **refuses to start** if it points anywhere else. A
 dotless name is resolved and its addresses checked, because a DNS
 search domain can point `moderation-model` at someone else's machine.
+
+One case is deferred rather than refused: a name that does not resolve
+*at all* is accepted at boot, because the model container may have
+started second and refusing to come up over that is its own failure.
+The check is then paid before the first request that would carry
+evidence — a name that still does not resolve, or resolves off-box by
+then, fails the assessment instead of the boot. So triage never sends a
+case document to a host it has not confirmed is local; it may just tell
+you at the first case rather than at startup.
 
 Case evidence is content a recipient disclosed *for adjudication*.
 Sending it to a third party's API is a further disclosure — one the
@@ -414,6 +450,16 @@ and the moderator's session.
 
 `/v1/cases/:id/decide` is the only path from a report to a sanction,
 and it needs a human's token. There is no automatic escalation.
+
+A decision that answers a claim — `"reviewed": "appeal"` or
+`"new-holder"` — should also carry `"claimRevision"`, the value
+`query-status` reported when the claim was read. The decision then
+refuses to commit if the claim gained a supplementary filing, or was
+answered by another moderator, in between: neither of those moves the
+case's own revision, and a pending appeal that has been supplemented is
+still `pending`, so nothing else would notice. The panel always sends
+it; omitting it decides against whatever the record says at commit
+time.
 
 Party `query-status` credentials travel in `X-Onym-Key`,
 `X-Onym-Timestamp`, and `X-Onym-Signature` headers. The signature covers

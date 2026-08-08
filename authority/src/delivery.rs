@@ -252,6 +252,7 @@ mod tests {
             appeal_state: "none".into(),
             new_holder_state: "none".into(),
             revision: 0,
+            claim_revision: 0,
         };
         store.put_case(&case).unwrap();
         let mut decided = case.clone();
@@ -270,6 +271,7 @@ mod tests {
                 expect_stage: "open",
                 expect_disposition: None,
                 expect_revision: None,
+                expect_claim_revision: None,
                 appeal_state: None,
                 new_holder_state: None,
                 extra_event: None,

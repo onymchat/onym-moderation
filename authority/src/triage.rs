@@ -90,6 +90,12 @@ const MAX_STORED_OUTPUT: usize = 8 * 1024;
 
 pub struct Triage {
     client: reqwest::Client,
+    /// Set once the triage host has been *resolved* to addresses on
+    /// this machine or its private network. `false` means boot could
+    /// not resolve it at all and let it through on the sibling-
+    /// container-not-up-yet reading — so the check is owed, and `infer`
+    /// pays it before the first request that would carry evidence.
+    host_confirmed_local: std::sync::atomic::AtomicBool,
 }
 
 impl Triage {
@@ -99,7 +105,38 @@ impl Triage {
                 .timeout(std::time::Duration::from_secs(config.timeout_secs))
                 .build()
                 .unwrap_or_default(),
+            host_confirmed_local: std::sync::atomic::AtomicBool::new(
+                crate::config::Config::triage_host_resolves_local(config),
+            ),
         }
+    }
+
+    /// The off-host check, paid again if boot could not settle it.
+    ///
+    /// Boot accepts a name that does not resolve yet, because refusing
+    /// to start when the model container came up second is its own
+    /// failure. But a typo'd or not-yet-published name that later
+    /// resolves to a public address would then have passed the one
+    /// check standing between disclosed evidence and a stranger — and
+    /// the documentation states that check as unconditional. So it is:
+    /// deferred, never skipped. Once the name resolves locally the
+    /// answer is cached and no lookup happens again.
+    fn confirm_host_is_local(&self, config: &TriageConfig) -> Result<(), Error> {
+        use std::sync::atomic::Ordering;
+        if self.host_confirmed_local.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if crate::config::Config::triage_host_resolves_local(config) {
+            self.host_confirmed_local.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+        Err(Error::Internal(format!(
+            "refusing to send case evidence to {}: the triage host did not resolve at boot and \
+             does not resolve to this host now. Case evidence is content a reporter disclosed \
+             for adjudication; sending it to a third party is a further disclosure the \
+             manifest's confidentiality policy would have to declare (§8 obligation 6).",
+            config.url
+        )))
     }
 
     /// Assess one case and store the result.
@@ -311,6 +348,9 @@ impl Triage {
         now: OffsetDateTime,
         counted: bool,
     ) -> Result<Assessment, Error> {
+        // The redacted output, computed once: it is both what gets
+        // stored and the yardstick every label is measured against.
+        let visible_output = strip_reasoning(raw_output);
         let assessment = Assessment {
             profile_id: profile.id.clone(),
             profile_digest: profile.profile_digest.clone(),
@@ -334,10 +374,18 @@ impl Triage {
             // The adapter still evaluates the *full* output: an
             // unclosed reasoning block is how it detects a truncated
             // generation, and it needs to see one to say so.
-            raw_output: truncate(&strip_reasoning(raw_output), MAX_STORED_OUTPUT),
+            raw_output: truncate(&visible_output, MAX_STORED_OUTPUT),
             outcome: assessed.outcome.as_str().to_string(),
             score: assessed.score,
-            labels: assessed.labels,
+            // `labels` is the third copy of the model's words, and it
+            // was the one the redaction did not cover. For a taxonomy
+            // read line by line, every line after the first becomes a
+            // label — so a server that inlines its reasoning into
+            // `content` put chain-of-thought straight into a field
+            // that is persisted, rendered in the panel, and returned to
+            // the accused. It was also the one copy no length bound
+            // applied to. Same treatment as the other two.
+            labels: sanitize_labels(assessed.labels, &visible_output),
             // The adapter's note quotes the output it could not read —
             // up to 120 characters of it, verbatim — so for a profile
             // whose server inlines the reasoning block into `content`,
@@ -372,6 +420,10 @@ impl Triage {
     /// Ollama and TGI all serve. The profile decided what is in the
     /// body; this only sends it and reads the answer out.
     async fn infer(&self, config: &TriageConfig, body: Value) -> Result<ModelOutput, Error> {
+        // Before the body — which carries the case document — leaves
+        // this process.
+        self.confirm_host_is_local(config)?;
+
         let mut request = self.client.post(&config.url).json(&body);
         if let Some(key) = config.api_key.as_deref() {
             request = request.bearer_auth(key);
@@ -471,6 +523,38 @@ fn strip_reasoning(text: &str) -> String {
     out
 }
 
+/// The most labels a reading is stored with, and the longest any one
+/// of them may be.
+///
+/// A native category code is a handful of characters; these bounds are
+/// far above any documented taxonomy and far below "the model's entire
+/// output, one line at a time".
+const MAX_STORED_LABELS: usize = 32;
+const MAX_STORED_LABEL: usize = 128;
+
+/// Labels get the same redaction and the same bound as `raw_output`.
+///
+/// The adapter is handed the *full* output on purpose — an unclosed
+/// reasoning block is how it detects a truncated generation — so
+/// anything it hands back can carry reasoning with it. Every label is
+/// a piece cut out of the model's text, which gives an exact rule: a
+/// label is kept only if it can still be quoted from the *redacted*
+/// output. Anything that cannot came out of a reasoning block.
+///
+/// Stripping each label on its own would not do it. The taxonomy
+/// shapes split on commas, so a reasoning block containing one is cut
+/// into fragments, and a fragment holding only the closing tag has no
+/// `<think>` left in it to strip.
+fn sanitize_labels(labels: Vec<String>, visible_output: &str) -> Vec<String> {
+    labels
+        .into_iter()
+        .filter(|label| visible_output.contains(label.trim()))
+        .map(|label| truncate(label.trim(), MAX_STORED_LABEL))
+        .filter(|label| !label.is_empty())
+        .take(MAX_STORED_LABELS)
+        .collect()
+}
+
 fn truncate(value: &str, limit: usize) -> String {
     if value.len() <= limit {
         return value.to_string();
@@ -531,10 +615,10 @@ pub async fn assess_and_maybe_decide(
 
     match Outcome::parse(&assessment.outcome) {
         Outcome::Dismiss => {
-            apply_automated(state, case_id, Disposition::Dismiss, &assessment, now).await;
+            apply_automated(state, case_id, Disposition::Dismiss, &assessment).await;
         }
         Outcome::Ban => {
-            apply_automated(state, case_id, Disposition::Ban, &assessment, now).await;
+            apply_automated(state, case_id, Disposition::Ban, &assessment).await;
         }
         Outcome::NoDecision => {
             tracing::info!(%case_id, note = %assessment.note, "no automated decision; case left open");
@@ -551,13 +635,23 @@ fn response_window_closed(case: &CaseRecord, now: OffsetDateTime) -> bool {
     }
 }
 
+/// Commit what the model concluded.
+///
+/// The clock is read *here*, not handed in. Every caller reaches this
+/// after awaiting a model — up to two minutes for one case, and up to
+/// twenty-five cases in a sweep that read the clock once before any of
+/// them. Carrying that timestamp in meant the decision deadline was
+/// checked against when the sweep started, so inference finishing after
+/// the deadline still committed the ban, stamped with a `decidedAt`
+/// from before it. The deadline guard and the signed timestamp must
+/// both be the time of the decision.
 async fn apply_automated(
     state: &std::sync::Arc<AppState>,
     case_id: &str,
     disposition: Disposition,
     assessment: &Assessment,
-    now: OffsetDateTime,
 ) {
+    let now = state.now();
     // The reasoning is a content address of the stored assessment, so
     // the accused (and an appellate) can be shown exactly what was
     // decided on rather than a sentence about it.
@@ -647,7 +741,7 @@ fn consented_model_profile(
 /// whose guard never comes good therefore ends as "undecided is
 /// dismissal", which is the right ending — the wrong one was ending
 /// there while a valid ban sat unapplied and unseen.
-pub async fn retry_unapplied_decisions(state: &std::sync::Arc<AppState>, now: OffsetDateTime) {
+pub async fn retry_unapplied_decisions(state: &std::sync::Arc<AppState>) {
     let Some(config) = state.config.triage.as_ref() else { return };
     if config.mode != TriageMode::Autonomous {
         // In advisory mode nothing is applied automatically, so an
@@ -690,7 +784,7 @@ pub async fn retry_unapplied_decisions(state: &std::sync::Arc<AppState>, now: Of
             continue;
         }
 
-        apply_automated(state, &case.case_id, disposition, &assessment, now).await;
+        apply_automated(state, &case.case_id, disposition, &assessment).await;
     }
 }
 
@@ -804,6 +898,7 @@ mod tests {
             appeal_state: "none".into(),
             new_holder_state: "none".into(),
             revision: 0,
+            claim_revision: 0,
         };
         let inside = util::parse_timestamp("2026-08-02T00:00:00Z").unwrap();
         let after = util::parse_timestamp("2026-08-05T00:00:00Z").unwrap();
@@ -865,6 +960,7 @@ mod tests {
             appeal_state: "none".into(),
             new_holder_state: "none".into(),
             revision: 0,
+            claim_revision: 0,
         };
         // The mandate the case names, with the manifest it consented
         // to. A case whose mandate is not on file is not a real case:
@@ -1131,6 +1227,7 @@ mod tests {
             appeal_state: "none".into(),
             new_holder_state: "none".into(),
             revision: 0,
+            claim_revision: 0,
         };
         store
             .put_mandate(
@@ -1547,7 +1644,7 @@ mod tests {
         // The notice reaches the interface, and the next sweep applies
         // what was already decided — without asking the model again.
         state.store.put_delivered_open_case_verdict("c1", "v-open").unwrap();
-        retry_unapplied_decisions(&state, now).await;
+        retry_unapplied_decisions(&state).await;
 
         let after = state.store.case("c1").unwrap().unwrap();
         assert_eq!(after.disposition.as_deref(), Some("ban"), "the ban must not be lost");
@@ -1574,7 +1671,7 @@ mod tests {
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
 
         assess_and_maybe_decide(&state, "c1", now).await;
-        retry_unapplied_decisions(&state, now).await;
+        retry_unapplied_decisions(&state).await;
 
         assert_eq!(state.store.case("c1").unwrap().unwrap().stage, "open");
         assert!(state.store.case("c1").unwrap().unwrap().disposition.is_none());
@@ -1626,7 +1723,7 @@ mod tests {
 
         // Notice lands, and the retry runs.
         state.store.put_delivered_open_case_verdict("c1", "v-open").unwrap();
-        retry_unapplied_decisions(&state, now).await;
+        retry_unapplied_decisions(&state).await;
 
         let after = state.store.case("c1").unwrap().unwrap();
         assert_eq!(
@@ -1805,4 +1902,109 @@ mod tests {
         }
     }
 
+    /// `raw_output` and `note` were redacted; `labels` was not, and it
+    /// is the field a line-by-line taxonomy fills with *every line
+    /// after the first*. A server that inlines its reasoning into
+    /// `content` therefore stored chain-of-thought in a field that is
+    /// persisted, rendered in the panel, and returned to the accused.
+    ///
+    /// The comma matters: the shape joins the remaining lines and
+    /// splits them again, so a reasoning block containing one arrives
+    /// as fragments, and the fragment carrying the closing tag has no
+    /// `<think>` left in it for a per-label strip to find.
+    #[tokio::test]
+    async fn labels_carry_no_reasoning_either() {
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content":
+                "unsafe\n<think>she blocked him, then he sent it again</think>\nS4"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "csam", "2026-08-04T00:00:00Z");
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "llama-guard-4-12b",
+            &url,
+            TriageMode::Advisory,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let (raw, _) = state.store.assessment("c1").unwrap().unwrap();
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(assessment.outcome, "no-decision", "{}", assessment.note);
+        for label in &assessment.labels {
+            assert!(!label.contains("blocked him"), "reasoning in labels: {label:?}");
+            assert!(!label.contains("sent it again"), "reasoning in labels: {label:?}");
+            assert!(!label.contains("<think>"), "{label:?}");
+        }
+        assert!(!assessment.raw_output.contains("blocked him"));
+        assert!(!assessment.note.contains("blocked him"));
+    }
+
+    /// A label the model genuinely emitted is still kept — the rule is
+    /// "quotable from the redacted output", not "discard everything".
+    #[test]
+    fn labels_the_model_actually_emitted_survive() {
+        let visible = "unsafe\nS4";
+        assert_eq!(
+            sanitize_labels(vec!["S4".into()], visible),
+            vec!["S4".to_string()]
+        );
+        // And the bound applies, which it did not before.
+        let long = "x".repeat(MAX_STORED_LABEL * 2);
+        let stored = sanitize_labels(vec![long.clone()], &long);
+        assert!(stored[0].len() < long.len());
+        assert_eq!(sanitize_labels(vec!["S4".into(); 100], visible).len(), MAX_STORED_LABELS);
+    }
+
+    /// The sweep reads the clock once and then awaits a model that can
+    /// take two minutes a case, for up to twenty-five cases. Carrying
+    /// that timestamp into the decision meant the deadline guard was
+    /// asked about when the sweep *started*: inference finishing after
+    /// the decision deadline still committed the ban, stamped with a
+    /// `decidedAt` from before it. The case is dismissed by default at
+    /// that point (§3.5), and a ban is the one thing it cannot become.
+    #[tokio::test]
+    async fn a_deadline_that_passes_during_inference_refuses_the_ban() {
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Violent"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        let mut case = open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+        // A deadline between when the sweep started and when the model
+        // answered.
+        case.decision_deadline = "2026-08-09T23:30:00Z".into();
+        store.put_case(&case).unwrap();
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        // What the sweep read before the model calls began.
+        let swept_at = util::parse_timestamp("2026-08-09T23:00:00Z").unwrap();
+        // Where the clock actually is by the time the answer arrives —
+        // the fixture's pinned default, after the deadline.
+        assert!(state.now() > util::parse_timestamp("2026-08-09T23:30:00Z").unwrap());
+
+        assess_and_maybe_decide(&state, "c1", swept_at).await;
+
+        let after = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(after.stage, "open", "an overdue case is not banned; it is dismissed by default");
+        assert_eq!(after.disposition, None);
+        // The reading itself is on file — it is the decision that was
+        // refused, not the assessment.
+        let (_, applied) = state.store.assessment("c1").unwrap().unwrap();
+        assert!(!applied);
+
+        // And the control: with the clock still inside the window, the
+        // same reading commits. Without this the test would pass on any
+        // refusal at all.
+        state.clock.set(util::parse_timestamp("2026-08-09T23:15:00Z").unwrap());
+        retry_unapplied_decisions(&state).await;
+        assert_eq!(state.store.case("c1").unwrap().unwrap().disposition.as_deref(), Some("ban"));
+    }
 }

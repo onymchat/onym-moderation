@@ -70,6 +70,7 @@ async fn sweep_overdue(
             expect_stage: "open",
             expect_disposition: None,
             expect_revision: None,
+            expect_claim_revision: None,
             appeal_state: None,
             new_holder_state: None,
             extra_event: None,
@@ -166,7 +167,7 @@ pub async fn triage_sweep(
     // Decisions the model reached and a guard refused. Cheap — no
     // model call — and the reason it runs every tick: the guard that
     // refused is usually a delivery that has since completed.
-    crate::triage::retry_unapplied_decisions(state, now).await;
+    crate::triage::retry_unapplied_decisions(state).await;
 
     if total > MAX_ASSESSMENTS_PER_SWEEP {
         tracing::info!(
@@ -240,6 +241,7 @@ mod tests {
             appeal_state: "none".into(),
             new_holder_state: "none".into(),
             revision: 0,
+            claim_revision: 0,
         }
     }
 
@@ -355,6 +357,7 @@ mod tests {
                 expect_stage: "open",
                 expect_disposition: None,
                 expect_revision: None,
+                expect_claim_revision: None,
                 appeal_state: None,
                 new_holder_state: None,
                 extra_event: None,

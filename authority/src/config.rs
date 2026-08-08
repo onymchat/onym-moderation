@@ -5,6 +5,38 @@ use std::env;
 use crate::profiles::{self, ModelProfile};
 use crate::types::AuthorityManifest;
 
+/// The SHA-256 a supplied profile document is named by: its bytes with
+/// `profileDigest` dropped structurally and the rest re-serialized with
+/// sorted keys — the same canonicalization every signature in this
+/// service uses.
+///
+/// Dropping the field is what makes the digest constructible: a
+/// document cannot state a hash of itself that includes the statement.
+/// Dropping it *structurally* rather than by string surgery is what
+/// keeps it honest — removing every occurrence of a digest-shaped
+/// string would let a planted copy elsewhere in the document
+/// reconstruct different bytes than the ones that decide cases.
+///
+/// Equivalent to `jq -cSj 'del(.profileDigest)' profile.json |
+/// shasum -a 256`, which is what the README tells operators to run.
+pub fn profile_digest(raw: &[u8]) -> Result<String, String> {
+    let bytes = crate::canonical::canonical_bytes(raw, &["profileDigest"])
+        .map_err(|e| format!("cannot canonicalize the profile document: {e}"))?;
+    Ok(crate::util::sha256_hex(&bytes))
+}
+
+/// What to make of a triage host that cannot be resolved right now.
+/// The two callers want different answers, and the difference is the
+/// whole of the boot-time leniency.
+#[derive(Clone, Copy)]
+pub enum Unresolved {
+    /// Boot: the sibling container may not be up yet.
+    TreatAsLocal,
+    /// First use: nothing says it is here, and evidence is about to
+    /// leave the process.
+    TreatAsRemote,
+}
+
 pub struct Config {
     pub bind_addr: String,
     pub store_path: String,
@@ -119,12 +151,27 @@ impl TriageConfig {
                 // then match that unchanged string against the
                 // manifest and judge an old mandate under replacement
                 // terms.
-                let computed = crate::util::sha256_hex(&raw);
+                //
+                // But it must be a digest an operator can actually
+                // produce. Hashing the whole file including its own
+                // `profileDigest` is self-referential — writing the
+                // value in changes the bytes it was computed from — so
+                // the documented procedure could never yield a
+                // document that passed, and the only way through was
+                // to leave the field empty, which skipped the check
+                // entirely. So: the digest names the profile's
+                // *execution bytes* — every field except the digest,
+                // re-serialized with sorted keys. Those are the bytes
+                // that decide cases, which is what a mandate consents
+                // to; and inserting the result does not disturb them.
+                let computed = profile_digest(&raw)
+                    .map_err(|e| format!("AUTHORITY_TRIAGE_PROFILE_PATH {path}: {e}"))?;
                 if !profile.profile_digest.is_empty() && profile.profile_digest != computed {
                     return Err(format!(
-                        "{path} declares profileDigest {} but its bytes hash to {computed}. The \
-                         digest names the document a mandate consents to; it cannot be asserted \
-                         separately from the document it names.",
+                        "{path} declares profileDigest {} but its execution bytes hash to \
+                         {computed}. The digest names the document a mandate consents to; it \
+                         cannot be asserted separately from the document it names. Compute it \
+                         with: jq -cSj 'del(.profileDigest)' {path} | shasum -a 256",
                         profile.profile_digest
                     ));
                 }
@@ -248,8 +295,20 @@ impl Config {
     /// evidence travels to a third party, which is a confidentiality
     /// change the manifest has to declare (§8 obligation 6), not a
     /// deployment detail.
+    /// At boot, a name that cannot be resolved *yet* is accepted: the
+    /// model container may have started second, and refusing to start
+    /// over that is its own failure. The check is deferred, not
+    /// skipped — `Triage::infer` pays it before the first request that
+    /// would carry evidence.
     pub fn triage_leaves_this_host(triage: &TriageConfig) -> bool {
-        !Self::is_local_host(Self::host_of(&triage.url))
+        !Self::is_local_host(Self::host_of(&triage.url), Unresolved::TreatAsLocal)
+    }
+
+    /// The same question with the boot leniency removed: the host must
+    /// actually resolve, and resolve here. This is what the deferred
+    /// check asks, and what the documentation describes.
+    pub fn triage_host_resolves_local(triage: &TriageConfig) -> bool {
+        Self::is_local_host(Self::host_of(&triage.url), Unresolved::TreatAsRemote)
     }
 
     /// The host part of a URL, with a bracketed IPv6 literal unwrapped.
@@ -281,7 +340,8 @@ impl Config {
     /// internet — and this check is the one thing standing between
     /// "the model runs here" and shipping disclosed evidence to a
     /// stranger.
-    fn is_local_host(host: &str) -> bool {
+    fn is_local_host(host: &str, unresolved: Unresolved) -> bool {
+        let unresolved = matches!(unresolved, Unresolved::TreatAsLocal);
         if host.is_empty() {
             return false;
         }
@@ -295,7 +355,7 @@ impl Config {
         if host.ends_with(".localhost") {
             return match Self::resolve(host) {
                 Some(addresses) => addresses.iter().all(Self::is_local_ip),
-                None => true,
+                None => unresolved,
             };
         }
         // A bare name with no dots is *usually* a compose service on
@@ -309,7 +369,7 @@ impl Config {
         if !host.contains('.') && !host.contains(':') {
             return match Self::resolve(host) {
                 Some(addresses) => addresses.iter().all(Self::is_local_ip),
-                None => true,
+                None => unresolved,
             };
         }
         // A dotted *literal* is judged by its octets.
@@ -417,6 +477,13 @@ Automated assessment (a model decides; a human reviews on appeal):
 mod tests {
     use super::*;
 
+    /// `TriageConfig::from_env` reads process-wide state, and the test
+    /// runner is threaded. Two tests setting `AUTHORITY_TRIAGE_*` at
+    /// once read each other's variables — one of them sees the other's
+    /// teardown and gets `Ok(None)`. Every test that touches those
+    /// variables takes this first.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// `starts_with("172.2")` matched `172.20.0.5`, which is private,
     /// and `172.2.3.4`, which is a routable address on the public
     /// internet. This check is the one thing standing between "the
@@ -434,7 +501,7 @@ mod tests {
             "http://172.31.255.254:8000/v1",
             "http://moderation-model:8000/v1",
         ] {
-            assert!(Config::is_local_host(Config::host_of(local)), "{local}");
+            assert!(Config::is_local_host(Config::host_of(local), Unresolved::TreatAsLocal), "{local}");
         }
 
         for remote in [
@@ -446,7 +513,7 @@ mod tests {
             "https://10.example.com/v1",
             "http://192.168.1.10.example.com/v1",
         ] {
-            assert!(!Config::is_local_host(Config::host_of(remote)), "{remote}");
+            assert!(!Config::is_local_host(Config::host_of(remote), Unresolved::TreatAsLocal), "{remote}");
         }
     }
 
@@ -455,10 +522,10 @@ mod tests {
     #[test]
     fn bracketed_ipv6_literals_survive_port_stripping() {
         assert_eq!(Config::host_of("http://[::1]:8000/v1/chat/completions"), "::1");
-        assert!(Config::is_local_host(Config::host_of("http://[::1]:8000/v1")));
+        assert!(Config::is_local_host(Config::host_of("http://[::1]:8000/v1"), Unresolved::TreatAsLocal));
         assert_eq!(Config::host_of("http://[2001:db8::1]:8000/v1"), "2001:db8::1");
         assert!(
-            !Config::is_local_host(Config::host_of("http://[2001:db8::1]:8000/v1")),
+            !Config::is_local_host(Config::host_of("http://[2001:db8::1]:8000/v1"), Unresolved::TreatAsLocal),
             "a routable IPv6 address is not this host"
         );
     }
@@ -477,10 +544,10 @@ mod tests {
         }
         // A dotted literal is still judged by its octets, with no
         // lookup at all.
-        assert!(Config::is_local_host("10.0.0.1"));
-        assert!(!Config::is_local_host("172.2.3.4"));
+        assert!(Config::is_local_host("10.0.0.1", Unresolved::TreatAsLocal));
+        assert!(!Config::is_local_host("172.2.3.4", Unresolved::TreatAsLocal));
         // And a name that resolves nowhere is not assumed local.
-        assert!(!Config::is_local_host("no-such-host.invalid"));
+        assert!(!Config::is_local_host("no-such-host.invalid", Unresolved::TreatAsLocal));
     }
 
     /// A profile whose band is inverted or collapsed has no state in
@@ -488,6 +555,7 @@ mod tests {
     /// to a person instead of to a verdict.
     #[test]
     fn a_custom_profile_needs_a_band_to_decline_in() {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir();
         let path = dir.join(format!("onym-profile-{}.json", std::process::id()));
         let body = |ban: f64, dismiss: f64| {
@@ -521,5 +589,108 @@ mod tests {
     fn the_host_is_taken_from_the_url_not_the_path() {
         assert_eq!(Config::host_of("http://example.com:8000/localhost"), "example.com");
         assert_eq!(Config::host_of("http://example.com/v1"), "example.com");
+    }
+
+    /// The digest a mandate consents to has to be one an operator can
+    /// actually produce. Hashing the whole file including its own
+    /// `profileDigest` was self-referential — writing the value in
+    /// changed the bytes it was computed from — so the documented
+    /// procedure could never yield a document that loaded, and the
+    /// only way through was to leave the field empty, which skipped
+    /// the check entirely.
+    #[test]
+    fn a_declared_profile_digest_can_be_constructed_and_is_checked() {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let document = |digest: &str| {
+            format!(
+                r#"{{"id":"house","displayName":"House","profileDigest":"{digest}",
+                    "policyDigest":"p","repository":"o/r","revision":"r","servedModel":"m",
+                    "supportsImages":false,"maxInputTokens":8192,"nativeTaxonomy":false,
+                    "prompt":{{"user":"{{document}}","usesCanonicalRule":true}},
+                    "adapter":{{"kind":"exactOutput","ban":"VIOLATION","dismiss":"CLEAR"}}}}"#
+            )
+        };
+
+        // Compute it the way the README says, then write it in.
+        let computed = profile_digest(document("").as_bytes()).unwrap();
+        // The README tells operators to run
+        //   jq -cSj 'del(.profileDigest)' profile.json | shasum -a 256
+        // against exactly this document. If the canonicalization here
+        // ever stops agreeing with that command, the instruction sends
+        // people to a value the service will reject.
+        assert_eq!(
+            computed, "cc15509fbc75bed206acb399efaae5e16f755870fef54718272711171fdd96e1",
+            "the documented jq command no longer reproduces this digest"
+        );
+        let declared = document(&computed);
+        assert_eq!(
+            profile_digest(declared.as_bytes()).unwrap(),
+            computed,
+            "inserting the digest must not change the bytes it names"
+        );
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("onym-digest-{}.json", std::process::id()));
+        std::fs::write(&path, &declared).unwrap();
+        std::env::set_var("AUTHORITY_TRIAGE_MODE", "advisory");
+        std::env::set_var("AUTHORITY_TRIAGE_PROFILE_PATH", path.to_str().unwrap());
+        std::env::remove_var("AUTHORITY_TRIAGE_PROFILE");
+
+        let loaded = TriageConfig::from_env().expect("a correctly declared digest must load");
+        assert_eq!(loaded.unwrap().profile.profile_digest, computed);
+
+        // And it is still a check, not a formality: a document whose
+        // execution bytes were edited after the digest was written no
+        // longer matches.
+        let tampered = declared.replace("\"CLEAR\"", "\"NOT A VIOLATION\"");
+        std::fs::write(&path, &tampered).unwrap();
+        let rejected = TriageConfig::from_env();
+        assert!(rejected.is_err(), "a rewritten profile must not load: {rejected:?}");
+
+        std::env::remove_var("AUTHORITY_TRIAGE_MODE");
+        std::env::remove_var("AUTHORITY_TRIAGE_PROFILE_PATH");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A name that does not resolve is accepted at boot — the model
+    /// container may have started second — and refused at first use.
+    /// The documentation states the off-host check unconditionally, so
+    /// the leniency has to be a deferral rather than a hole a typo'd
+    /// or not-yet-published name falls through.
+    #[test]
+    fn an_unresolvable_host_is_a_deferred_check_not_a_skipped_one() {
+        let triage = |url: &str| TriageConfig {
+            mode: TriageMode::Advisory,
+            url: url.to_string(),
+            api_key: None,
+            profile: profiles::by_id("qwen3guard-8b").unwrap(),
+            timeout_secs: 5,
+        };
+
+        // Boot lets it through…
+        let unresolvable = triage("http://not-a-real-sibling/v1/chat/completions");
+        assert!(!Config::triage_leaves_this_host(&unresolvable));
+        // …and the check that runs before evidence leaves does not.
+        assert!(!Config::triage_host_resolves_local(&unresolvable));
+
+        // A `.localhost` name is decided by resolution, not by its
+        // suffix — conventionally loopback is not the same as *being*
+        // loopback. Which way it goes depends on the resolver, so the
+        // assertion is that the two checks agree with the lookup rather
+        // than with the spelling.
+        let dotted = triage("http://nothing-here.localhost:8000/v1/chat/completions");
+        let resolves_local = Config::resolve("nothing-here.localhost")
+            .is_some_and(|addresses| addresses.iter().all(Config::is_local_ip));
+        assert_eq!(Config::triage_host_resolves_local(&dotted), resolves_local);
+
+        // A literal needs no lookup and passes both.
+        let literal = triage("http://127.0.0.1:8000/v1/chat/completions");
+        assert!(!Config::triage_leaves_this_host(&literal));
+        assert!(Config::triage_host_resolves_local(&literal));
+
+        // And a public address fails both.
+        let remote = triage("https://api.example.com/v1/chat/completions");
+        assert!(Config::triage_leaves_this_host(&remote));
+        assert!(!Config::triage_host_resolves_local(&remote));
     }
 }

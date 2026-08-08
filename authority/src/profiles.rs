@@ -533,6 +533,15 @@ impl ModelProfile {
 /// Everything a native taxonomy needs to read one output. Grouped so
 /// the grammar's parts stay together — each is a thing the published
 /// terms state, and a missing one is a way to be permissive.
+/// One labelled field, read out of an output. The three answers are
+/// distinct because two of them are failures and one of those used to
+/// be indistinguishable from "present and empty".
+enum Field {
+    One(String),
+    Missing,
+    Repeated,
+}
+
 struct Taxonomy<'a> {
     shape: &'a TaxonomyShape,
     unsafe_label: &'a str,
@@ -556,26 +565,59 @@ fn evaluate_taxonomy(output: &ModelOutput, taxonomy: &Taxonomy<'_>) -> Assessed 
     let text = output.text.trim();
     let (verdict, categories) = match shape {
         TaxonomyShape::LabelledFields { safety_field, categories_field } => {
-            let field = |name: &str| -> Option<String> {
+            let field = |name: &str| -> Field {
                 let prefix = format!("{name}:");
                 let mut found = text
                     .lines()
                     .filter_map(|line| line.trim().strip_prefix(&prefix))
                     .map(|v| v.trim().to_string());
-                let first = found.next()?;
+                let Some(first) = found.next() else { return Field::Missing };
                 // A repeated field is contradictory output, not a
                 // stronger signal.
                 if found.next().is_some() {
-                    return None;
+                    return Field::Repeated;
                 }
-                Some(first)
+                Field::One(first)
             };
-            let Some(verdict) = field(safety_field) else {
-                return Assessed::no_decision(format!(
-                    "no single {safety_field} field in the model's output"
-                ));
+            let verdict = match field(safety_field) {
+                Field::One(verdict) => verdict,
+                Field::Missing => {
+                    return Assessed::no_decision(format!(
+                        "no {safety_field} field in the model's output"
+                    ))
+                }
+                Field::Repeated => {
+                    return Assessed::no_decision(format!(
+                        "more than one {safety_field} field in the model's output; exactly one is \
+                         required"
+                    ))
+                }
             };
-            let categories = field(categories_field).unwrap_or_default();
+            // The categories field is required too, and its absence is
+            // not "no categories". Defaulting it to an empty string
+            // made a `Safety: Safe` with no `Categories:` line — or
+            // with two contradictory ones — read as a clean output and
+            // dismiss the case: malformed output failing open to an
+            // acquittal, which is the shape this profile's terms
+            // (missing, contradictory, extra or unmapped → no decision)
+            // exist to refuse. `None` is how this taxonomy spells "no
+            // categories", and it is spelled in the field.
+            let categories = match field(categories_field) {
+                Field::One(categories) => categories,
+                Field::Missing => {
+                    return Assessed::no_decision(format!(
+                        "no {categories_field} field in the model's output; an answer that omits \
+                         it is not this profile's documented shape, and an omitted field is not \
+                         an empty one"
+                    ))
+                }
+                Field::Repeated => {
+                    return Assessed::no_decision(format!(
+                        "more than one {categories_field} field in the model's output; exactly \
+                         one is required"
+                    ))
+                }
+            };
             (verdict, categories)
         }
         TaxonomyShape::LabelThenCodes => {
@@ -1276,6 +1318,51 @@ mod tests {
                 .evaluate("csam", &output("Safety: Safe\nCategories: Sexual Content or Sexual Acts"))
                 .outcome,
             Outcome::NoDecision
+        );
+    }
+
+    /// The published terms say a missing, contradictory, extra or
+    /// unmapped field means no decision. The categories field was the
+    /// one that did not hold to it: absent, it became an empty string,
+    /// and an empty category list beside `Safety: Safe` reads as clean
+    /// — so malformed output failed *open*, to a dismissal. Every
+    /// outage of the output format became an acquittal.
+    #[test]
+    fn a_malformed_categories_field_does_not_dismiss() {
+        let profile = qwen3guard_8b();
+
+        for malformed in [
+            // No categories line at all. `None` is how this taxonomy
+            // spells an empty list, and it is spelled in the field.
+            "Safety: Safe",
+            "Safety: Unsafe",
+            // Two of them, contradicting each other.
+            "Safety: Safe\nCategories: None\nCategories: Violent",
+            "Safety: Unsafe\nCategories: Violent\nCategories: None",
+            // And the same rule for the safety field itself.
+            "Categories: None",
+            "Safety: Safe\nSafety: Unsafe\nCategories: None",
+        ] {
+            let assessed = profile.evaluate("csam", &output(malformed));
+            assert_eq!(
+                assessed.outcome,
+                Outcome::NoDecision,
+                "{malformed:?} should reach no decision, got {} ({})",
+                assessed.outcome.as_str(),
+                assessed.note
+            );
+        }
+
+        // The documented shape still decides, both ways.
+        assert_eq!(
+            profile.evaluate("csam", &output("Safety: Safe\nCategories: None")).outcome,
+            Outcome::Dismiss
+        );
+        assert_eq!(
+            profile
+                .evaluate("csam", &output("Safety: Unsafe\nCategories: Sexual Content or Sexual Acts"))
+                .outcome,
+            Outcome::Ban
         );
     }
 
