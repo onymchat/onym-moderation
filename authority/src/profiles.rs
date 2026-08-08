@@ -1453,4 +1453,59 @@ mod tests {
 
 
 
+
+    /// The digests are the whole of the binding: a mandate consents to
+    /// a manifest naming a profile *by digest*, and a profile
+    /// incorporates the policy the same way. A constant here that no
+    /// longer matches the document it names does not fail loudly — it
+    /// quietly attests to bytes nobody has.
+    ///
+    /// Absence is a failure, not a skip. An earlier version of this
+    /// test returned early when the documents were missing, which is
+    /// exactly what happened on the branch it lived on: it passed
+    /// against a deliberately wrong digest. A test that cannot find
+    /// what it checks has not checked anything.
+    #[test]
+    fn every_pinned_digest_matches_the_document_it_names() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let policy_path = root.join("REFERENCE-AUTHORITY-POLICY.md");
+        let policy = std::fs::read(&policy_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", policy_path.display()));
+        assert_eq!(
+            crate::util::sha256_hex(&policy),
+            policy::REFERENCE_POLICY_SHA256,
+            "REFERENCE_POLICY_SHA256 does not match REFERENCE-AUTHORITY-POLICY.md"
+        );
+
+        for profile in builtin() {
+            let path = root.join("authorities").join(format!("{}.md", profile.id.to_uppercase()));
+            let document = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+            assert_eq!(
+                crate::util::sha256_hex(&document),
+                profile.profile_digest,
+                "{} pins a digest that is not {}",
+                profile.id,
+                path.display()
+            );
+            assert_eq!(
+                profile.policy_digest,
+                policy::REFERENCE_POLICY_SHA256,
+                "{} incorporates a different policy than this build pins",
+                profile.id
+            );
+
+            // And the published document states the policy digest it
+            // incorporates: the chain is sound only if the profile
+            // people read agrees with the code claiming to implement it.
+            let text = String::from_utf8_lossy(&document);
+            assert!(
+                text.contains(policy::REFERENCE_POLICY_SHA256),
+                "{} does not state the policy digest it incorporates",
+                path.display()
+            );
+        }
+    }
+
 }
