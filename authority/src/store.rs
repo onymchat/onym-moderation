@@ -52,9 +52,17 @@ pub struct Decision<'a> {
     pub expect_stage: &'a str,
     pub expect_disposition: Option<&'a str>,
     /// An appeal state to move in the same transaction, when this
-    /// decision *is* the answer to an appeal. Left `None` by the
-    /// deciders that have nothing to do with one.
+    /// decision *is* the answer to an appeal. Left `None` when the
+    /// decision says nothing about one.
     pub appeal_state: Option<&'a str>,
+    /// Likewise for a new-holder claim, which is a separate field
+    /// because it is a separate claim.
+    pub new_holder_state: Option<&'a str>,
+    /// One further event to record in the same transaction — the
+    /// review that produced this decision. Committed here rather than
+    /// appended afterwards, so the case log cannot end up describing a
+    /// review whose outcome never landed, or the reverse.
+    pub extra_event: Option<(&'a str, &'a str)>,
 }
 
 /// A verdict awaiting delivery, carrying the manifest bytes the case
@@ -100,6 +108,10 @@ pub struct CaseRecord {
     pub appeal_deadline: Option<String>,
     /// none | pending | upheld | reversed
     pub appeal_state: String,
+    /// none | pending | refused | granted. Independent of
+    /// `appeal_state`: a new-holder claim is a different claim, by a
+    /// different person, about a different question.
+    pub new_holder_state: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -210,7 +222,16 @@ impl Store {
                 -- none | pending | upheld | reversed. `pending` is the
                 -- moderator panel's queue: an appeal filed against a
                 -- verdict and not yet reviewed by a human.
-                appeal_state      TEXT NOT NULL DEFAULT 'none'
+                appeal_state      TEXT NOT NULL DEFAULT 'none',
+                -- none | pending | refused | granted. Tracked
+                -- separately from the appeal, because the two are
+                -- different claims by different people: the accused
+                -- says the verdict was wrong, a new holder says the
+                -- device changed hands. Sharing one slot let a claim
+                -- swallow a pending appeal — and let anyone who knows a
+                -- case id file a claim and lock the accused out of
+                -- appealing at all.
+                new_holder_state  TEXT NOT NULL DEFAULT 'none'
             );
             CREATE INDEX IF NOT EXISTS cases_by_stage ON cases (stage);
             -- At most one open case per (accused, class). Intake checks
@@ -252,6 +273,12 @@ impl Store {
                 recommendation TEXT NOT NULL,
                 applied        INTEGER NOT NULL DEFAULT 0,
                 assessed_at    TEXT NOT NULL,
+                -- The exact case document the model was shown. The
+                -- digest alone let the record say *that* something was
+                -- judged without letting anyone see *what* — and an
+                -- appeal reviewer applying the narrower canonical rule
+                -- needs the material, not a hash of it.
+                document       BLOB,
                 -- How many times this case has been put to the model.
                 -- A no-decision is retried, but not forever and not
                 -- every tick: a model that cannot read a case now is
@@ -321,7 +348,9 @@ impl Store {
             ("verdicts", "undeliverable", "INTEGER NOT NULL DEFAULT 0"),
             // The moderator panel's appeal queue.
             ("cases", "appeal_state", "TEXT NOT NULL DEFAULT 'none'"),
+            ("cases", "new_holder_state", "TEXT NOT NULL DEFAULT 'none'"),
             ("assessments", "attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("assessments", "document", "BLOB"),
         ] {
             Self::add_column(&conn, table, column, definition)?;
         }
@@ -689,8 +718,8 @@ impl Store {
             "INSERT OR REPLACE INTO cases
              (case_id, accused, reporter, class_id, mandate_ref, device_binding, stage,
               opened_at, response_deadline, decision_deadline, responded, disposition,
-              appeal_deadline, appeal_state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              appeal_deadline, appeal_state, new_holder_state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 case.case_id,
                 case.accused,
@@ -706,6 +735,7 @@ impl Store {
                 case.disposition,
                 case.appeal_deadline,
                 case.appeal_state,
+                case.new_holder_state,
             ],
         )?;
         Ok(())
@@ -716,6 +746,20 @@ impl Store {
     /// arriving or being reviewed changes what the panel shows without
     /// issuing a verdict. A reversal still goes through
     /// `commit_decision`; this only records the appeal's own progress.
+    /// Move a new-holder claim's state. Separate from the appeal's,
+    /// so neither can overwrite the other: they are different claims,
+    /// by different people, about different questions.
+    pub fn set_new_holder_state(
+        &self,
+        case_id: &str,
+        value: &str,
+        at: &str,
+        event_kind: &str,
+        event_detail: &str,
+    ) -> Result<(), Error> {
+        self.set_case_field("new_holder_state", case_id, value, at, event_kind, event_detail)
+    }
+
     pub fn set_appeal_state(
         &self,
         case_id: &str,
@@ -724,11 +768,23 @@ impl Store {
         event_kind: &str,
         event_detail: &str,
     ) -> Result<(), Error> {
+        self.set_case_field("appeal_state", case_id, appeal_state, at, event_kind, event_detail)
+    }
+
+    fn set_case_field(
+        &self,
+        column: &str,
+        case_id: &str,
+        value: &str,
+        at: &str,
+        event_kind: &str,
+        event_detail: &str,
+    ) -> Result<(), Error> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let changed = tx.execute(
-            "UPDATE cases SET appeal_state = ?2 WHERE case_id = ?1",
-            params![case_id, appeal_state],
+            &format!("UPDATE cases SET {column} = ?2 WHERE case_id = ?1"),
+            params![case_id, value],
         )?;
         if changed == 0 {
             return Err(Error::NotFound(format!("case {case_id}")));
@@ -780,8 +836,8 @@ impl Store {
             "INSERT INTO cases
              (case_id, accused, reporter, class_id, mandate_ref, device_binding, stage,
               opened_at, response_deadline, decision_deadline, responded, disposition,
-              appeal_deadline, appeal_state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              appeal_deadline, appeal_state, new_holder_state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 case.case_id,
                 case.accused,
@@ -797,6 +853,7 @@ impl Store {
                 case.disposition,
                 case.appeal_deadline,
                 case.appeal_state,
+                case.new_holder_state,
             ],
         ) {
             Ok(_) => {}
@@ -936,18 +993,20 @@ impl Store {
             disposition: row.get(11)?,
             appeal_deadline: row.get(12)?,
             appeal_state: row.get(13)?,
+            new_holder_state: row.get(14)?,
         })
     }
 
     const CASE_COLUMNS: &'static str = "case_id, accused, reporter, class_id, mandate_ref, \
          device_binding, stage, opened_at, response_deadline, decision_deadline, responded, \
-         disposition, appeal_deadline, appeal_state";
+         disposition, appeal_deadline, appeal_state, new_holder_state";
 
     /// The same list, qualified — `assessments` also has a `case_id`,
     /// so an unqualified join is ambiguous.
     const CASE_COLUMNS_C: &'static str = "c.case_id, c.accused, c.reporter, c.class_id, \
          c.mandate_ref, c.device_binding, c.stage, c.opened_at, c.response_deadline, \
-         c.decision_deadline, c.responded, c.disposition, c.appeal_deadline, c.appeal_state";
+         c.decision_deadline, c.responded, c.disposition, c.appeal_deadline, c.appeal_state, \
+         c.new_holder_state";
 
     pub fn case(&self, case_id: &str) -> Result<Option<CaseRecord>, Error> {
         let conn = self.conn.lock().unwrap();
@@ -1002,6 +1061,50 @@ impl Store {
     /// kind exist for the case. The count and insert share the store
     /// lock, so concurrent requests cannot all observe the same free
     /// slot and overflow the bound.
+    /// Record a new-holder claim: bound it, log it, and queue the case
+    /// for a human — all under one lock.
+    ///
+    /// Two findings meet here. The endpoint is unauthenticated, so a
+    /// count followed by a separate write lets a concurrent burst
+    /// overrun the cap. And the claim must be queued under its *own*
+    /// state: writing the appeal's would swallow a pending appeal, and
+    /// since anyone knowing a case id can file a claim, it would also
+    /// let a stranger lock the accused out of appealing at all.
+    ///
+    /// Only the first claim moves the state. Later ones are logged
+    /// against an already-queued case, so a reviewer sees all of them
+    /// without the queue flapping.
+    pub fn record_new_holder_claim(
+        &self,
+        case_id: &str,
+        at: &str,
+        detail: &str,
+        limit: usize,
+    ) -> Result<bool, Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM case_events WHERE case_id = ?1 AND kind = 'new_holder_claim'",
+            params![case_id],
+            |row| row.get(0),
+        )?;
+        if count >= limit as i64 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO case_events (case_id, at, kind, detail)
+             VALUES (?1, ?2, 'new_holder_claim', ?3)",
+            params![case_id, at, detail],
+        )?;
+        tx.execute(
+            "UPDATE cases SET new_holder_state = 'pending'
+              WHERE case_id = ?1 AND new_holder_state = 'none'",
+            params![case_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn append_event_bounded(
         &self,
         case_id: &str,
@@ -1071,7 +1174,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(&format!(
             "SELECT {} FROM cases
-              WHERE appeal_state IN ('pending', 'new-holder-pending')
+              WHERE appeal_state = 'pending' OR new_holder_state = 'pending'
               ORDER BY opened_at",
             Self::CASE_COLUMNS
         ))?;
@@ -1157,7 +1260,7 @@ impl Store {
             Self::CASE_COLUMNS_C
         ))?;
         let rows = statement.query_map(params![now], |row| {
-            Ok((Self::case_from_row(row)?, row.get(14)?, row.get(15)?))
+            Ok((Self::case_from_row(row)?, row.get(15)?, row.get(16)?))
         })?;
         let mut out = Vec::new();
         for row in rows {
@@ -1171,20 +1274,37 @@ impl Store {
         case_id: &str,
         raw: &[u8],
         recommendation: &str,
+        document: &str,
     ) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO assessments
-             (case_id, raw, recommendation, applied, assessed_at, attempts)
+             (case_id, raw, recommendation, applied, assessed_at, attempts, document)
              VALUES (?1, ?2, ?3,
                      COALESCE((SELECT applied FROM assessments WHERE case_id = ?1), 0),
                      ?4,
-                     COALESCE((SELECT attempts FROM assessments WHERE case_id = ?1), 0) + 1)",
+                     COALESCE((SELECT attempts FROM assessments WHERE case_id = ?1), 0) + 1,
+                     ?5)",
             params![case_id, raw, recommendation, crate::util::format_timestamp(
                 time::OffsetDateTime::now_utc()
-            )],
+            ), document],
         )?;
         Ok(())
+    }
+
+    /// The exact document the model was shown for this case, if one is
+    /// on file. What an appeal is actually about.
+    pub fn assessed_document(&self, case_id: &str) -> Result<Option<String>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let raw = conn
+            .query_row(
+                "SELECT document FROM assessments WHERE case_id = ?1",
+                params![case_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(raw)
     }
 
     /// The stored assessment and whether it has been acted on.
@@ -1259,6 +1379,8 @@ impl Store {
             expect_stage,
             expect_disposition,
             appeal_state,
+            new_holder_state,
+            extra_event,
         } = decision;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -1312,6 +1434,18 @@ impl Store {
             tx.execute(
                 "UPDATE cases SET appeal_state = ?2 WHERE case_id = ?1",
                 params![case.case_id, appeal_state],
+            )?;
+        }
+        if let Some(new_holder_state) = new_holder_state {
+            tx.execute(
+                "UPDATE cases SET new_holder_state = ?2 WHERE case_id = ?1",
+                params![case.case_id, new_holder_state],
+            )?;
+        }
+        if let Some((kind, detail)) = extra_event {
+            tx.execute(
+                "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
+                params![case.case_id, at, kind, detail],
             )?;
         }
         tx.commit()?;
@@ -1582,6 +1716,7 @@ mod tests {
             disposition: None,
             appeal_deadline: None,
             appeal_state: "none".into(),
+            new_holder_state: "none".into(),
         }
     }
 
@@ -1606,6 +1741,8 @@ mod tests {
                 expect_stage: "open",
                 expect_disposition: None,
                 appeal_state: None,
+                new_holder_state: None,
+                extra_event: None,
             })
             .unwrap();
     }
@@ -1770,6 +1907,7 @@ mod tests {
             disposition: None,
             appeal_deadline: None,
             appeal_state: "none".into(),
+            new_holder_state: "none".into(),
         };
         store.put_case(&case).unwrap();
 
@@ -1895,6 +2033,8 @@ mod tests {
             expect_stage: "open",
             expect_disposition: None,
             appeal_state: None,
+            new_holder_state: None,
+            extra_event: None,
         });
 
         assert!(matches!(second, Err(Error::CaseState(_))), "{second:?}");
@@ -1927,6 +2067,8 @@ mod tests {
             expect_stage: "decided",
             expect_disposition: Some("ban"),
             appeal_state: None,
+            new_holder_state: None,
+            extra_event: None,
         });
         assert!(matches!(result, Err(Error::CaseState(_))), "a dismissal is not a ban to reverse");
     }

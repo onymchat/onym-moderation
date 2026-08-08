@@ -4,6 +4,10 @@
   "seat": "moderation",
   "operator": "onym:key:0000000000000000000000000000000000000000000000000000000000000000",
   "moderationProfileId": "onym:moderation-profile:consent-bound-v1",
+  "modelProfile": {
+    "id": "qwen3guard-8b",
+    "digest": "9de986ce0e21d361c9bd049a10c6cce7833716cec9c53d1750fbcca24b7a7013"
+  },
   "violationClasses": [
     {
       "classId": "csam",

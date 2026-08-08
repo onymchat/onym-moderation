@@ -679,6 +679,7 @@ async fn open_case(
         disposition: None,
         appeal_deadline: None,
         appeal_state: "none".into(),
+        new_holder_state: "none".into(),
     };
     let issued = cases::open_case_verdict(
         &case,
@@ -870,13 +871,15 @@ async fn appeal(
         let actionable = case.as_ref().and_then(|c| c.disposition.as_deref()) == Some("ban");
         if actionable {
             let stamp = util::format_timestamp(OffsetDateTime::now_utc());
-            // Count and insert share one store lock. This endpoint is
-            // unauthenticated, so a check followed by a separate write
-            // would let a concurrent burst overrun the advertised cap.
-            let _ = state.store.append_event_bounded(
+            // Bounded, logged, and queued in one write. The count and
+            // the insert share a lock because this endpoint is
+            // unauthenticated and a concurrent burst would otherwise
+            // overrun the cap; the queue state is its own field
+            // because a claim is not an appeal, and writing the
+            // appeal's would let a stranger swallow the accused's.
+            let _ = state.store.record_new_holder_claim(
                 &case_id,
                 &stamp,
-                "new_holder_claim",
                 &submission.statement,
                 MAX_NEW_HOLDER_CLAIMS,
             )?;
@@ -1014,6 +1017,11 @@ async fn query_status(
     // confidentiality policy withholds. A party proves who they are by
     // signing the case id with the key that made them a party.
     authorize_case_party(&state, &case, &case_id, &headers)?;
+    let is_accused = headers
+        .get("x-onym-key")
+        .and_then(|value| value.to_str().ok())
+        == Some(case.accused.as_str())
+        || authorize_moderator(&state, &headers).is_ok();
 
     let events: Vec<Value> = state
         .store
@@ -1021,6 +1029,25 @@ async fn query_status(
         .into_iter()
         .map(|(at, kind, _detail)| json!({ "at": at, "kind": kind }))
         .collect();
+
+    // The accused is entitled to the record their case was decided on;
+    // a reporter is not — it contains the accused's own response.
+    let assessment = if is_accused {
+        match state.store.assessment(&case_id)? {
+            Some((raw, _)) => {
+                let mut value: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+                if let (Some(object), Ok(Some(document))) =
+                    (value.as_object_mut(), state.store.assessed_document(&case_id))
+                {
+                    object.insert("document".into(), Value::String(document));
+                }
+                value
+            }
+            None => Value::Null,
+        }
+    } else {
+        Value::Null
+    };
 
     Ok(Json(json!({
         "caseId": case.case_id,
@@ -1036,6 +1063,14 @@ async fn query_status(
         "responsesOnFile": state.store.responses(&case_id)?.len(),
         "disposition": case.disposition,
         "appealDeadline": case.appeal_deadline,
+        "appealState": case.appeal_state,
+        "newHolderState": case.new_holder_state,
+        // What decided the case, resolved rather than hashed. The
+        // verdict's `reasoning` is a content address of exactly this,
+        // and without a route that resolves it the promise that a
+        // verdict identifies the model, its revision, what it was
+        // shown and what it said is a promise nobody can check.
+        "assessment": assessment,
         "events": events,
     })))
 }
@@ -2254,6 +2289,7 @@ mod tests {
             disposition: None,
             appeal_deadline: None,
             appeal_state: "none".into(),
+            new_holder_state: "none".into(),
         };
         for report_id in ["r1", "r2", "r3"] {
             store
@@ -2764,13 +2800,143 @@ mod tests {
         let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), claim).await;
         assert_eq!(status, StatusCode::OK);
 
-        assert_eq!(
-            harness.state.store.case(&case_id).unwrap().unwrap().appeal_state,
-            "new-holder-pending",
-            "not 'pending' — it is not an appeal"
-        );
+        let case = harness.state.store.case(&case_id).unwrap().unwrap();
+        assert_eq!(case.new_holder_state, "pending");
+        assert_eq!(case.appeal_state, "none", "it is not an appeal, and must not occupy one");
         // It still reaches a human: both kinds are in the queue.
         assert_eq!(harness.state.store.cases_awaiting_appeal_review().unwrap().len(), 1);
+    }
+
+
+    /// A new-holder claim and an appeal are different claims, by
+    /// different people, about different questions. Sharing one field
+    /// let a claim swallow a pending appeal — and since the claim path
+    /// is unauthenticated, let anyone knowing a case id lock the
+    /// accused out of appealing at all.
+    #[tokio::test]
+    async fn a_new_holder_claim_neither_swallows_nor_blocks_an_appeal() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        // The accused appeals.
+        let appeal = signed(
+            json!({"caseId": case_id, "kind": "appeal", "statement": "it was a quotation"}),
+            "signature",
+            &[ACCUSED_SEED],
+        );
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A stranger files a new-holder claim on the same case.
+        let claim = serde_json::to_vec(&json!({
+            "caseId": case_id,
+            "kind": "new-holder-claim",
+            "statement": "I bought this device secondhand",
+        }))
+        .unwrap();
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), claim).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let case = harness.state.store.case(&case_id).unwrap().unwrap();
+        assert_eq!(case.appeal_state, "pending", "the appeal must survive the claim");
+        assert_eq!(case.new_holder_state, "pending", "and the claim is queued too");
+    }
+
+    /// The order that mattered more: a claim filed *first* must not
+    /// stop the accused appealing.
+    #[tokio::test]
+    async fn a_claim_filed_first_does_not_lock_out_the_appeal() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        let claim = serde_json::to_vec(&json!({
+            "caseId": case_id,
+            "kind": "new-holder-claim",
+            "statement": "I bought this device secondhand",
+        }))
+        .unwrap();
+        harness.post(&format!("/v1/cases/{case_id}/appeal"), claim).await;
+
+        let appeal = signed(
+            json!({"caseId": case_id, "kind": "appeal", "statement": "it was a quotation"}),
+            "signature",
+            &[ACCUSED_SEED],
+        );
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal).await;
+        assert_eq!(status, StatusCode::OK, "§12 relief must not be blockable by a stranger");
+        assert_eq!(
+            harness.state.store.case(&case_id).unwrap().unwrap().appeal_state,
+            "pending"
+        );
+    }
+
+    /// A reversal through the JSON API answers the appeal too — it left
+    /// the case in the panel's queue, where a moderator could then
+    /// "uphold" a verdict that had already been reversed.
+    #[tokio::test]
+    async fn a_reversal_through_the_api_resolves_the_appeal() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        let appeal = signed(
+            json!({"caseId": case_id, "kind": "appeal", "statement": "it was a quotation"}),
+            "signature",
+            &[ACCUSED_SEED],
+        );
+        harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal).await;
+
+        let (status, _) =
+            harness.decide(&case_id, json!({"disposition": "reverse", "reasoning": "hash:r"})).await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert_eq!(harness.state.store.case(&case_id).unwrap().unwrap().appeal_state, "reversed");
+        assert!(
+            harness.state.store.cases_awaiting_appeal_review().unwrap().is_empty(),
+            "an answered appeal leaves the queue whichever door the answer came through"
+        );
+    }
+
+    /// Reversing a ban nobody appealed is the authority correcting
+    /// itself, not an appeal outcome. Recording it as one puts a review
+    /// that never happened into the case log.
+    #[tokio::test]
+    async fn reversing_without_an_appeal_is_not_recorded_as_an_appeal_outcome() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        let (status, _) =
+            harness.decide(&case_id, json!({"disposition": "reverse", "reasoning": "hash:r"})).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let case = harness.state.store.case(&case_id).unwrap().unwrap();
+        assert_eq!(case.disposition.as_deref(), Some("reversed"));
+        assert_eq!(case.appeal_state, "none", "nobody appealed");
+        assert!(
+            !harness
+                .state
+                .store
+                .events(&case_id)
+                .unwrap()
+                .iter()
+                .any(|(_, kind, _)| kind == "appeal_reversed"),
+            "the log must not claim an appeal was reversed"
+        );
     }
 
 }

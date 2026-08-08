@@ -201,6 +201,7 @@ mod tests {
             disposition: None,
             appeal_deadline: None,
             appeal_state: "none".into(),
+            new_holder_state: "none".into(),
         }
     }
 

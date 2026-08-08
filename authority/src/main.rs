@@ -134,6 +134,37 @@ async fn main() {
             "triage enabled"
         );
 
+        // The published manifest is what users consent to. If it names
+        // a model profile, running a different one means deciding
+        // cases under terms nobody agreed to — so refuse to start
+        // rather than discover it in a case record.
+        match state.config.manifest.model_profile.as_ref() {
+            Some(declared)
+                if declared.id != triage.profile.id
+                    || declared.digest != triage.profile.profile_digest =>
+            {
+                eprintln!(
+                    "Configuration error: the manifest declares model profile {} ({}), but \
+                     AUTHORITY_TRIAGE_PROFILE selects {} ({}).\n\nWhich model decides a case is \
+                     consented policy and may not be replaced by a deployment. Run the profile \
+                     the manifest names, or publish a new manifest and take fresh mandates \
+                     against it.",
+                    declared.id,
+                    declared.digest,
+                    triage.profile.id,
+                    triage.profile.profile_digest
+                );
+                std::process::exit(1);
+            }
+            Some(_) => {}
+            None => tracing::warn!(
+                profile = %triage.profile.id,
+                "the published manifest declares no `modelProfile`, so nothing binds this \
+                 deployment's classifier to the terms users consented to. Add one — id and the \
+                 SHA-256 of the published profile document — and cases become checkable."
+            ),
+        }
+
         // A class the profile cannot decide is not fatal — those cases
         // wait for a human and dismiss at their deadline — but the
         // symptom is "the classifier has gone quiet", which is a bad

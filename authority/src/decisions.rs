@@ -78,23 +78,16 @@ pub async fn apply(
     decider: Decider,
     now: OffsetDateTime,
 ) -> Result<Issued, Error> {
-    apply_with_appeal_state(state, case_id, disposition, reasoning, decider, now, None).await
+    apply_inner(state, case_id, disposition, reasoning, decider, now).await
 }
 
-/// As `apply`, moving the case's appeal state in the same transaction.
-/// Used by the panel: a reversal on appeal and the record of that
-/// appeal having been reviewed are one fact, and committing them
-/// separately left the case reversed while its appeal still read
-/// `pending`.
-#[allow(clippy::too_many_arguments)]
-pub async fn apply_with_appeal_state(
+async fn apply_inner(
     state: &std::sync::Arc<AppState>,
     case_id: &str,
     disposition: Disposition,
     reasoning: &str,
     decider: Decider,
     now: OffsetDateTime,
-    appeal_state: Option<&str>,
 ) -> Result<Issued, Error> {
     let mut case = state
         .store
@@ -185,6 +178,30 @@ pub async fn apply_with_appeal_state(
     // authority's own error, so nobody's record moves for it.
     let credited: &[String] =
         if disposition == Disposition::Reverse { &[] } else { &reporters };
+
+    // A reversal answers whatever was pending, and only what was
+    // pending. Deciding this here rather than at the call site is what
+    // makes the JSON API and the panel agree: a reversal through
+    // `/decide` used to leave the appeal `pending` forever — the case
+    // stayed in the panel's queue, and a moderator could then "uphold"
+    // a verdict that had already been reversed. And a reversal of a
+    // ban nobody appealed was recorded as an appeal outcome, which is a
+    // review that did not happen.
+    let (appeal_state, new_holder_state, extra_event) = if disposition == Disposition::Reverse {
+        let appeal = (case.appeal_state == "pending").then_some("reversed");
+        let claim = (case.new_holder_state == "pending").then_some("granted");
+        let event = match (appeal, claim) {
+            (Some(_), _) => Some(("appeal_reversed", reasoning)),
+            (None, Some(_)) => Some(("new_holder_claim_granted", reasoning)),
+            // Reversing on the authority's own initiative, with nothing
+            // pending. Correcting an error is allowed; calling it an
+            // appeal outcome is not.
+            (None, None) => None,
+        };
+        (appeal, claim, event)
+    } else {
+        (None, None, None)
+    };
     state.store.commit_decision(&crate::store::Decision {
         case: &case,
         verdict_ref: &issued.verdict_ref,
@@ -201,6 +218,8 @@ pub async fn apply_with_appeal_state(
         expect_stage: if disposition == Disposition::Reverse { "decided" } else { "open" },
         expect_disposition: if disposition == Disposition::Reverse { Some("ban") } else { None },
         appeal_state,
+        new_holder_state,
+        extra_event,
     })?;
 
     // Detached: the verdict is committed, and the caller should not
@@ -311,6 +330,7 @@ mod tests {
             disposition: None,
             appeal_deadline: None,
             appeal_state: "none".into(),
+            new_holder_state: "none".into(),
         }
     }
 

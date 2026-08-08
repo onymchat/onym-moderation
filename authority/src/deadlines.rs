@@ -70,6 +70,8 @@ async fn sweep_overdue(
             expect_stage: "open",
             expect_disposition: None,
             appeal_state: None,
+            new_holder_state: None,
+            extra_event: None,
         });
         match committed {
             Ok(()) => {}
@@ -230,6 +232,7 @@ mod tests {
             disposition: None,
             appeal_deadline: None,
             appeal_state: "none".into(),
+            new_holder_state: "none".into(),
         }
     }
 

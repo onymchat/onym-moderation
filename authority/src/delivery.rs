@@ -250,6 +250,7 @@ mod tests {
             disposition: None,
             appeal_deadline: None,
             appeal_state: "none".into(),
+            new_holder_state: "none".into(),
         };
         store.put_case(&case).unwrap();
         let mut decided = case.clone();
@@ -268,6 +269,8 @@ mod tests {
                 expect_stage: "open",
                 expect_disposition: None,
                 appeal_state: None,
+                new_holder_state: None,
+                extra_event: None,
             })
             .unwrap();
     }

@@ -114,12 +114,19 @@ is a **startup failure**, not a warning. Case evidence is content a
 reporter disclosed for adjudication; a log line about having sent it to
 a third party arrives after the disclosure has happened.
 
-**A new-holder claim is queued as itself, not as an appeal.** It does
-not say the verdict was wrong — it says the device changed hands and
-the mark is now punishing someone the case was never about. Both reach
-a human, and the panel says which it is showing, because "appeal
-upheld" in the log of a case nobody appealed is a record of a review
-that did not happen.
+**A new-holder claim is tracked in its own field, not the appeal's.**
+It does not say the verdict was wrong — it says the device changed
+hands and the mark is punishing someone the case was never about. Both
+reach a human and the panel says which it is showing. They are separate
+fields because the path is unauthenticated: sharing one let a claim
+swallow a pending appeal, and let anyone knowing a case id lock the
+accused out of §12 relief entirely.
+
+A reversal answers whatever was pending, wherever it came from — the
+JSON API and the panel reach the same code, so a reversal cannot leave
+an appeal queued for a moderator to "uphold" afterwards. Reversing a
+ban nobody appealed is the authority correcting itself, and is recorded
+as that rather than as an appeal outcome.
 
 Whatever the mode, three things do not change:
 
@@ -189,6 +196,20 @@ is no code that knows about any particular model:
 Four adapter kinds cover the published profiles: `firstTokenScore`,
 `exactOutput`, `labelLine`, and `nativeTaxonomy`.
 
+### The manifest names the profile, and the case binds to it
+
+A manifest may declare `modelProfile` — the profile's id and the
+SHA-256 of its published document. When it does, two things follow: the
+service refuses to start under any other profile, and a case is only
+decided under the profile *its own consented manifest* names. Without
+that second check an operator could change an environment variable and
+have a live case decided by a different model, prompt or adapter than
+its accused agreed to, with the assessment recording the substitution
+after the fact as though it had always been the terms.
+
+A manifest that declares none gets a warning at boot: nothing binds
+that deployment's classifier to anything a user consented to.
+
 ### A profile is consented policy, not configuration
 
 There is no `AUTHORITY_TRIAGE_BAN_THRESHOLD`, and that absence is
@@ -242,8 +263,10 @@ to be judged under, and the outcome is no decision — never a ban.
 
 ## The model runs on this host
 
-`AUTHORITY_TRIAGE_URL` defaults to a sibling container, and the service
-logs an error at boot if it points anywhere else.
+`AUTHORITY_TRIAGE_URL` defaults to a sibling container, and with triage
+enabled the service **refuses to start** if it points anywhere else. A
+dotless name is resolved and its addresses checked, because a DNS
+search domain can point `moderation-model` at someone else's machine.
 
 Case evidence is content a recipient disclosed *for adjudication*.
 Sending it to a third party's API is a further disclosure — one the
@@ -294,8 +317,18 @@ evidence differs. This is not a claim that prompt injection is solved;
 the profiles say plainly that it is not. It removes the cheapest
 version.
 
-The document's SHA-256 goes on the assessment, so an appeal can
-establish exactly what the model saw. So do the profile digest, policy
+The document itself is kept, not only its digest — an appeal reviewer
+applying the narrower canonical rule cannot do it from a hash, and for
+the native-taxonomy profiles that review is the whole remedy. The panel
+renders it alongside the rule to apply, and `query-status` returns it
+to the accused, so the content address in a verdict's `reasoning` is
+something a party can actually resolve.
+
+Its SHA-256 goes on the assessment, and is re-checked after inference:
+a reading of a document that changed while the model held it — a late
+response, another report joining the case — decides nothing and the
+case is reassessed. Otherwise the response the accused filed would have
+had no bearing on the decision that banned them. So do the profile digest, policy
 digest, model revision, the raw final output, and how many evidence
 items and responses were in the document — "did it see my reply?" has a
 recorded answer rather than an inferred one. Private chain-of-thought

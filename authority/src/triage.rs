@@ -112,6 +112,38 @@ impl Triage {
             .ok_or_else(|| Error::Internal("triage is not configured".into()))?;
         let profile = &config.profile;
 
+        // The profile that decides a case is the one that case's
+        // manifest declares — not whatever this process was started
+        // with. Without this an operator could change an environment
+        // variable and have a live case, or an old mandate, decided by
+        // a different model, prompt or adapter than the accused agreed
+        // to, with the assessment recording the substitution after the
+        // fact as though it had always been the terms.
+        if let Some(declared) = consented_model_profile(state, case)? {
+            if declared.id != profile.id || declared.digest != profile.profile_digest {
+                let document = casedoc::build(&state.store, case)?;
+                return self.record(
+                    state,
+                    case,
+                    profile,
+                    "",
+                    &document,
+                    Assessed {
+                        outcome: Outcome::NoDecision,
+                        score: None,
+                        labels: Vec::new(),
+                        note: format!(
+                            "this case consented to model profile {} ({}), but the service is \
+                             configured with {} ({}); it will not be decided under terms its \
+                             accused never agreed to",
+                            declared.id, declared.digest, profile.id, profile.profile_digest
+                        ),
+                    },
+                    now,
+                );
+            }
+        }
+
         // A profile that cannot decide this class must not be asked
         // about it. Its answer could not be attributed to terms the
         // accused consented to, and a request made anyway would put
@@ -200,6 +232,33 @@ impl Triage {
                 return Err(e);
             }
         };
+        // The case is not frozen while the model reads it, and reading
+        // can take two minutes. A late response, or another report
+        // joining the case, changes the document — and an assessment of
+        // a record that no longer exists must not decide anything: the
+        // response the accused filed in the meantime would have had no
+        // bearing on the decision that banned them.
+        let current = casedoc::build(&state.store, case)?;
+        if current.digest != document.digest {
+            return self.record(
+                state,
+                case,
+                profile,
+                &output.text,
+                &current,
+                Assessed {
+                    outcome: Outcome::NoDecision,
+                    score: None,
+                    labels: Vec::new(),
+                    note: "the case record changed while the model was reading it; this reading \
+                           is of a document that no longer exists and the case will be \
+                           reassessed"
+                        .into(),
+                },
+                now,
+            );
+        }
+
         let assessed = profile.evaluate(&case.class_id, &output);
 
         self.record(state, case, profile, &output.text, &document, assessed, now)
@@ -236,7 +295,7 @@ impl Triage {
 
         let raw = serde_json::to_vec(&assessment)
             .map_err(|e| Error::Internal(format!("encode assessment: {e}")))?;
-        state.store.put_assessment(&case.case_id, &raw, &assessment.outcome)?;
+        state.store.put_assessment(&case.case_id, &raw, &assessment.outcome, &document.text)?;
         state.store.append_event_bounded(
             &case.case_id,
             &util::format_timestamp(now),
@@ -437,6 +496,25 @@ async fn apply_automated(
     }
 }
 
+/// The model profile the case's *consented* manifest declares, if it
+/// declares one. `None` means the manifest is silent — older manifests
+/// are, and the example one is — in which case nothing here can be
+/// bound and the assessment records what actually ran.
+fn consented_model_profile(
+    state: &AppState,
+    case: &CaseRecord,
+) -> Result<Option<crate::types::ModelProfileReference>, Error> {
+    let Some(mandate) = state.store.mandate(&case.mandate_ref)? else {
+        return Ok(state.config.manifest.model_profile.clone());
+    };
+    let Some(raw) = state.store.manifest_bytes(&mandate.manifest_hash)? else {
+        return Ok(state.config.manifest.model_profile.clone());
+    };
+    let manifest: crate::types::AuthorityManifest = serde_json::from_slice(&raw)
+        .map_err(|e| Error::Internal(format!("stored consented manifest unparseable: {e}")))?;
+    Ok(manifest.model_profile)
+}
+
 /// Whether a profile is safe to run against this manifest, checked at
 /// boot rather than at the first case.
 ///
@@ -545,6 +623,7 @@ mod tests {
             disposition: None,
             appeal_deadline: None,
             appeal_state: "none".into(),
+            new_holder_state: "none".into(),
         };
         let inside = util::parse_timestamp("2026-08-02T00:00:00Z").unwrap();
         let after = util::parse_timestamp("2026-08-05T00:00:00Z").unwrap();
@@ -604,6 +683,7 @@ mod tests {
             disposition: None,
             appeal_deadline: None,
             appeal_state: "none".into(),
+            new_holder_state: "none".into(),
         };
         store.put_case(&case).unwrap();
         let report = serde_json::json!({
@@ -847,6 +927,7 @@ mod tests {
             disposition: None,
             appeal_deadline: None,
             appeal_state: "none".into(),
+            new_holder_state: "none".into(),
         };
         store.put_case(&case).unwrap();
         let state = std::sync::Arc::new(AppState::for_tests_with_triage(
@@ -864,6 +945,170 @@ mod tests {
         assert_eq!(assessment.outcome, "no-decision");
         assert!(assessment.note.contains("no stored evidence"), "{}", assessment.note);
         assert_eq!(state.store.case("c1").unwrap().unwrap().stage, "open");
+    }
+
+
+    /// Inference can take two minutes, and the case is not frozen
+    /// while it runs. A late response changes the document, and
+    /// deciding on the old reading would mean the response the accused
+    /// filed had no bearing on the decision that banned them.
+    #[tokio::test]
+    async fn an_assessment_of_a_changed_case_is_not_applied() {
+        // A model that takes its time, so the record can change while
+        // it is reading.
+        let (url, _) = slow_stub_model(
+            serde_json::json!({
+                "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Sexual Content or Sexual Acts"}}]
+            }),
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        let case = open_case(&store, "unsolicited-pornography", "2026-08-04T00:00:00Z");
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        let assessing = {
+            let state = std::sync::Arc::clone(&state);
+            tokio::spawn(async move { assess_and_maybe_decide(&state, "c1", now).await })
+        };
+
+        // Mid-flight, the accused answers.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let reply = serde_json::json!({"caseId": "c1", "statement": "they asked me to"});
+        state
+            .store
+            .put_response(&case, &serde_json::to_vec(&reply).unwrap(), true,
+                          "2026-08-11T00:00:00Z", "response_late", "they asked me to")
+            .unwrap();
+        assessing.await.unwrap();
+
+        let after = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(after.stage, "open", "a reading of a document that changed must not decide");
+        assert!(after.disposition.is_none());
+        let (raw, _) = state.store.assessment("c1").unwrap().unwrap();
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(assessment.outcome, "no-decision");
+        assert!(assessment.note.contains("changed while the model was reading"), "{}", assessment.note);
+    }
+
+    /// A stub that holds the request open, so a test can change the
+    /// record while the "model" is reading it.
+    async fn slow_stub_model(
+        response: serde_json::Value,
+        delay: std::time::Duration,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use axum::routing::post;
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let recorder = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let recorder = recorder.clone();
+                let response = response.clone();
+                async move {
+                    recorder.lock().unwrap().push(body);
+                    tokio::time::sleep(delay).await;
+                    axum::Json(response)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/v1/chat/completions"), seen)
+    }
+
+    /// The profile that decides a case is the one that case's manifest
+    /// declares. Otherwise an operator changes an environment variable
+    /// and a live case is decided by a model its accused never agreed
+    /// to, with the assessment recording the substitution after the
+    /// fact as though it had always been the terms.
+    #[tokio::test]
+    async fn a_case_is_not_decided_under_a_profile_it_did_not_consent_to() {
+        let (url, seen) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Violent"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+
+        // The mandate consented to a manifest naming a different model.
+        let consented = crate::testing::MANIFEST_JSON.replace(
+            "\"moderationProfileId\"",
+            "\"modelProfile\": {\"id\": \"shieldgemma-9b\", \"digest\": \"deadbeef\"},\n  \"moderationProfileId\"",
+        );
+        store
+            .put_mandate(
+                &crate::store::MandateRecord {
+                    mandate_ref: "m1".into(),
+                    user_key: "onym:key:acc".into(),
+                    device_binding: "d1".into(),
+                    classes: vec!["credible-violence".into()],
+                    manifest_hash: util::sha256_hex(consented.as_bytes()),
+                },
+                b"{}",
+                consented.as_bytes(),
+                "2026-08-01T00:00:00Z",
+            )
+            .unwrap();
+
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        assert!(seen.lock().unwrap().is_empty(), "the model must not even be consulted");
+        let case = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(case.stage, "open");
+        let (raw, _) = state.store.assessment("c1").unwrap().unwrap();
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(assessment.outcome, "no-decision");
+        assert!(assessment.note.contains("never agreed to"), "{}", assessment.note);
+    }
+
+    /// The document the model read is kept, not just its digest. An
+    /// appeal reviewer applying the narrower canonical rule cannot do
+    /// it from a hash.
+    #[tokio::test]
+    async fn the_assessed_document_is_kept() {
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "Safety: Safe\nCategories: None"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let document = state.store.assessed_document("c1").unwrap().expect("kept");
+        assert!(document.contains("CLASS: credible-violence"));
+        assert!(document.contains("the material"));
+        let (raw, _) = state.store.assessment("c1").unwrap().unwrap();
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            assessment.input_digest,
+            util::sha256_hex(document.as_bytes()),
+            "the kept document must be the one the digest names"
+        );
     }
 
 }

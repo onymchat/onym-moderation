@@ -302,6 +302,33 @@ fn assessment_section(state: &AppState, case_id: &str) -> String {
         escape(assessment["rawOutput"].as_str().unwrap_or(""))
     ));
 
+    // And the document it read. For the native-taxonomy profiles the
+    // terms promise a human applies the *narrower* canonical rule on
+    // appeal — which cannot be done from a digest. The rule itself is
+    // rendered alongside it for the same reason.
+    match state.store.assessed_document(case_id) {
+        Ok(Some(document)) => {
+            out.push_str(&format!(
+                "<h3>The case document the model read</h3><pre class=mono>{}</pre>",
+                escape(&document)
+            ));
+        }
+        _ => out.push_str(
+            "<h3>The case document the model read</h3><p class=empty>Not on file — this \
+             assessment predates the document being stored.</p>",
+        ),
+    }
+
+    if let Some(rule) = assessment["classId"].as_str().and_then(crate::policy::rule_for_class) {
+        out.push_str(&format!(
+            "<h3>The canonical rule to apply</h3><pre class=mono>{}</pre>\
+             <p class=sub>Where the profile uses the model's own taxonomy, its terms promise \
+             that a human applies <em>this</em> rule on appeal, and reverses when its required \
+             elements are not proved.</p>",
+            escape(&rule.as_prompt_text())
+        ));
+    }
+
     out
 }
 
@@ -309,8 +336,9 @@ fn review_form(case: &CaseRecord) -> String {
     // Reversal is only meaningful against a ban; upholding is only
     // meaningful while something is pending.
     let can_reverse = case.disposition.as_deref() == Some("ban");
-    let new_holder = case.appeal_state == "new-holder-pending";
-    let appeal_pending = case.appeal_state == "pending" || new_holder;
+    let new_holder = case.new_holder_state == "pending";
+    let appeal_pending = case.appeal_state == "pending";
+    let anything_pending = appeal_pending || new_holder;
 
     let mut out = String::from("<h2>Review</h2>");
     if new_holder {
@@ -325,7 +353,7 @@ fn review_form(case: &CaseRecord) -> String {
              in force against hardware whose holder may have changed.</p>",
         );
     }
-    if !appeal_pending && !can_reverse {
+    if !anything_pending && !can_reverse {
         out.push_str(
             "<p class=empty>No appeal is pending and there is no ban to reverse, so there is \
              nothing for a reviewer to do here.</p>",
@@ -340,7 +368,7 @@ fn review_form(case: &CaseRecord) -> String {
          <input name=reasoning size=70 placeholder=\"sha256:… or https://…\" required></label><br>",
         id = escape(&case.case_id)
     ));
-    if appeal_pending {
+    if anything_pending {
         out.push_str(&format!(
             "<button name=outcome value=uphold class=secondary>{}</button> ",
             if new_holder { "Refuse the claim — marks stay" } else { "Uphold the verdict" }
@@ -390,7 +418,7 @@ async fn review(
         .store
         .case(&case_id)?
         .ok_or_else(|| Error::NotFound(format!("case {case_id}")))?;
-    let new_holder = case.appeal_state == "new-holder-pending";
+    let new_holder = case.new_holder_state == "pending";
     if form.outcome == "uphold" && case.appeal_state != "pending" && !new_holder {
         return Err(Error::CaseState(
             "there is no appeal or new-holder claim pending on this case to decide".into(),
@@ -405,23 +433,34 @@ async fn review(
             // The case log has to say which kind of review happened. A
             // device-changed-hands claim recorded as "appeal upheld"
             // is a record of a review nobody asked for.
-            let (state_after, event) = if new_holder {
-                ("new-holder-refused", "new_holder_claim_refused")
+            if new_holder {
+                state.store.set_new_holder_state(
+                    &case_id,
+                    "refused",
+                    &stamp,
+                    "new_holder_claim_refused",
+                    &form.reasoning,
+                )?;
             } else {
-                ("upheld", "appeal_upheld")
-            };
-            state.store.set_appeal_state(&case_id, state_after, &stamp, event, &form.reasoning)?;
+                state.store.set_appeal_state(
+                    &case_id,
+                    "upheld",
+                    &stamp,
+                    "appeal_upheld",
+                    &form.reasoning,
+                )?;
+            }
         }
         "reverse" => {
             // The reviewer saw the classifier's assessment on the way
             // here, so the decision is recorded as assisted rather than
             // as unaided human judgment.
-            // The reversal and the record of the review that produced
-            // it commit together. Separately, a failure between them
-            // left the case reversed while its appeal still read
-            // pending — back in the queue, with the review that
-            // decided it missing from the file.
-            decisions::apply_with_appeal_state(
+            // `apply` resolves whatever was pending and records the
+            // review in the same transaction — the panel does not get
+            // to decide what kind of review this was, because the JSON
+            // API reaches the same code and must reach the same
+            // answer.
+            decisions::apply(
                 &state,
                 &case_id,
                 Disposition::Reverse,
@@ -430,16 +469,8 @@ async fn review(
                 // form was submitted from, so the reviewer did see it.
                 Decider::HumanAssisted,
                 now,
-                Some(if new_holder { "new-holder-granted" } else { "reversed" }),
             )
             .await?;
-            state.store.append_event_bounded(
-                &case_id,
-                &stamp,
-                if new_holder { "new_holder_claim_granted" } else { "appeal_reversed" },
-                &form.reasoning,
-                32,
-            )?;
         }
         other => return Err(Error::BadRequest(format!("unknown outcome {other:?}"))),
     }
@@ -577,6 +608,14 @@ mod tests {
     }
 
     fn reviewable_case(disposition: Option<&str>, appeal_state: &str) -> CaseRecord {
+        reviewable_case_with(disposition, appeal_state, "none")
+    }
+
+    fn reviewable_case_with(
+        disposition: Option<&str>,
+        appeal_state: &str,
+        new_holder_state: &str,
+    ) -> CaseRecord {
         CaseRecord {
             case_id: "c1".into(),
             accused: "onym:key:acc".into(),
@@ -592,6 +631,7 @@ mod tests {
             disposition: disposition.map(str::to_string),
             appeal_deadline: None,
             appeal_state: appeal_state.into(),
+            new_holder_state: new_holder_state.into(),
         }
     }
 
@@ -659,7 +699,7 @@ mod tests {
     #[tokio::test]
     async fn a_new_holder_claim_is_refused_as_itself_not_as_an_appeal() {
         let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
-        state.store.put_case(&reviewable_case(Some("ban"), "new-holder-pending")).unwrap();
+        state.store.put_case(&reviewable_case_with(Some("ban"), "none", "pending")).unwrap();
 
         review(
             State(state.clone()),
@@ -670,7 +710,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(state.store.case("c1").unwrap().unwrap().appeal_state, "new-holder-refused");
+        let case = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(case.new_holder_state, "refused");
+        assert_eq!(case.appeal_state, "none", "no appeal was touched");
         let events = state.store.events("c1").unwrap();
         assert!(events.iter().any(|(_, kind, _)| kind == "new_holder_claim_refused"));
         assert!(

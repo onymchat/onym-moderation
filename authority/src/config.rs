@@ -242,10 +242,19 @@ impl Config {
         if host == "localhost" || host == "::1" || host.ends_with(".localhost") {
             return true;
         }
-        // A bare name with no dots is a compose service, resolved on
-        // the private network.
+        // A bare name with no dots is *usually* a compose service on
+        // the private network — but "usually" is not good enough for
+        // the check that decides whether disclosed evidence leaves the
+        // host. A DNS search domain can resolve `evil` to anywhere, so
+        // the name is resolved and its addresses are checked. If it
+        // cannot be resolved yet (the sibling container may not be up),
+        // a dotless name is accepted: refusing to boot because the
+        // model container started second would be its own failure.
         if !host.contains('.') && !host.contains(':') {
-            return true;
+            return match Self::resolve(host) {
+                Some(addresses) => addresses.iter().all(Self::is_local_ip),
+                None => true,
+            };
         }
         let Some(octets) = Self::ipv4_octets(host) else {
             return false;
@@ -256,6 +265,25 @@ impl Config {
             [192, 168, _, _] => true,
             [172, second, _, _] => (16..=31).contains(&second),
             _ => false,
+        }
+    }
+
+    /// Resolve a host to its addresses. `None` when it cannot be
+    /// resolved at all, which is a different answer from "resolves off
+    /// this host".
+    fn resolve(host: &str) -> Option<Vec<std::net::IpAddr>> {
+        use std::net::ToSocketAddrs;
+        let resolved: Vec<std::net::IpAddr> =
+            (host, 0u16).to_socket_addrs().ok()?.map(|address| address.ip()).collect();
+        (!resolved.is_empty()).then_some(resolved)
+    }
+
+    fn is_local_ip(address: &std::net::IpAddr) -> bool {
+        match address {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback() || v4.is_private() || v4.is_link_local()
+            }
+            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.segments()[0] & 0xfe00 == 0xfc00,
         }
     }
 

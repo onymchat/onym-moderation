@@ -152,6 +152,14 @@ pub enum Adapter {
         /// class id → the one native code that can support a ban for
         /// it.
         required_code: BTreeMap<String, String>,
+        /// Every code the profile's published terms document. When
+        /// non-empty, a code outside this set makes the output
+        /// unreadable rather than merely uninteresting: the terms say
+        /// an unknown or extra code is no decision, and accepting one
+        /// silently is the fail-open shape this adapter exists to
+        /// prevent.
+        #[serde(default)]
+        known_codes: Vec<String>,
     },
 }
 
@@ -350,6 +358,7 @@ impl ModelProfile {
                 undecided_labels,
                 empty_categories,
                 required_code,
+                known_codes,
             } => {
                 let Some(required) = required_code.get(class_id) else {
                     // Not a failure of the model — a failure of the
@@ -362,12 +371,15 @@ impl ModelProfile {
                 };
                 evaluate_taxonomy(
                     output,
-                    shape,
-                    unsafe_label,
-                    safe_label,
-                    undecided_labels,
-                    empty_categories.as_deref(),
-                    required,
+                    &Taxonomy {
+                        shape,
+                        unsafe_label,
+                        safe_label,
+                        undecided_labels,
+                        empty_categories: empty_categories.as_deref(),
+                        required,
+                        known_codes,
+                    },
                 )
             }
         }
@@ -513,15 +525,29 @@ impl ModelProfile {
     }
 }
 
-fn evaluate_taxonomy(
-    output: &ModelOutput,
-    shape: &TaxonomyShape,
-    unsafe_label: &str,
-    safe_label: &str,
-    undecided_labels: &[String],
-    empty_categories: Option<&str>,
-    required: &str,
-) -> Assessed {
+/// Everything a native taxonomy needs to read one output. Grouped so
+/// the grammar's parts stay together — each is a thing the published
+/// terms state, and a missing one is a way to be permissive.
+struct Taxonomy<'a> {
+    shape: &'a TaxonomyShape,
+    unsafe_label: &'a str,
+    safe_label: &'a str,
+    undecided_labels: &'a [String],
+    empty_categories: Option<&'a str>,
+    required: &'a str,
+    known_codes: &'a [String],
+}
+
+fn evaluate_taxonomy(output: &ModelOutput, taxonomy: &Taxonomy<'_>) -> Assessed {
+    let Taxonomy {
+        shape,
+        unsafe_label,
+        safe_label,
+        undecided_labels,
+        empty_categories,
+        required,
+        known_codes,
+    } = *taxonomy;
     let text = output.text.trim();
     let (verdict, categories) = match shape {
         TaxonomyShape::LabelledFields { safety_field, categories_field } => {
@@ -574,6 +600,27 @@ fn evaluate_taxonomy(
         };
     }
 
+    // Any code the published terms do not document makes the whole
+    // output unreadable. Ignoring the unknown ones and acting on the
+    // rest is the fail-open shape: `unsafe\nS4\nWHAT` would ban on the
+    // strength of a line nobody can interpret.
+    if !known_codes.is_empty() {
+        if let Some(unknown) =
+            codes.iter().find(|c| !known_codes.iter().any(|k| k.eq_ignore_ascii_case(c)))
+        {
+            return Assessed {
+                outcome: Outcome::NoDecision,
+                score: None,
+                labels: codes.clone(),
+                note: format!(
+                    "the model returned {:?}, which this profile's terms do not document; an \
+                     output containing a code nobody can interpret is not an answer",
+                    truncate(unknown)
+                ),
+            };
+        }
+    }
+
     if verdict.eq_ignore_ascii_case(unsafe_label) {
         // Only the code mapped to this class counts. A model flagging
         // some other category has said nothing about the class the
@@ -599,9 +646,13 @@ fn evaluate_taxonomy(
     }
 
     if verdict.eq_ignore_ascii_case(safe_label) {
+        // `None` here means "this profile documents no placeholder for
+        // an empty category list", which makes *any* code alongside a
+        // safe verdict contradictory — not, as it previously did, make
+        // every code acceptable. `safe\nS4` dismissed the case.
         let categories_clear = match empty_categories {
             Some(empty) => codes.is_empty() || codes.iter().all(|c| c.eq_ignore_ascii_case(empty)),
-            None => true,
+            None => codes.is_empty(),
         };
         return if categories_clear {
             Assessed {
@@ -807,6 +858,23 @@ fn qwen3guard_8b() -> ModelProfile {
                 "Violent",
                 "Sexual Content or Sexual Acts",
             ),
+            // Qwen3Guard's documented categories. Anything else is an
+            // output this profile cannot read.
+            known_codes: [
+                "None",
+                "Violent",
+                "Non-violent Illegal Acts",
+                "Sexual Content or Sexual Acts",
+                "PII",
+                "Suicide & Self-Harm",
+                "Unethical Acts",
+                "Politically Sensitive Topics",
+                "Copyright Violation",
+                "Jailbreak",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         },
     }
 }
@@ -881,6 +949,10 @@ fn llama_guard_4_12b() -> ModelProfile {
             undecided_labels: Vec::new(),
             empty_categories: None,
             required_code: native_codes("S4", "S1", "S12"),
+            // Llama Guard 4's documented hazard IDs. `unsafe` followed
+            // by anything else is not an answer this profile's terms
+            // describe.
+            known_codes: (1..=13).map(|n| format!("S{n}")).collect(),
         },
     }
 }
@@ -1331,4 +1403,52 @@ mod tests {
         }
         assert!(by_id("no-such-model").is_none());
     }
+
+    /// The fail-open shape this adapter exists to prevent, in both
+    /// directions. `safe` followed by a hazard code is contradictory
+    /// output, not a dismissal — the published terms accept exactly
+    /// `safe`. And an unsafe verdict carrying a code nobody documents
+    /// is not a ban just because the required code is also in there.
+    #[test]
+    fn contradictory_or_undocumented_codes_decide_nothing() {
+        let profile = llama_guard_4_12b();
+
+        // Was a dismissal: the safe branch accepted any codes at all.
+        assert_eq!(
+            profile.evaluate("csam", &output("safe\nS4")).outcome,
+            Outcome::NoDecision,
+            "safe with a hazard code is contradictory, not clean"
+        );
+        assert_eq!(profile.evaluate("csam", &output("safe")).outcome, Outcome::Dismiss);
+
+        // Was a ban: unknown codes were ignored as long as the
+        // required one appeared.
+        assert_eq!(
+            profile.evaluate("csam", &output("unsafe\nS4\nUNKNOWN")).outcome,
+            Outcome::NoDecision,
+            "an output containing a code nobody can interpret is not an answer"
+        );
+        assert_eq!(profile.evaluate("csam", &output("unsafe\nS4")).outcome, Outcome::Ban);
+        // Several documented codes are fine, as long as they are all
+        // documented and the required one is present.
+        assert_eq!(profile.evaluate("csam", &output("unsafe\nS4\nS12")).outcome, Outcome::Ban);
+    }
+
+    #[test]
+    fn the_labelled_field_taxonomy_rejects_undocumented_categories_too() {
+        let profile = qwen3guard_8b();
+        assert_eq!(
+            profile
+                .evaluate("csam", &output("Safety: Unsafe\nCategories: Nonsense Category"))
+                .outcome,
+            Outcome::NoDecision
+        );
+        assert_eq!(
+            profile
+                .evaluate("csam", &output("Safety: Unsafe\nCategories: Sexual Content or Sexual Acts"))
+                .outcome,
+            Outcome::Ban
+        );
+    }
+
 }
