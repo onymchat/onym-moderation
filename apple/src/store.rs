@@ -336,16 +336,28 @@ impl Store {
             let stored_signing_bytes = crate::canonical::verdict_signing_bytes(&raw)?;
             let incoming_signing_bytes =
                 crate::canonical::verdict_signing_bytes(&verdict.raw)?;
-            if stored_signing_bytes == incoming_signing_bytes {
-                // The signature envelope may legitimately differ while
-                // the signed decision — and verdictRef — is identical.
-                // Preserve execution, supersession, and receipt order.
-                return Ok(());
+            // `verdict_ref` is `sha256(verdict_signing_bytes)`, derived
+            // here rather than taken from the submission (`api.rs`), so
+            // a stored row sharing this ref shares these bytes by
+            // construction — the mismatch arm below cannot fire without
+            // a SHA-256 collision. It stays as an assertion of that
+            // invariant, and its message now says so instead of
+            // implying a check that does real work. If the ref ever
+            // stops being derived from the signed bytes, this is the
+            // line that should fail rather than a row being silently
+            // accepted under someone else's reference.
+            if stored_signing_bytes != incoming_signing_bytes {
+                return Err(Error::Internal(format!(
+                    "verdictRef {:?} is on file with different signing bytes. The reference is \
+                     the SHA-256 of those bytes, so this is either a hash collision or the \
+                     derivation has changed and references are no longer content-addressed.",
+                    verdict.verdict_ref
+                )));
             }
-            return Err(Error::VerdictInvalid(format!(
-                "verdictRef {:?} is already on file with different contents",
-                verdict.verdict_ref
-            )));
+            // The signature envelope may legitimately differ while the
+            // signed decision — and verdictRef — is identical. Preserve
+            // execution, supersession, and receipt order.
+            return Ok(());
         }
         conn.execute(
             "INSERT INTO verdicts

@@ -19,10 +19,33 @@ use crate::util;
 /// re-attempted every stuck verdict, inflating their counts. The sweep
 /// remains the reliable path; this only lets a fresh verdict leave
 /// promptly when the interface is healthy.
+///
+/// **Single-flight.** Spawning one of these per report and per decision
+/// moved the problem rather than solving it: with a slow interface the
+/// tasks overlap, each drains the same backlog, and the same verdicts
+/// are re-POSTed by several flushes at once — inflating `attempts`,
+/// which is the number the refusal budget and the operator both read.
+/// Only one background flush runs at a time; a call arriving while one
+/// is in flight is dropped rather than queued, because the flush
+/// already in progress will reach anything newly enqueued, and the
+/// sweep covers whatever it misses.
 pub fn flush_soon(state: &std::sync::Arc<crate::state::AppState>) {
+    use std::sync::atomic::Ordering;
+
+    if state.delivery.flush_in_flight.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
     let state = std::sync::Arc::clone(state);
     tokio::spawn(async move {
-        if let Err(e) = state.delivery.flush(&state.store).await {
+        let result = state.delivery.flush(&state.store).await;
+        // Cleared before the log line and on every path: a flush that
+        // panicked or errored while holding this would silence
+        // `flush_soon` for the life of the process, and the symptom —
+        // verdicts leaving only on the sweep's clock — looks like a
+        // slow interface rather than a stuck flag.
+        state.delivery.flush_in_flight.store(false, Ordering::Release);
+        if let Err(e) = result {
             tracing::warn!(error = %e, "background verdict delivery failed; the sweep will retry");
         }
     });
@@ -68,6 +91,10 @@ pub struct Delivery {
     /// when those exact bytes still hash to the mandate's reference.
     published_manifest: String,
     published_manifest_hash: String,
+    /// Whether a `flush_soon` task is already draining the backlog.
+    /// The sweep's own `flush` is deliberately not gated by this — it
+    /// is the reliable path and must run on its own clock.
+    pub flush_in_flight: std::sync::atomic::AtomicBool,
 }
 
 impl Delivery {
@@ -81,6 +108,7 @@ impl Delivery {
             token,
             published_manifest: util::base64_encode(manifest_raw),
             published_manifest_hash: util::sha256_hex(manifest_raw),
+            flush_in_flight: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

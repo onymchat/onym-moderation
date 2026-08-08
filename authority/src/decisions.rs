@@ -412,14 +412,39 @@ fn consented_manifest(
 /// it — the caller most likely to reach a verdict while delivery is
 /// still queued.
 fn require_notice_delivered(state: &AppState, case_id: &str) -> Result<(), Error> {
-    if !state.store.open_case_verdict_delivered(case_id)? {
-        return Err(Error::CaseState(
-            "the opening verdict has not reached the interface; banning before notice would run \
-             the response window silently"
-                .into(),
-        ));
+    if state.store.open_case_verdict_delivered(case_id)? {
+        return Ok(());
     }
-    Ok(())
+
+    // Which notice, and whether waiting will help. A refusal on shape
+    // marks the verdict `undeliverable` and leaves `delivered = 0`
+    // permanently, so this guard then refuses every ban on the case for
+    // the rest of its life. That is the safe direction and it is not a
+    // reason to be unhelpful about it: a moderator reading "the opening
+    // verdict has not reached the interface" on a case that will never
+    // clear has no way to tell a queue from a dead end.
+    let stuck = state.store.undelivered_case_notices(case_id)?;
+    let given_up: Vec<&str> =
+        stuck.iter().filter(|(_, undeliverable)| *undeliverable).map(|(r, _)| r.as_str()).collect();
+
+    if given_up.is_empty() {
+        let waiting: Vec<&str> = stuck.iter().map(|(r, _)| r.as_str()).collect();
+        return Err(Error::CaseState(format!(
+            "the opening verdict has not reached the interface; banning before notice would run \
+             the response window silently. Still queued: {}",
+            if waiting.is_empty() { "no notice has been issued for this case".into() }
+            else { waiting.join(", ") }
+        )));
+    }
+
+    Err(Error::CaseState(format!(
+        "this case cannot be banned: notice {} was refused by the interface and has been given \
+         up on, so the accused has never been served with it. Banning would run the response \
+         window silently. Repair the interface and requeue it with POST \
+         /v1/verdicts/{}/requeue — it will not retry on its own.",
+        given_up.join(", "),
+        given_up[0]
+    )))
 }
 
 /// Once the decision deadline passes the case is dismissed by default

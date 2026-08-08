@@ -1841,6 +1841,36 @@ impl Store {
         Ok(total > 0 && total == delivered)
     }
 
+    /// The case's notices that have not reached the interface, and
+    /// whether each has been given up on.
+    ///
+    /// `open_case_verdict_delivered` answers yes-or-no, which is the
+    /// right guard and a useless diagnosis. A notice the interface
+    /// refuses on shape is marked `undeliverable` and keeps
+    /// `delivered = 0` forever, so the guard refuses every ban on that
+    /// case for the rest of its life while the error said only that
+    /// "the opening verdict has not reached the interface" — true, and
+    /// no help at all in finding the one ref that is stuck or knowing
+    /// that `/v1/verdicts/:ref/requeue` is the way out.
+    pub fn undelivered_case_notices(
+        &self,
+        case_id: &str,
+    ) -> Result<Vec<(String, bool)>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT verdict_ref, undeliverable FROM verdicts
+              WHERE case_id = ?1 AND disposition = 'open-case' AND delivered = 0
+              ORDER BY issued_at, verdict_ref",
+        )?;
+        let rows = statement
+            .query_map(params![case_id], |row| Ok((row.get(0)?, row.get::<_, i32>(1)? != 0)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Record a failed delivery. `refused` distinguishes the interface
     /// rejecting the verdict itself from it being unreachable, and only
     /// refusals are counted toward giving up: an interface down for
