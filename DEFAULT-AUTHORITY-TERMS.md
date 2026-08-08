@@ -12,10 +12,10 @@ and follow only the procedure stated below. Your signed mandate records the
 exact hash of these terms. A later version does not change your mandate without
 fresh review and consent.
 
-> **Important:** Mistral Moderation performs first-pass triage of eligible text
-> that a reporter voluntarily submits. This means disclosed report text is sent
-> to Mistral AI. Mistral does not decide cases or bans. A classifier score is
-> neither proof nor a verdict.
+> **Important:** the first decision is automated. A locally hosted Mistral
+> Moderation model scores the text a reporter voluntarily submits. A mapped
+> score of `0.90` or higher causes the Authority to issue a ban without prior
+> human review. A human reviews the merits only if the user appeals.
 
 ## 1. What you are agreeing to
 
@@ -24,11 +24,13 @@ You authorize the Default Onym Moderation Authority to:
 1. receive reports from users who selected the same Authority;
 2. verify that reported material was voluntarily disclosed by a recipient and
    carries evidence that binds it to the accused identity;
-3. use Mistral Moderation to prioritize and route eligible disclosed text;
-4. open a case only within a violation class listed in §2;
-5. give the accused notice and the stated response window;
-6. make a reasoned human decision before the decision deadline; and
-7. sign a verdict that the Onym interface validates and enforces mechanically.
+3. open a case only within a violation class listed in §2;
+4. use Mistral Moderation to make the initial decision from the disclosed text;
+5. give the accused notice and the stated response window before an automated
+   ban takes effect;
+6. automatically sign a dismissal or ban verdict when the score rules in §4
+   decide the case; and
+7. provide human review if the accused or a device's new holder appeals.
 
 This authority applies only to the Onym interface and device covered by your
 mandate. It is not a protocol-wide ban and does not prevent use of compatible
@@ -48,10 +50,21 @@ The Authority may open and decide a case only under one of these classes:
 | Credible violence (`credible-violence`) | A specific threat, incitement, or operational instruction for physical violence where the words and available context make harm reasonably credible. News, documentary, fictional, defensive, or good-faith safety discussion is not a violation merely because it describes violence. | 7 days | 14 days | 365 days | 30 days; non-suspensive |
 | Unsolicited pornography (`unsolicited-pornography`) | Intentionally sending explicit sexual material to a person who did not consent to receive it. Consensual exchanges and non-explicit educational, medical, or safety material are not violations. | 7 days | 14 days | 90 days | 30 days; suspensive |
 
-The definition in this document controls. A Mistral category with a similar
-name is only a triage signal and cannot broaden a class. In particular,
-Mistral's broader `sexual`, `violence_and_threats`, `dangerous`, or `criminal`
-categories do not automatically establish any Onym violation.
+The initial automated decision uses these mappings:
+
+| Onym class | Mistral categories whose scores count |
+|---|---|
+| `csam` | `sexual`, `sexual/minors` |
+| `credible-violence` | `violence_and_threats`, `dangerous_and_criminal_content` |
+| `unsolicited-pornography` | `sexual` |
+
+The highest mapped score across all disclosed items is the case score. These
+mappings are broader than the definitions above. For example, Mistral's
+`sexual` category does not by itself establish that a person is under 18 or
+that explicit material was unsolicited. Nevertheless, under these terms a
+mapped score at or above the ban threshold controls the first decision. The
+definition, context, intent, consent, and any mismatch in the mapping are
+considered by a human only on appeal.
 
 A permanent sanction is valid only with a separate appellate authority named
 in the manifest. If no living forum can hear an appeal or new-holder claim, the
@@ -73,120 +86,131 @@ Reports are free. Reporters receive no bounty and the Authority is not paid
 more for opening a case or issuing a ban. A reporter's history of upheld and
 dismissed reports may affect review priority, but never substitutes for proof.
 
-## 4. Mistral Moderation triage
+## 4. Automated decision by Mistral Moderation
 
-### 4.1 What Mistral does
+### 4.1 Model and score rules
 
-The Authority uses Mistral AI's text moderation service,
-`mistral-moderation-2603`, as a first-pass classifier. Mistral documents that
-the service returns category scores and classifications across categories such
-as sexual content, hate and discrimination, violence and threats, dangerous
-content, criminal content, self-harm, and personally identifying information.
+The Authority runs Mistral's `mistral-moderation-2603` model on infrastructure
+controlled by the Authority. The model evaluates the voluntarily disclosed
+text in the reports joined to a case and returns category scores between zero
+and one. The Authority stores the complete assessment, including the model,
+every returned category and score, the mapped categories, the deciding score,
+and the time of assessment.
 
-For each eligible report, the Authority may use the returned scores and
-Mistral's default policy thresholds to:
+The first decision is mechanical:
 
-- prioritize urgent material;
-- route a report to a reviewer with the relevant training;
-- identify material requiring careful privacy handling; or
-- identify reports that need manual triage because the model is uncertain or
-  the Onym class does not map cleanly to a Mistral category.
+- score **at or above `0.90`** → automated ban recommendation;
+- score **at or below `0.20`** → automated dismissal; and
+- score **between `0.20` and `0.90`** → no model decision. The case remains
+  open and is dismissed automatically if the decision deadline arrives.
 
-The Authority records the model identifier and triage result used for the
-report. Mistral states that its default thresholds are based on its internal
-test set and that moderation models and scores may change. Scores are therefore
-not stable facts about a person.
+Both thresholds are inclusive. The score is the highest score from the mapped
+categories in §2 across all disclosed report items. If the class has no mapped
+category, the model cannot ban under that class.
 
-### 4.2 What Mistral does not do
+The Mistral result determines the first-instance disposition. The Authority's
+software converts it into a signed Onym verdict and sends that verdict to the
+interface. Mistral itself does not hold the Authority signing key and cannot
+write a device mark, but in ordinary terms **Mistral decides the initial ban**.
 
-Mistral does not:
+### 4.2 No human review before the initial verdict
 
-- verify who authored the reported material;
-- decide whether Onym's narrower class definition is satisfied;
-- open a case or set a device mark;
-- determine credibility, intent, consent, context, defenses, or sanctions;
-- decide an appeal; or
-- receive access to conversations that nobody reported.
+No moderator checks the report, model mapping, score, context, response, or
+class fit before the automated first decision. The non-model checks before a
+case opens are mechanical: signatures, mandates, class membership, and
+authenticity proof.
 
-A high score creates no presumption against the accused. A low score is not a
-safe harbor. No ban may be based only on a Mistral result.
+The accused may submit a response during the response window. It becomes part
+of the case record available on appeal, but it is not reviewed by a human
+before the initial automated verdict. A pending ban cannot execute before the
+response window closes. The model may dismiss immediately because dismissal is
+not a sanction.
 
-### 4.3 Errors and availability
+The first human merits review occurs only after an ordinary appeal or
+new-holder claim. The reviewer sees the disclosed evidence, response,
+assessment, category mapping, scores, and original automated verdict.
+
+### 4.3 Known limits and failure behavior
 
 Automated moderation can produce false positives and false negatives,
 especially with quotation, reclaimed language, slang, satire, multilingual
-content, or missing context. A Mistral outage or error does not count against a
-reporter or accused. The Authority queues the report for manual triage or
-declines intake without opening a case; it does not treat an error as proof of
-a violation.
+content, missing context, age, consent, or intent. The overlap in §2 can also
+make a broad Mistral category a poor match for the narrower Onym class. Agreeing
+to these terms means accepting that risk at the first decision, subject to the
+human appeal right.
 
-If the Authority changes the moderation provider, model family, or the role
-automation plays in a case, the change must be disclosed in new terms and may
-bind new mandates only after review and consent. If the named Mistral model is
-unavailable for an existing mandate, the Authority may use human triage; it may
-not silently replace it with another automated decision-maker.
+An invalid response from the model is an error, not a zero score. If the model
+is unavailable or returns no recognizable scores, the case remains open and is
+retried. If no valid automated decision lands by the decision deadline, the
+case is dismissed. Model failure never becomes a ban and does not route the
+case to pre-verdict human review.
 
-## 5. What is sent to Mistral
+Mistral states that moderation models and category scores can change. This
+Authority pins the named model and thresholds for these terms. Changing the
+model, thresholds, category mapping, or role of automation requires new terms
+and applies only to mandates signed after fresh review and consent.
 
-Only text that a reporter deliberately includes in a report, plus the minimum
-textual context needed to classify it, is eligible for Mistral triage. Before
-submission, the Authority removes Onym identity keys, device bindings,
-signatures, report and case identifiers, and reporter identity unless those
-details are inseparable from the disclosed text itself.
+Mistral's category documentation is available at [Moderation &
+Guardrailing](https://docs.mistral.ai/en/studio-api/conversations/moderation).
+The documentation describes the model taxonomy; it does not expand the
+Authority's signed mandate.
 
-Images, video, audio, cryptographic proofs, and device data are not submitted
-to Mistral Moderation under these terms. Material that cannot safely or
-lawfully be sent to a general text-classification service—including suspected
-child sexual abuse media—is routed directly to the trained human and lawful
-reporting process.
+## 5. Where classification runs
 
-Mistral AI is therefore a third-party processor of the eligible text. Mistral's
-current documentation says API data is not used for model training and offers
-a zero-data-retention control. The Default Authority must keep training use
-disabled and zero data retention enabled for moderation requests. If those
-controls are unavailable, it must stop sending report text to Mistral and use
-manual triage until the disclosed configuration is restored.
+The Mistral model runs on the Authority's own host. Eligible report text is
+sent from the Authority case service to that local model endpoint; it is not
+sent to Mistral AI's hosted API under these terms. Mistral AI supplies the model
+technology but is not a recipient or case reviewer in this deployment.
 
-Mistral's current documentation is available at:
+Only text a reporter deliberately includes in a report is classified. Images,
+video, audio, cryptographic proofs, identity keys, device bindings, signatures,
+and device data are not model inputs. Suspected child sexual abuse media is
+handled through the Authority's lawful reporting process; the local text model
+does not inspect the media itself.
 
-- [Moderation & Guardrailing](https://docs.mistral.ai/en/studio-api/conversations/moderation)
-- [Privacy and data controls](https://docs.mistral.ai/admin/monitor-comply/privacy-data-controls)
-
-These links explain Mistral's service; they do not let Mistral expand this
-Authority's jurisdiction.
+Moving classification to a third-party API would be a new disclosure and a
+material change to these terms. The Authority may not do that for an existing
+mandate without fresh consent.
 
 ## 6. Case procedure
 
 1. **Jurisdiction and authenticity.** The Authority verifies both parties'
    mandates, the claimed class, the report signature, and the evidence's
    authorship proof before treating the material as evidence.
-2. **Triage.** Eligible text is minimized and sent to Mistral as described in
-   §§4–5. A trained reviewer sees the triage result and the record.
-3. **Human intake.** A person decides whether the report is within the class
-   and sufficient to open a case. A receipt for a report is not notice that a
-   case opened.
-4. **Notice.** If a case opens, the interface shows the accused the class,
+2. **Case opening.** A conforming report opens a case mechanically. A receipt
+   for a report alone is not notice that a case opened.
+3. **Automated assessment.** The locally hosted Mistral model scores the
+   reporter-disclosed text under the category mapping and thresholds in §§2
+   and 4. No human pre-screens the case.
+4. **Notice.** When the case opens, the interface shows the accused the class,
    intake basis, evidence available under the confidentiality rules, response
    deadline, and decision deadline. The procedural `case-open` mark does not
    reduce service.
 5. **Response.** The accused may submit a signed statement and counter-evidence
-   throughout the response window. Not responding is not a confession.
-6. **Decision.** A human reviewer decides against the exact class definition
-   in §2 and gives signed reasoning. No ban may issue before the response
-   window closes or after the decision deadline.
+   throughout the response window. No human reviews it unless an appeal is
+   filed. Not responding is not a confession.
+6. **Automated decision.** A score at or above `0.90` produces a signed ban
+   verdict after the response window; a score at or below `0.20` produces a
+   signed dismissal. The verdict reasoning identifies the stored assessment
+   whose model output caused the decision.
 7. **Default.** If the Authority does not decide by the deadline, the case is
    dismissed and the `case-open` mark clears.
 
 ## 7. Appeals and a device's new holder
 
-An accused user may appeal within the period in §2. A successful appeal results
-in a new signed reversal verdict; the original verdict is not edited.
+An accused user may appeal within the period in §2. Appeal is the first time a
+human reviews the merits. The reviewer must consider the exact Onym class—not
+merely the mapped Mistral category—together with authorship proof, full
+disclosed context, the user's response and counter-evidence, the complete model
+assessment, and any claimed model or mapping error. The reviewer gives written
+reasoning and either upholds the automated ban or issues a new signed reversal
+verdict. The original verdict is not edited.
 
 A person who acquired a marked device from somebody else may make a
 challenge-bound new-holder claim without possessing the former holder's
 identity key. The interface must provide this route for as long as a device ban
-is in force. The Authority expedites these claims because a device is not a
-person.
+is in force. A human reviews these claims on an expedited basis because a
+device is not a person.
 
 For a suspensive class, a timely appeal pauses execution until the declared
 appeal path resolves. For a non-suspensive class, the ban may remain in force
@@ -218,7 +242,9 @@ The Authority may not:
 - scan devices or conversations;
 - obtain encryption keys or undisclosed plaintext;
 - act against a user or class absent from the signed mandate;
-- treat Mistral output as a verdict;
+- use model categories or thresholds other than those disclosed in §§2 and 4;
+- substitute undisclosed human judgment or another model for the automated
+  first decision;
 - write device marks directly;
 - impose a longer ban than §2 permits;
 - maintain a protocol-wide blacklist; or
@@ -241,5 +267,7 @@ open cases dismiss at their deadlines; an existing ban remains only while a
 living declared forum can hear an appeal.
 
 By selecting **Agree**, you confirm that you reviewed these terms, including
-the disclosure of eligible reported text to Mistral AI for triage, and consent
-to the Authority and classes above for this identity and device.
+the automated Mistral decision, the `0.90` ban threshold, the absence of human
+review before the first verdict, and the need to appeal to obtain human review.
+You consent to that Authority and the classes above for this identity and
+device.
