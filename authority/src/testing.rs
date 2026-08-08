@@ -34,3 +34,31 @@ pub const MANIFEST_JSON: &str = r#"{
   "appellate": "onym:component:test-appellate",
   "validUntil": "2030-01-01T00:00:00Z"
 }"#;
+
+// ─── Signing fixtures ────────────────────────────────────────────────
+//
+// Fixed seeds: a test that generates keys at random cannot be told apart
+// from one that passes by luck.
+
+use ed25519_dalek::{Signer, SigningKey};
+
+pub const INTERFACE_SEED: [u8; 32] = [1u8; 32];
+pub const ACCUSED_SEED: [u8; 32] = [2u8; 32];
+pub const REPORTER_SEED: [u8; 32] = [3u8; 32];
+pub const STRANGER_SEED: [u8; 32] = [4u8; 32];
+
+pub fn key(seed: [u8; 32]) -> SigningKey {
+    SigningKey::from_bytes(&seed)
+}
+
+pub fn key_reference(seed: [u8; 32]) -> String {
+    crate::util::key_reference(key(seed).verifying_key().as_bytes())
+}
+
+pub fn interface_key_reference() -> String {
+    key_reference(INTERFACE_SEED)
+}
+
+pub fn sign(seed: [u8; 32], message: &[u8]) -> String {
+    crate::util::base64_encode(&key(seed).sign(message).to_bytes())
+}

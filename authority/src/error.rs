@@ -73,17 +73,30 @@ impl Error {
     }
 
     fn status(&self) -> StatusCode {
+        // Each refusal gets a status that says which *kind* of refusal
+        // it is. Collapsing them all into 400 made "your JSON is
+        // malformed" indistinguishable from "this case was already
+        // decided" without parsing the body, which is exactly the
+        // distinction a client needs to know whether retrying, fixing,
+        // or giving up is the right response. The §10 code in the body
+        // stays authoritative.
         match self {
-            Error::BadRequest(_)
-            | Error::AuthenticityUnverified(_)
-            | Error::ClassOutsideMandate(_)
-            | Error::WindowClosed(_)
-            | Error::CaseState(_) => StatusCode::BAD_REQUEST,
+            Error::BadRequest(_) => StatusCode::BAD_REQUEST,
+            // Well-formed, but the content does not prove what it
+            // claims to prove.
+            Error::AuthenticityUnverified(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Error::SignatureInvalid(_) => StatusCode::UNAUTHORIZED,
+            // The window existed and has passed — not something a
+            // corrected request can recover.
+            Error::WindowClosed(_) => StatusCode::GONE,
+            // The case is real but not in a stage that admits this.
+            Error::CaseState(_) => StatusCode::CONFLICT,
             // Refusals of standing and jurisdiction are not the
             // caller's fault to fix by retrying; they say this
             // authority has no power here.
-            Error::ReporterUnconsented | Error::NoJurisdiction => StatusCode::FORBIDDEN,
+            Error::ReporterUnconsented | Error::NoJurisdiction | Error::ClassOutsideMandate(_) => {
+                StatusCode::FORBIDDEN
+            }
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }

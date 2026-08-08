@@ -26,7 +26,12 @@ impl AppState {
 
     #[cfg(test)]
     pub fn for_tests(store: Store) -> Self {
-        let manifest_raw = crate::testing::MANIFEST_JSON.as_bytes().to_vec();
+        Self::for_tests_with(store, crate::testing::MANIFEST_JSON)
+    }
+
+    #[cfg(test)]
+    pub fn for_tests_with(store: Store, manifest_json: &str) -> Self {
+        let manifest_raw = manifest_json.as_bytes().to_vec();
         let manifest = serde_json::from_slice(&manifest_raw).expect("test manifest");
         let config = Config {
             bind_addr: "127.0.0.1:0".into(),
@@ -36,7 +41,10 @@ impl AppState {
             signing_seed: [7u8; 32],
             interface_base_url: None,
             interface_token: None,
-            interface_key: None,
+            // Tests exercise the fail-closed path deliberately, so the
+            // default fixture is a *configured* deployment; the
+            // unconfigured one gets its own test.
+            interface_key: Some(crate::testing::interface_key_reference()),
             moderator_token: Some("test-token".into()),
             deadline_sweep_secs: 300,
         };

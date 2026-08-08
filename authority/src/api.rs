@@ -40,6 +40,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// Statements are free text from unauthenticated or semi-authenticated
+/// parties; the store is not a place to put unbounded prose.
+const MAX_STATEMENT_BYTES: usize = 16 * 1024;
+
 async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
         "status": "ok",
@@ -71,6 +75,11 @@ async fn accept_mandate(
     State(state): State<Arc<AppState>>,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, Error> {
+    // An expired manifest may not take new mandates: the terms it
+    // offers are no longer on offer, and consent to them now would be
+    // consent to something this authority has withdrawn (§5.2).
+    require_manifest_current(&state, "accept a mandate")?;
+
     let mandate: ModerationMandate = serde_json::from_slice(&body)
         .map_err(|e| Error::BadRequest(format!("malformed mandate: {e}")))?;
 
@@ -114,24 +123,41 @@ async fn accept_mandate(
                 "mandate is not countersigned by the interface".into(),
             ))
         }
-        // No interface key configured: accept, but say so. A deployment
-        // that never sets one cannot tell a real designation from a
-        // forged one.
-        (None, _) => tracing::warn!(
-            "AUTHORITY_INTERFACE_KEY is unset; accepting a mandate without checking the \
-             interface countersignature"
-        ),
+        // No interface key configured, so a countersignature cannot be
+        // checked — and an unverifiable designation is exactly the
+        // forgery this check exists to catch. Refuse. Accepting here
+        // would let anyone who can reach this endpoint grant us
+        // jurisdiction over a user who never consented, which is the
+        // one failure that turns a consent-bound authority into an
+        // unbounded one.
+        (None, _) => {
+            tracing::error!(
+                "AUTHORITY_INTERFACE_KEY is unset; refusing mandate registration. Set it to the \
+                 interface's countersigning key (its /health `countersigningKey`)."
+            );
+            return Err(Error::BadRequest(
+                "this authority is not configured with an interface countersigning key, so it \
+                 cannot verify that the interface witnessed this consent"
+                    .into(),
+            ));
+        }
     }
 
     let mandate_ref = util::sha256_hex(&signing_bytes);
+    // The manifest bytes are stored alongside the mandate, not merely
+    // referenced: this mandate consents to *these* terms, and when the
+    // published manifest is superseded the case must still be judged by
+    // what the user actually agreed to.
     state.store.put_mandate(
         &crate::store::MandateRecord {
             mandate_ref: mandate_ref.clone(),
             user_key: mandate.user.clone(),
             device_binding: mandate.device_binding.clone(),
             classes: mandate.classes.clone(),
+            manifest_hash: mandate.manifest_hash.clone(),
         },
         &body,
+        &state.config.manifest_raw,
         &util::format_timestamp(OffsetDateTime::now_utc()),
     )?;
 
@@ -155,6 +181,30 @@ async fn file_report(
     verify_signature(&report.reporter, &signing_bytes, &report.signature)
         .map_err(|_| Error::SignatureInvalid("reporter signature did not verify".into()))?;
 
+    // A retried filing must not open a second case or double-count the
+    // reporter. Identical bytes under the same (reporter, reportId) are
+    // the same report arriving twice, and the honest answer is the
+    // original receipt.
+    if let Some(existing) = state.store.report(&report.reporter, &report.report_id)? {
+        if existing.raw != body.as_ref() {
+            return Err(Error::BadRequest(format!(
+                "reportId {:?} is already on file with different contents; a filed report is \
+                 immutable",
+                report.report_id
+            )));
+        }
+        let case_id = existing.case_id.unwrap_or_default();
+        let case = state.store.case(&case_id)?;
+        return Ok(Json(json!({
+            "reportId": report.report_id,
+            "receivedAt": case.as_ref().map(|c| c.opened_at.clone()),
+            "caseId": case_id,
+            "duplicate": true,
+            "responseDeadline": case.as_ref().map(|c| c.response_deadline.clone()),
+            "decisionDeadline": case.as_ref().map(|c| c.decision_deadline.clone()),
+        })));
+    }
+
     // Standing follows the reporter's mandate: reporting requires
     // having consented to this authority too.
     let reporter_mandate = state
@@ -174,13 +224,16 @@ async fn file_report(
         .mandate_for_user(&report.accused)?
         .ok_or(Error::NoJurisdiction)?;
 
-    // The class must be one the accused consented to and one we declare.
+    // The class must be one the accused consented to and one we
+    // declare — and the terms come from the manifest *their mandate
+    // pinned*, not from whatever this authority publishes today.
+    // Otherwise republishing a manifest with a longer ban term would
+    // silently re-term everyone who consented before it.
     if !accused_mandate.classes.iter().any(|c| c == &report.class_id) {
         return Err(Error::ClassOutsideMandate(report.class_id.clone()));
     }
-    let class = state
-        .config
-        .manifest
+    let consented = consented_manifest(&state, &accused_mandate)?;
+    let class = consented
         .violation_class(&report.class_id)
         .ok_or_else(|| Error::ClassOutsideMandate(report.class_id.clone()))?
         .clone();
@@ -221,7 +274,17 @@ async fn file_report(
             )?;
             existing
         }
-        None => open_case(&state, &report, &accused_mandate, &class, now).await?,
+        None => {
+            // Consent has a horizon. Opening a case under terms whose
+            // validity has lapsed would apply an agreement neither side
+            // is still offering — and opening a case sets a mark.
+            let valid_until = util::parse_timestamp(&consented.valid_until)
+                .map_err(|e| Error::Internal(format!("consented manifest validUntil: {e}")))?;
+            if now > valid_until {
+                return Err(Error::NoJurisdiction);
+            }
+            open_case(&state, &report, &accused_mandate, &class, now).await?
+        }
     };
 
     state.store.put_report(
@@ -237,12 +300,52 @@ async fn file_report(
 
     Ok(Json(json!({
         "reportId": report.report_id,
+        // The interface's receipt decoder requires this; without it the
+        // client cannot tell a filed report from a dropped one.
+        "receivedAt": stamp,
         "caseId": case.case_id,
         "intakeWeight": weight,
         // The notice the accused is owed, so the interface can serve it.
         "responseDeadline": case.response_deadline,
         "decisionDeadline": case.decision_deadline,
     })))
+}
+
+/// The manifest a mandate consented to, parsed. Falls back to the
+/// currently published one only for mandates registered before
+/// snapshots were kept — and says so, because judging under terms the
+/// user never saw is the failure this exists to prevent.
+fn consented_manifest(
+    state: &AppState,
+    mandate: &crate::store::MandateRecord,
+) -> Result<AuthorityManifest, Error> {
+    match state.store.manifest_bytes(&mandate.manifest_hash)? {
+        Some(raw) => serde_json::from_slice(&raw)
+            .map_err(|e| Error::Internal(format!("stored consented manifest unparseable: {e}"))),
+        None => {
+            tracing::warn!(
+                mandate_ref = %mandate.mandate_ref,
+                manifest_hash = %mandate.manifest_hash,
+                "no stored manifest for this mandate; falling back to the published one"
+            );
+            Ok(state.config.manifest.clone())
+        }
+    }
+}
+
+/// Refuse work that an expired manifest cannot authorise. Live cases
+/// keep running to their deadlines — an expiry must not strand someone
+/// under a case-open mark — but nothing new starts under lapsed terms.
+fn require_manifest_current(state: &AppState, action: &str) -> Result<(), Error> {
+    let valid_until = util::parse_timestamp(&state.config.manifest.valid_until)
+        .map_err(|e| Error::Internal(format!("manifest validUntil: {e}")))?;
+    if OffsetDateTime::now_utc() > valid_until {
+        return Err(Error::BadRequest(format!(
+            "this authority's manifest expired at {}; it cannot {action} under lapsed terms",
+            state.config.manifest.valid_until
+        )));
+    }
+    Ok(())
 }
 
 /// Open a case: set the deadlines the manifest declares, issue the
@@ -274,8 +377,6 @@ async fn open_case(
         disposition: None,
         appeal_deadline: None,
     };
-    state.store.put_case(&case)?;
-
     let issued = cases::open_case_verdict(
         &case,
         &state.config.manifest.component_id,
@@ -284,12 +385,17 @@ async fn open_case(
         &state.signing_key,
     )?;
     let stamp = util::format_timestamp(now);
-    state
-        .store
-        .put_verdict(&issued.verdict_ref, &case.case_id, &issued.disposition, &issued.raw, &stamp)?;
-    state
-        .store
-        .append_event(&case.case_id, &stamp, "case_opened", &issued.verdict_ref)?;
+    // The case row, its interim verdict, and the event are one write.
+    // Split, a crash in between leaves either a mark with no signed
+    // verdict behind it or a verdict for a case that does not exist.
+    state.store.open_case_atomically(
+        &case,
+        &issued.verdict_ref,
+        &issued.disposition,
+        &issued.raw,
+        &stamp,
+        &issued.verdict_ref,
+    )?;
 
     state.delivery.flush(&state.store).await?;
     tracing::info!(case_id = %case.case_id, "case opened");
@@ -309,6 +415,15 @@ async fn respond(
 ) -> Result<Json<Value>, Error> {
     let response: CaseResponse = serde_json::from_slice(&body)
         .map_err(|e| Error::BadRequest(format!("malformed response: {e}")))?;
+    // The signed object names its own case; the path must agree with
+    // it. Without this the signature covers a statement that could be
+    // presented against any case at all.
+    if response.case_id != case_id {
+        return Err(Error::BadRequest(format!(
+            "this response is signed for case {}, not {case_id}",
+            response.case_id
+        )));
+    }
     let mut case = state
         .store
         .case(&case_id)?
@@ -321,6 +436,17 @@ async fn respond(
     verify_signature(&case.accused, &signing_bytes, &response.signature)
         .map_err(|_| Error::SignatureInvalid("accused signature did not verify".into()))?;
 
+    // Counter-evidence must verify against the accused's own key, the
+    // same rule the reporter's evidence is held to.
+    for (index, item) in response.evidence.iter().enumerate() {
+        verify_signature(&case.accused, item.disclosed_content.as_bytes(), &item.authenticity_proof)
+            .map_err(|_| {
+                Error::AuthenticityUnverified(format!(
+                    "response evidence item {index} does not verify against the accused's key"
+                ))
+            })?;
+    }
+
     let now = OffsetDateTime::now_utc();
     let stamp = util::format_timestamp(now);
     let late = util::parse_timestamp(&case.response_deadline)
@@ -328,9 +454,13 @@ async fn respond(
         .unwrap_or(false);
 
     case.responded = true;
-    state.store.put_case(&case)?;
-    state.store.append_event(
-        &case_id,
+    // The response is stored whole — statement *and* evidence. Keeping
+    // only a summary line would mean deciding, and later reviewing on
+    // appeal, without the material the accused actually offered.
+    state.store.put_response(
+        &case,
+        &body,
+        late,
         &stamp,
         if late { "response_late" } else { "response" },
         &response.statement,
@@ -349,16 +479,59 @@ async fn appeal(
 ) -> Result<Json<Value>, Error> {
     let submission: AppealSubmission = serde_json::from_slice(&body)
         .map_err(|e| Error::BadRequest(format!("malformed appeal: {e}")))?;
+    if submission.case_id != case_id {
+        return Err(Error::BadRequest(format!(
+            "this submission is signed for case {}, not {case_id}",
+            submission.case_id
+        )));
+    }
+    if submission.statement.len() > MAX_STATEMENT_BYTES {
+        return Err(Error::BadRequest(format!(
+            "statement exceeds {MAX_STATEMENT_BYTES} bytes"
+        )));
+    }
     let case = state
         .store
         .case(&case_id)?
         .ok_or_else(|| Error::NotFound(format!("case {case_id}")))?;
 
-    let new_holder = submission.kind == "new-holder-claim";
+    let new_holder = match submission.kind.as_str() {
+        "appeal" => false,
+        "new-holder-claim" => true,
+        other => {
+            return Err(Error::BadRequest(format!(
+                "unknown appeal kind {other:?} (expected appeal | new-holder-claim)"
+            )))
+        }
+    };
 
     // A new holder is, by definition, not the mandated identity, so
-    // their claim cannot be signature-checked against it. Everyone else
-    // must sign.
+    // their claim cannot be signature-checked against it — which would
+    // otherwise make this an unauthenticated endpoint anyone can append
+    // to without limit. Two bounds stand in for the signature it cannot
+    // have: the claim must answer a ban that is actually in force (a
+    // claim against a dismissed case has nothing to remedy), and only
+    // one may be pending at a time. Real attestation that the device
+    // changed hands needs the interface, which holds the device key;
+    // this service cannot verify it alone.
+    if new_holder {
+        if case.disposition.as_deref() != Some("ban") {
+            return Err(Error::CaseState(
+                "a new-holder claim applies to a ban in force; this case carries none".into(),
+            ));
+        }
+        let pending = state
+            .store
+            .events(&case_id)?
+            .iter()
+            .any(|(_, kind, _)| kind == "new_holder_claim");
+        if pending {
+            return Err(Error::CaseState(
+                "a new-holder claim is already pending on this case".into(),
+            ));
+        }
+    }
+
     if !new_holder {
         let signing_bytes = canonical::report_signing_bytes(&body)?;
         verify_signature(&case.accused, &signing_bytes, &submission.signature)
@@ -403,11 +576,21 @@ async fn appeal(
 async fn query_status(
     State(state): State<Arc<AppState>>,
     Path(case_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<StatusQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, Error> {
     let case = state
         .store
         .case(&case_id)?
         .ok_or_else(|| Error::NotFound(format!("case {case_id}")))?;
+
+    // Case existence, stage, and timing are not public facts. A case id
+    // is a bearer secret otherwise: anyone holding one could learn that
+    // a given person is under investigation, which is exactly what the
+    // confidentiality policy withholds. A party proves who they are by
+    // signing the case id with the key that made them a party.
+    authorize_case_party(&state, &case, &case_id, &query, &headers)?;
+
     let events: Vec<Value> = state
         .store
         .events(&case_id)?
@@ -423,6 +606,10 @@ async fn query_status(
         "responseDeadline": case.response_deadline,
         "decisionDeadline": case.decision_deadline,
         "responded": case.responded,
+        // So the accused can confirm their answer is on file — a
+        // response that vanished silently is indistinguishable from one
+        // that was never sent.
+        "responsesOnFile": state.store.responses(&case_id)?.len(),
         "disposition": case.disposition,
         "appealDeadline": case.appeal_deadline,
         "events": events,
@@ -465,6 +652,16 @@ async fn decide(
     let now = OffsetDateTime::now_utc();
     let stamp = util::format_timestamp(now);
 
+    // Every reporter on the case, not just whoever filed first. A case
+    // three people reported was upheld or dismissed for all three.
+    let reporters = {
+        let mut reporters = state.store.case_reporters(&case_id)?;
+        if !reporters.contains(&case.reporter) {
+            reporters.push(case.reporter.clone());
+        }
+        reporters
+    };
+
     let issued = match decision.disposition.as_str() {
         "dismiss" => {
             if case.stage != "open" {
@@ -472,7 +669,6 @@ async fn decide(
             }
             // Notice must precede sanction, but a dismissal is not a
             // sanction — it can land any time before the deadline.
-            state.store.record_report_outcome(&case.reporter, false)?;
             cases::dismissal_verdict(
                 &case,
                 &state.config.manifest.component_id,
@@ -485,23 +681,51 @@ async fn decide(
             if case.stage != "open" {
                 return Err(Error::CaseState("case is already decided".into()));
             }
-            // Notice and the response window must have elapsed before
-            // any ban verdict (§8 obligation 4). The case-open mark is
-            // the only pre-verdict effect this authority may have.
+            // The decision deadline is not advisory: once it passes the
+            // case is dismissed by default, whether or not the sweep
+            // has run yet (§3.5). Without this check a moderator could
+            // ban a case that the contract had already ended in the
+            // accused's favour — and the sweep would simply lose the
+            // race. "Undecided is dismissal" has to hold at the moment
+            // of decision, not at the moment a background task notices.
+            let decision_deadline = util::parse_timestamp(&case.decision_deadline)
+                .map_err(|e| Error::Internal(format!("stored decisionDeadline: {e}")))?;
+            if now > decision_deadline {
+                return Err(Error::WindowClosed(format!(
+                    "the decision deadline passed at {}; this case is dismissed by default and \
+                     cannot be banned",
+                    case.decision_deadline
+                )));
+            }
+            // The response window must have *elapsed* before any ban
+            // verdict: §8 obligation 4 says hold it, and §11.4 says the
+            // banned mark is set "only after the response window a
+            // consented class declared". Neither admits an exception
+            // for a case that has already been answered.
+            //
+            // An earlier version banned as soon as any response
+            // existed. That reads the window as a formality to be
+            // discharged rather than as time the accused was promised:
+            // they may answer on day one and keep gathering
+            // counter-evidence until day three, and a ban on day one
+            // takes the other two days away. The case-open mark is the
+            // only pre-verdict effect this authority may have.
             let response_deadline = util::parse_timestamp(&case.response_deadline)
                 .map_err(|e| Error::Internal(format!("stored responseDeadline: {e}")))?;
-            if now < response_deadline && !case.responded {
+            if now < response_deadline {
                 return Err(Error::CaseState(format!(
                     "the response window runs until {}; a ban before it closes is nonconforming",
                     case.response_deadline
                 )));
             }
-            let class = state
-                .config
-                .manifest
+            let mandate = state.store.mandate(&case.mandate_ref)?;
+            let consented = match mandate.as_ref() {
+                Some(mandate) => consented_manifest(&state, mandate)?,
+                None => state.config.manifest.clone(),
+            };
+            let class = consented
                 .violation_class(&case.class_id)
                 .ok_or_else(|| Error::ClassOutsideMandate(case.class_id.clone()))?;
-            state.store.record_report_outcome(&case.reporter, true)?;
             cases::ban_verdict(
                 &case,
                 class,
@@ -533,10 +757,6 @@ async fn decide(
         }
     };
 
-    state
-        .store
-        .put_verdict(&issued.verdict_ref, &case_id, &issued.disposition, &issued.raw, &stamp)?;
-
     // A reversal ends the sanction; the case stays decided either way.
     case.stage = "decided".into();
     case.disposition = Some(if decision.disposition == "reverse" {
@@ -549,10 +769,25 @@ async fn decide(
             .map_err(|e| Error::Internal(format!("re-read verdict: {e}")))?;
         case.appeal_deadline = v["appealDeadline"].as_str().map(str::to_string);
     }
-    state.store.put_case(&case)?;
-    state
-        .store
-        .append_event(&case_id, &stamp, "decided", &decision.disposition)?;
+
+    // Verdict, case stage, event, and reporter track records commit
+    // together — and only after the verdict was successfully built and
+    // signed. Crediting reporters first meant a decision that failed to
+    // sign still moved their standing.
+    //
+    // A reversal is not a dismissal of the report: it corrects this
+    // authority's own error, so nobody's record moves for it.
+    let credited: &[String] = if decision.disposition == "reverse" { &[] } else { &reporters };
+    state.store.commit_decision(&crate::store::Decision {
+        case: &case,
+        verdict_ref: &issued.verdict_ref,
+        disposition: &issued.disposition,
+        raw: &issued.raw,
+        at: &stamp,
+        event_kind: "decided",
+        event_detail: &decision.disposition,
+        credited_reporters: credited,
+    })?;
 
     state.delivery.flush(&state.store).await?;
 
@@ -565,6 +800,54 @@ async fn decide(
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────
+
+/// Credentials for `query-status`, as query parameters so the call
+/// stays a plain GET.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusQuery {
+    /// `onym:key:<hex>` of the party asking.
+    key: Option<String>,
+    /// Base64 Ed25519 signature over `query-status:<caseId>`.
+    signature: Option<String>,
+}
+
+/// A caller may read a case if they are the accused, a reporter on it,
+/// or a moderator. Proof for the first two is a signature over the case
+/// id by the key that made them a party — no session, no bearer token
+/// the authority would then have to store.
+fn authorize_case_party(
+    state: &AppState,
+    case: &CaseRecord,
+    case_id: &str,
+    query: &StatusQuery,
+    headers: &HeaderMap,
+) -> Result<(), Error> {
+    if authorize_moderator(state, headers).is_ok() {
+        return Ok(());
+    }
+    let (Some(key), Some(signature)) = (query.key.as_deref(), query.signature.as_deref()) else {
+        return Err(Error::SignatureInvalid(
+            "query-status requires `key` and `signature` over \"query-status:<caseId>\", or a \
+             moderator token"
+                .into(),
+        ));
+    };
+
+    let is_party = key == case.accused
+        || state.store.case_reporters(case_id)?.iter().any(|r| r == key)
+        || key == case.reporter;
+    if !is_party {
+        // Same answer as an unparticipating key asking about a case
+        // that does not exist: a distinguishable refusal would confirm
+        // the case is real.
+        return Err(Error::NotFound(format!("case {case_id}")));
+    }
+
+    let message = format!("query-status:{case_id}");
+    verify_signature(key, message.as_bytes(), signature)
+        .map_err(|_| Error::SignatureInvalid("case-party signature did not verify".into()))
+}
 
 fn verify_signature(key_reference: &str, message: &[u8], signature: &str) -> Result<(), Error> {
     let key_bytes = util::key_bytes_from_reference(key_reference)
@@ -606,4 +889,542 @@ fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
         return false;
     }
     lhs.iter().zip(rhs).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────
+//
+// These drive the real router. What is being pinned here is mostly what
+// this service *refuses* — the restraint is the reviewable part of a
+// moderation service, and a refusal that quietly regresses into an
+// acceptance is the failure that matters.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+    use crate::testing::{self, ACCUSED_SEED, INTERFACE_SEED, REPORTER_SEED, STRANGER_SEED};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    struct Harness {
+        state: Arc<AppState>,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            Self { state: Arc::new(AppState::for_tests(Store::in_memory().unwrap())) }
+        }
+
+        async fn send(&self, request: Request<Body>) -> (StatusCode, Value) {
+            let response = router(self.state.clone()).oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (status, body)
+        }
+
+        async fn post(&self, path: &str, body: Vec<u8>) -> (StatusCode, Value) {
+            self.send(
+                Request::post(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+        }
+
+        async fn decide(&self, case_id: &str, body: Value) -> (StatusCode, Value) {
+            self.send(
+                Request::post(format!("/v1/cases/{case_id}/decide"))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+        }
+    }
+
+    /// Serialize, sign the canonical bytes, and put the signature back
+    /// — the shape a real client produces.
+    fn signed(mut object: Value, signature_field: &str, seeds: &[[u8; 32]]) -> Vec<u8> {
+        let raw = serde_json::to_vec(&object).unwrap();
+        let signing_bytes = canonical::canonical_bytes(&raw, &[signature_field]).unwrap();
+        let signatures: Vec<String> =
+            seeds.iter().map(|seed| testing::sign(*seed, &signing_bytes)).collect();
+        object[signature_field] = if signature_field == "signatures" {
+            json!(signatures)
+        } else {
+            json!(signatures[0])
+        };
+        serde_json::to_vec(&object).unwrap()
+    }
+
+    fn mandate_json(user_seed: [u8; 32], classes: Value, manifest_hash: &str) -> Value {
+        json!({
+            "mandateVersion": 1,
+            "user": testing::key_reference(user_seed),
+            "interface": "onym:component:test-interface",
+            "authority": "onym:component:test-authority",
+            "manifestHash": manifest_hash,
+            "classes": classes,
+            "deviceBinding": format!("device-{}", user_seed[0]),
+            "acceptedAt": "2026-08-01T00:00:00Z",
+        })
+    }
+
+    async fn register_mandate(harness: &Harness, user_seed: [u8; 32]) -> String {
+        let manifest_hash = util::sha256_hex(&harness.state.config.manifest_raw);
+        let body = signed(
+            mandate_json(user_seed, json!(["csam", "unsolicited-pornography"]), &manifest_hash),
+            "signatures",
+            &[user_seed, INTERFACE_SEED],
+        );
+        let (status, response) = harness.post("/v1/mandates", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        response["mandateRef"].as_str().unwrap().to_string()
+    }
+
+    fn report_json(reporter_mandate: &str, report_id: &str) -> Value {
+        let content = "prohibited thing";
+        json!({
+            "reportVersion": 1,
+            "reportId": report_id,
+            "reporter": testing::key_reference(REPORTER_SEED),
+            "reporterMandate": reporter_mandate,
+            "accused": testing::key_reference(ACCUSED_SEED),
+            "classId": "csam",
+            "evidence": [{
+                "disclosedContent": content,
+                // Authenticity is a signature by the *accused* over the
+                // content: that is what makes it evidence of authorship
+                // rather than an assertion about it.
+                "authenticityProof": testing::sign(ACCUSED_SEED, content.as_bytes()),
+            }],
+            "filedAt": "2026-08-02T00:00:00Z",
+        })
+    }
+
+    /// A registered accused, a registered reporter, and an open case.
+    async fn open_case(harness: &Harness) -> String {
+        register_mandate(harness, ACCUSED_SEED).await;
+        let reporter_mandate = register_mandate(harness, REPORTER_SEED).await;
+        let body = signed(report_json(&reporter_mandate, "r-1"), "signature", &[REPORTER_SEED]);
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        response["caseId"].as_str().unwrap().to_string()
+    }
+
+    // ─── Jurisdiction ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_report_about_an_unmandated_user_is_refused_not_judged() {
+        let harness = Harness::new();
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+        let body = signed(report_json(&reporter_mandate, "r-1"), "signature", &[REPORTER_SEED]);
+
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(response["error"], "no_jurisdiction");
+    }
+
+    #[tokio::test]
+    async fn a_reporter_without_their_own_mandate_has_no_standing() {
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let body = signed(report_json("some-mandate", "r-1"), "signature", &[REPORTER_SEED]);
+
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(response["error"], "reporter_unconsented");
+    }
+
+    #[tokio::test]
+    async fn content_without_an_authenticity_proof_is_a_complaint_not_evidence() {
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+
+        let mut report = report_json(&reporter_mandate, "r-1");
+        // Signed by someone who is not the accused.
+        report["evidence"][0]["authenticityProof"] =
+            json!(testing::sign(STRANGER_SEED, b"prohibited thing"));
+        let body = signed(report, "signature", &[REPORTER_SEED]);
+
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+        assert_eq!(response["error"], "authenticity_unverified");
+    }
+
+    // ─── Mandates ────────────────────────────────────────────────────
+
+    /// Without a configured interface key a countersignature cannot be
+    /// checked, and an unverifiable designation is the forgery the
+    /// check exists to catch.
+    #[tokio::test]
+    async fn mandate_registration_fails_closed_without_an_interface_key() {
+        let mut state = AppState::for_tests(Store::in_memory().unwrap());
+        state.config.interface_key = None;
+        let harness = Harness { state: Arc::new(state) };
+
+        let manifest_hash = util::sha256_hex(&harness.state.config.manifest_raw);
+        let body = signed(
+            mandate_json(ACCUSED_SEED, json!(["csam"]), &manifest_hash),
+            "signatures",
+            &[ACCUSED_SEED, INTERFACE_SEED],
+        );
+
+        let (status, _) = harness.post("/v1/mandates", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_mandate_countersigned_by_the_wrong_key_is_refused() {
+        let harness = Harness::new();
+        let manifest_hash = util::sha256_hex(&harness.state.config.manifest_raw);
+        let body = signed(
+            mandate_json(ACCUSED_SEED, json!(["csam"]), &manifest_hash),
+            "signatures",
+            &[ACCUSED_SEED, STRANGER_SEED],
+        );
+
+        let (status, _) = harness.post("/v1/mandates", body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_mandate_pinning_another_manifest_is_refused() {
+        let harness = Harness::new();
+        let body = signed(
+            mandate_json(ACCUSED_SEED, json!(["csam"]), &"a".repeat(64)),
+            "signatures",
+            &[ACCUSED_SEED, INTERFACE_SEED],
+        );
+
+        let (status, _) = harness.post("/v1/mandates", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A class the accused did not consent to is outside this
+    /// authority's reach even though the manifest declares it.
+    #[tokio::test]
+    async fn a_class_outside_the_mandate_is_refused() {
+        let harness = Harness::new();
+        let manifest_hash = util::sha256_hex(&harness.state.config.manifest_raw);
+        let body = signed(
+            mandate_json(ACCUSED_SEED, json!(["unsolicited-pornography"]), &manifest_hash),
+            "signatures",
+            &[ACCUSED_SEED, INTERFACE_SEED],
+        );
+        harness.post("/v1/mandates", body).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+
+        // The report names `csam`, which this accused did not consent to.
+        let body = signed(report_json(&reporter_mandate, "r-1"), "signature", &[REPORTER_SEED]);
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(response["error"], "class_outside_mandate");
+    }
+
+    // ─── Report immutability ─────────────────────────────────────────
+
+    /// A report is evidence. Refiling identical bytes is a retry and
+    /// gets the original receipt; refiling *different* bytes under a
+    /// used id is an attempt to rewrite the record.
+    #[tokio::test]
+    async fn a_filed_report_cannot_be_rewritten_but_may_be_retried() {
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+
+        let original = signed(report_json(&reporter_mandate, "r-1"), "signature", &[REPORTER_SEED]);
+        let (status, first) = harness.post("/v1/reports", original.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, retry) = harness.post("/v1/reports", original).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(retry["duplicate"], true);
+        assert_eq!(retry["caseId"], first["caseId"], "a retry must not open a second case");
+
+        let mut edited = report_json(&reporter_mandate, "r-1");
+        edited["filedAt"] = json!("2026-08-03T00:00:00Z");
+        let (status, _) =
+            harness.post("/v1/reports", signed(edited, "signature", &[REPORTER_SEED])).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Two reports about the same accused and class join one case: a
+    /// second case would set a second mark before anyone decided
+    /// anything.
+    #[tokio::test]
+    async fn further_reports_join_the_open_case() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+
+        let body = signed(report_json(&reporter_mandate, "r-2"), "signature", &[REPORTER_SEED]);
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["caseId"], case_id);
+    }
+
+    // ─── Notice before sanction ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_ban_inside_the_response_window_is_refused() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+
+        let (status, response) =
+            harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(response["error"], "case_state");
+    }
+
+    /// An answered case does not shorten the window. The accused was
+    /// promised the time, not merely the opportunity to speak once.
+    #[tokio::test]
+    async fn a_response_does_not_open_the_door_to_an_early_ban() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+
+        let response_body = signed(
+            json!({"caseId": case_id, "statement": "it wasn't me", "evidence": []}),
+            "signature",
+            &[ACCUSED_SEED],
+        );
+        let (status, _) =
+            harness.post(&format!("/v1/cases/{case_id}/respond"), response_body).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) =
+            harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "the window still has days to run");
+    }
+
+    /// Undecided is dismissal, and it binds at the moment of decision —
+    /// not whenever the sweep next happens to run.
+    #[tokio::test]
+    async fn a_ban_after_the_decision_deadline_is_refused() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        case.decision_deadline = "2020-01-08T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+
+        let (status, response) =
+            harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(response["error"], "window_closed");
+    }
+
+    #[tokio::test]
+    async fn a_ban_after_the_window_closes_is_issued_and_credits_every_reporter() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+
+        let (status, response) =
+            harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["disposition"], "ban");
+
+        let reporter = harness.state.store.reporter(&testing::key_reference(REPORTER_SEED)).unwrap();
+        assert_eq!(reporter.upheld, 1);
+    }
+
+    #[tokio::test]
+    async fn deciding_requires_the_moderator_token_and_a_reason() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+
+        let (status, _) = harness
+            .post(
+                &format!("/v1/cases/{case_id}/decide"),
+                serde_json::to_vec(&json!({"disposition": "dismiss", "reasoning": "hash:f"}))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "no bearer token");
+
+        let (status, _) =
+            harness.decide(&case_id, json!({"disposition": "dismiss", "reasoning": "  "})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "an unexplained disposition");
+    }
+
+    // ─── Signed-object binding ───────────────────────────────────────
+
+    /// A response signed for one case must not be replayable onto
+    /// another: "that wasn't me" against a spam case would otherwise
+    /// register as an answer to an accusation the signer never saw.
+    #[tokio::test]
+    async fn a_response_signed_for_another_case_is_refused() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+
+        let body = signed(
+            json!({"caseId": "some-other-case", "statement": "no", "evidence": []}),
+            "signature",
+            &[ACCUSED_SEED],
+        );
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/respond"), body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn only_the_accused_may_respond() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+
+        let body = signed(
+            json!({"caseId": case_id, "statement": "no", "evidence": []}),
+            "signature",
+            &[STRANGER_SEED],
+        );
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/respond"), body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The new-holder path cannot be signature-checked — the new owner
+    /// is not the mandated identity — so it is bounded instead: it
+    /// answers a ban in force, and only one may be pending.
+    #[tokio::test]
+    async fn a_new_holder_claim_is_bounded_to_a_live_ban() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+
+        let claim = |case_id: &str| {
+            serde_json::to_vec(&json!({
+                "caseId": case_id,
+                "kind": "new-holder-claim",
+                "statement": "I bought this device secondhand",
+            }))
+            .unwrap()
+        };
+
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), claim(&case_id)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "no ban to be relieved of");
+
+        // Ban the case, then the claim lands — once.
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), claim(&case_id)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), claim(&case_id)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "an unauthenticated endpoint must not be unbounded");
+    }
+
+    // ─── Confidentiality ─────────────────────────────────────────────
+
+    /// A case id is not a credential. Anyone holding one could
+    /// otherwise learn that a named person is under investigation.
+    #[tokio::test]
+    async fn query_status_requires_a_party_credential() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+
+        let (status, _) =
+            harness.send(Request::get(format!("/v1/cases/{case_id}/status")).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // A stranger who signs correctly is still not a party — and
+        // gets the same answer as for a case that does not exist.
+        let message = format!("query-status:{case_id}");
+        let signature = testing::sign(STRANGER_SEED, message.as_bytes());
+        let url = format!(
+            "/v1/cases/{case_id}/status?key={}&signature={}",
+            testing::key_reference(STRANGER_SEED),
+            urlencode(&signature)
+        );
+        let (status, _) = harness.send(Request::get(url).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // The accused can read their own case.
+        let signature = testing::sign(ACCUSED_SEED, message.as_bytes());
+        let url = format!(
+            "/v1/cases/{case_id}/status?key={}&signature={}",
+            testing::key_reference(ACCUSED_SEED),
+            urlencode(&signature)
+        );
+        let (status, body) = harness.send(Request::get(url).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["stage"], "open");
+        // The reporter's identity is never in the answer (§5.4).
+        assert!(!body.to_string().contains(&testing::key_reference(REPORTER_SEED)));
+    }
+
+    fn urlencode(value: &str) -> String {
+        value
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                other => format!("%{other:02X}"),
+            })
+            .collect()
+    }
+
+    // ─── Manifest snapshots ──────────────────────────────────────────
+
+    /// A case is judged by the terms the accused actually consented
+    /// to. Republishing the manifest with a longer response window must
+    /// not re-term the people who consented before it — their mandate
+    /// pinned different bytes, and those bytes are what they agreed to.
+    #[tokio::test]
+    async fn a_case_uses_the_terms_its_mandate_pinned_not_the_published_ones() {
+        let harness = Harness::new();
+
+        // The accused consented to a manifest declaring a 30-day
+        // response window for csam; the published one declares 3.
+        let consented_manifest =
+            crate::testing::MANIFEST_JSON.replace("\"responseWindow\": \"P3D\"", "\"responseWindow\": \"P30D\"");
+        assert_ne!(consented_manifest, crate::testing::MANIFEST_JSON);
+        harness
+            .state
+            .store
+            .put_mandate(
+                &crate::store::MandateRecord {
+                    mandate_ref: "mandate-consented".into(),
+                    user_key: testing::key_reference(ACCUSED_SEED),
+                    device_binding: "device-2".into(),
+                    classes: vec!["csam".into()],
+                    manifest_hash: util::sha256_hex(consented_manifest.as_bytes()),
+                },
+                b"{}",
+                consented_manifest.as_bytes(),
+                "2026-08-01T00:00:00Z",
+            )
+            .unwrap();
+
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+        let body = signed(report_json(&reporter_mandate, "r-1"), "signature", &[REPORTER_SEED]);
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+
+        let case = harness
+            .state
+            .store
+            .case(response["caseId"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let opened = util::parse_timestamp(&case.opened_at).unwrap();
+        let deadline = util::parse_timestamp(&case.response_deadline).unwrap();
+        assert_eq!(
+            (deadline - opened).whole_days(),
+            30,
+            "the case must hold the window the accused consented to, not the published one"
+        );
+    }
 }

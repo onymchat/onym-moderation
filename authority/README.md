@@ -34,11 +34,24 @@ reviewing:
 - **No evidence without authenticity.** Every disclosed item must
   verify against the accused's key. Content without a proof is a
   complaint, not evidence, and cannot support a verdict.
-- **No sanction before notice.** A ban is refused while the consented
-  response window is still running and the accused has not answered.
-  The case-open mark is the only pre-verdict effect.
+- **No sanction before notice.** A ban is refused until the consented
+  response window has *elapsed* — answering early does not shorten it,
+  because the accused was promised the time, not merely one chance to
+  speak. A ban is also refused once the decision deadline has passed,
+  since by then the case is already dismissed by default. The case-open
+  mark is the only pre-verdict effect.
 - **No unexplained verdicts.** `reasoning` is required on every
   disposition, including dismissals and case openings.
+- **No case without consent to *these* terms.** Every mandate is stored
+  with the exact manifest bytes it pinned, and cases are judged by
+  those — republishing the manifest with a longer ban term does not
+  re-term anyone who consented before it.
+
+- **No unverifiable jurisdiction.** With no interface countersigning key
+  configured, mandate registration is refused rather than accepted on
+  trust: an unverifiable designation is exactly the forgery the check
+  exists to catch.
+
 - **No bounty.** Reporters build an authority-local, pseudonymous,
   non-transferable track record that weights intake. Nothing is paid
   for a report, and nothing about a ban pays more than a dismissal.
@@ -68,8 +81,12 @@ worth stating:
   their mandates — their consent was to the old bytes.
 - The `operator` field must name the key this service signs with, or
   every verdict it issues is refused downstream. The service checks
-  this at boot and logs an error rather than discovering it on the
-  first ban.
+  this at boot and **exits** rather than running as an authority whose
+  output nobody can verify — a warning produced a service that looked
+  healthy, decided cases, and moved no marks.
+- Once `validUntil` has passed, no new mandate is accepted and no new
+  case is opened. Cases already open still run to their deadlines: an
+  expiry must not strand someone under a case-open mark.
 
 ## Endpoints
 
@@ -80,12 +97,24 @@ worth stating:
 | `POST` | `/v1/reports` | file-report: signed report with authenticity proofs |
 | `POST` | `/v1/cases/:id/respond` | The accused's response |
 | `POST` | `/v1/cases/:id/appeal` | Appeal, or a new-holder claim |
-| `GET` | `/v1/cases/:id/status` | query-status, per the confidentiality policy |
+| `GET` | `/v1/cases/:id/status` | query-status, per the confidentiality policy — requires a party credential |
 | `POST` | `/v1/cases/:id/decide` | The moderator's judgment (bearer token) |
 | `GET` | `/health` | Signing key, manifest hash, whether it can decide or deliver |
 
 `/v1/cases/:id/decide` is the only path from a report to a sanction,
 and it needs a human's token. There is no automatic escalation.
+
+A case id is not a credential. `query-status` answers the accused, a
+reporter on the case, or a moderator; a party proves who they are by
+signing `query-status:<caseId>` with the key that made them one
+(`?key=onym:key:…&signature=…`). A stranger gets the same answer as for
+a case that does not exist, because a distinguishable refusal would
+confirm that a named person is under investigation.
+
+`respond` and `appeal` carry `caseId` **inside** the signed bytes. Left
+out, a signed "that wasn't me" could be lifted from one case and
+replayed onto another as an answer to an accusation its signer never
+saw.
 
 ## A canonicalization hazard worth knowing
 
@@ -126,6 +155,19 @@ See [SKILL.md](SKILL.md).
 ## Status
 
 Reference implementation. Known limits:
+
+- **Nothing calls `accept-mandate` yet.** The endpoint is implemented
+  and tested here, but the interface (`../apple`) does not POST the
+  countersigned mandate to the authority, and the iOS client has no
+  registration operation. Until that lands, jurisdiction has to be
+  seeded by hand — which means the end-to-end consent path is not
+  closed, across all three repos.
+
+- **The new-holder path cannot be authenticated here.** A new owner is
+  by definition not the mandated identity, so their claim cannot be
+  signature-checked. It is bounded instead — it must answer a ban in
+  force, and only one may be pending per case. Real attestation that a
+  device changed hands needs the interface, which holds the device key.
 
 - **Appeals are recorded, not adjudicated.** Filing an appeal logs it
   and notifies; a human then decides via `decide` with `reverse`. The

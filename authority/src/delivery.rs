@@ -15,9 +15,10 @@ pub struct Delivery {
     client: reqwest::Client,
     base_url: Option<String>,
     token: Option<String>,
-    /// Base64 of the manifest's exact published bytes — what the
-    /// interface hashes against the mandate's `manifestHash`.
-    consented_manifest: String,
+    /// Base64 of the currently published manifest. A fallback only:
+    /// each verdict normally travels with the manifest its own case's
+    /// mandate pinned, which for an older mandate is not this one.
+    published_manifest: String,
 }
 
 impl Delivery {
@@ -29,7 +30,7 @@ impl Delivery {
                 .unwrap_or_default(),
             base_url,
             token,
-            consented_manifest: util::base64_encode(manifest_raw),
+            published_manifest: util::base64_encode(manifest_raw),
         }
     }
 
@@ -40,16 +41,27 @@ impl Delivery {
     /// Deliver one verdict. `Ok(false)` means "not delivered, try
     /// again" — the caller keeps it queued rather than treating the
     /// case as unresolved.
-    pub async fn deliver(&self, raw_verdict: &[u8]) -> Result<bool, Error> {
+    pub async fn deliver(
+        &self,
+        raw_verdict: &[u8],
+        consented_manifest: Option<&[u8]>,
+    ) -> Result<bool, Error> {
         let Some(base_url) = self.base_url.as_deref() else {
             return Ok(false);
         };
         let verdict: serde_json::Value = serde_json::from_slice(raw_verdict)
             .map_err(|e| Error::Internal(format!("stored verdict unparseable: {e}")))?;
 
+        // The interface checks these bytes against the hash *this
+        // user's mandate* pinned. Sending the currently published
+        // manifest would make every verdict for a pre-republication
+        // mandate fail that check — the sanction would silently never
+        // execute, and the case would look decided from here.
         let submission = VerdictSubmission {
             verdict,
-            consented_manifest: self.consented_manifest.clone(),
+            consented_manifest: consented_manifest
+                .map(util::base64_encode)
+                .unwrap_or_else(|| self.published_manifest.clone()),
         };
 
         let mut request = self
@@ -84,10 +96,10 @@ impl Delivery {
         if !self.configured() {
             return Ok(());
         }
-        for (verdict_ref, raw) in store.undelivered_verdicts()? {
-            if self.deliver(&raw).await? {
-                store.mark_delivered(&verdict_ref)?;
-                tracing::info!(%verdict_ref, "verdict delivered");
+        for queued in store.undelivered_verdicts()? {
+            if self.deliver(&queued.raw, queued.consented_manifest.as_deref()).await? {
+                store.mark_delivered(&queued.verdict_ref)?;
+                tracing::info!(verdict_ref = %queued.verdict_ref, "verdict delivered");
             }
         }
         Ok(())

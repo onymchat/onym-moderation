@@ -69,15 +69,39 @@ async fn main() {
 
     // The manifest names an operator key; verdicts are checked against
     // it downstream. If it doesn't match the key we sign with, every
-    // verdict we issue will be refused — better to say so at boot than
-    // to discover it on the first ban.
+    // verdict this authority issues is unverifiable — so refuse to
+    // start rather than run a service whose output nobody can check. A
+    // warning was not enough: it produces an authority that looks
+    // healthy, decides cases, and moves no marks.
     let signing_reference = util::key_reference(state.signing_key.verifying_key().as_bytes());
     if state.config.manifest.operator_key != signing_reference {
-        tracing::error!(
-            manifest_operator = %state.config.manifest.operator_key,
-            %signing_reference,
-            "manifest `operator` does not match the signing key — every verdict will be refused"
+        eprintln!(
+            "Configuration error: the manifest's `operator` is {} but this service signs with \
+             {}.\n\nEvery verdict issued would be refused downstream. Put the signing key in the \
+             manifest's `operator` field, or point AUTHORITY_SIGNING_SEED at the key the manifest \
+             already names.",
+            state.config.manifest.operator_key, signing_reference
         );
+        std::process::exit(1);
+    }
+
+    // An expired manifest may not take new mandates or open new cases
+    // (§5.2 constraint 5). Live process continues, so this is a refusal
+    // at intake rather than at startup — but say it loudly at boot,
+    // because the symptom otherwise is "reports mysteriously refused".
+    match util::parse_timestamp(&state.config.manifest.valid_until) {
+        Ok(valid_until) if valid_until <= time::OffsetDateTime::now_utc() => {
+            tracing::error!(
+                valid_until = %state.config.manifest.valid_until,
+                "manifest validUntil has passed: no new mandate or case will be accepted. \
+                 Cases already open still run to their deadlines."
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("Configuration error: manifest validUntil is unparseable: {e}");
+            std::process::exit(1);
+        }
     }
 
     if state.config.moderator_token.is_none() {

@@ -114,6 +114,11 @@ pub struct Report {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaseResponse {
+    /// The case this answers. Inside the signed bytes on purpose: a
+    /// response that named no case could be lifted from one case and
+    /// replayed onto another, so an innocuous "that wasn't me" would
+    /// register as an answer to an accusation the signer never saw.
+    pub case_id: String,
     pub statement: String,
     #[serde(default)]
     pub evidence: Vec<EvidenceItem>,
@@ -124,6 +129,9 @@ pub struct CaseResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppealSubmission {
+    /// The case appealed. Signed, for the same replay reason as
+    /// `CaseResponse::case_id`.
+    pub case_id: String,
     /// `"appeal"` or `"new-holder-claim"`. The latter is the device's
     /// new owner, which §5.7 makes a mandatory class with expedited
     /// review — the device is not the person.

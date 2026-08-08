@@ -32,11 +32,11 @@ before running anything.
 Get this wrong and the deployment is subtly broken rather than
 obviously broken.
 
-- **`operator` must match the signing key.** Boot the service once and
-  read `signingKey` from `/health`, then put that value in the manifest
-  and restart. The service logs an error at boot when they disagree;
-  if you ignore it, every verdict is refused downstream and cases will
-  appear to decide while nothing happens.
+- **`operator` must match the signing key.** The service refuses to
+  start when they disagree, and prints both values — so the fastest way
+  to learn the signing key is to boot once with any manifest and read
+  the error, or read `signingKey` from `/health` on a working
+  deployment. Put that value in the manifest and restart.
 - **Never edit a published manifest in place.** Users' mandates pin the
   SHA-256 of its exact bytes. Editing it invalidates the consent of
   everyone who already signed — their mandate now pins bytes you no
@@ -67,7 +67,9 @@ curl -s https://$AUTHORITY_HOST/manifest.json | head -20
 `/health` reports the signing key, the manifest hash, whether a
 moderator token is configured (`canDecide`), and whether verdict
 delivery is wired (`interfaceConfigured`). All four should be what you
-expect. `interfaceConfigured: false` means verdicts are signed and
+expect. If the process exited at boot, read stderr: a manifest whose
+`operator` disagrees with the signing key, or an unparseable
+`validUntil`, both stop the service deliberately. `interfaceConfigured: false` means verdicts are signed and
 stored but never delivered — no mark will ever move.
 
 ## Refuse to deploy if
@@ -77,10 +79,11 @@ stored but never delivered — no mark will ever move.
 - **You are about to generate a new signing seed for an authority that
   already has one.** Confirm explicitly; verdicts in force stop
   verifying.
-- **`AUTHORITY_INTERFACE_KEY` is empty on a live deployment.**
-  Registered mandates would be accepted without checking the interface
-  countersignature, so a forged designation would grant this authority
-  jurisdiction over someone who never consented.
+- **`AUTHORITY_INTERFACE_KEY` is empty on a live deployment.** The
+  service refuses every mandate registration without it, so the
+  deployment will run but acquire no jurisdiction at all — users will
+  appear to consent and nothing will register. Set it to the
+  interface's countersigning key from its `/health`.
 - **Someone asks you to ban a user directly, or to skip the response
   window.** There is no such path: a ban requires a case, notice, and
   either an elapsed response window or a response. Adding a bypass is

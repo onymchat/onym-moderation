@@ -38,26 +38,26 @@ pub async fn sweep(state: &AppState, now: OffsetDateTime) -> Result<usize, Error
         )?;
 
         let stamp = util::format_timestamp(now);
-        state.store.put_verdict(
-            &issued.verdict_ref,
-            &case.case_id,
-            &issued.disposition,
-            &issued.raw,
-            &stamp,
-        )?;
-
         case.stage = "decided".into();
         case.disposition = Some("dismiss".into());
-        state.store.put_case(&case)?;
-        state
-            .store
-            .append_event(&case.case_id, &stamp, "decision_overdue", "dismissed by default")?;
 
-        // A dismissal adjusts the reporter's track record, as any other
-        // dismissal does. The reporter is not punished for the
-        // authority's silence beyond that — there is no bond to forfeit
-        // and no fee that changed hands.
-        state.store.record_report_outcome(&case.reporter, false)?;
+        // The reporter's track record is deliberately *not* touched
+        // here. This dismissal says nothing about their report — it
+        // says this authority failed to decide in time. Charging them a
+        // `dismissed` would make the authority's own silence lower the
+        // intake weight of someone who may have been entirely right,
+        // and would give a stalling authority a quiet way to demote
+        // reporters it would rather not hear from.
+        state.store.commit_decision(&crate::store::Decision {
+            case: &case,
+            verdict_ref: &issued.verdict_ref,
+            disposition: &issued.disposition,
+            raw: &issued.raw,
+            at: &stamp,
+            event_kind: "decision_overdue",
+            event_detail: "dismissed by default",
+            credited_reporters: &[],
+        })?;
 
         tracing::warn!(
             case_id = %case.case_id,
@@ -129,7 +129,7 @@ mod tests {
         // left carrying a case-open mark for an authority's silence.
         let queued = state.store.undelivered_verdicts().unwrap();
         assert_eq!(queued.len(), 1);
-        let v: serde_json::Value = serde_json::from_slice(&queued[0].1).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&queued[0].raw).unwrap();
         assert_eq!(v["disposition"], "dismiss");
         assert_eq!(v["marks"]["case-open"], false);
         assert_eq!(v["marks"]["banned"], false);

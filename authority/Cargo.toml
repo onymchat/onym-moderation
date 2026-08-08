@@ -22,3 +22,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Drives the router directly in tests: every refusal below is exercised
+# through the real handler stack, not a reimplementation of it.
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
