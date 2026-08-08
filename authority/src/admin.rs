@@ -307,11 +307,24 @@ fn assessment_section(state: &AppState, case_id: &str) -> String {
 
 fn review_form(case: &CaseRecord) -> String {
     // Reversal is only meaningful against a ban; upholding is only
-    // meaningful while an appeal is pending.
+    // meaningful while something is pending.
     let can_reverse = case.disposition.as_deref() == Some("ban");
-    let appeal_pending = case.appeal_state == "pending";
+    let new_holder = case.appeal_state == "new-holder-pending";
+    let appeal_pending = case.appeal_state == "pending" || new_holder;
 
     let mut out = String::from("<h2>Review</h2>");
+    if new_holder {
+        // Said plainly, because it changes what the reviewer is being
+        // asked. A new-holder claim does not say the verdict was
+        // wrong; it says the device changed hands, and the mark is now
+        // punishing someone the case was never about.
+        out.push_str(
+            "<p><strong>This is a new-holder claim, not an appeal.</strong> The claim is not \
+             that the verdict was wrong — it is that this device has a different owner now, \
+             and the mark is punishing them. Reversing clears the marks; refusing leaves them \
+             in force against hardware whose holder may have changed.</p>",
+        );
+    }
     if !appeal_pending && !can_reverse {
         out.push_str(
             "<p class=empty>No appeal is pending and there is no ban to reverse, so there is \
@@ -328,9 +341,10 @@ fn review_form(case: &CaseRecord) -> String {
         id = escape(&case.case_id)
     ));
     if appeal_pending {
-        out.push_str(
-            "<button name=outcome value=uphold class=secondary>Uphold the verdict</button> ",
-        );
+        out.push_str(&format!(
+            "<button name=outcome value=uphold class=secondary>{}</button> ",
+            if new_holder { "Refuse the claim — marks stay" } else { "Uphold the verdict" }
+        ));
     }
     if can_reverse {
         out.push_str("<button name=outcome value=reverse>Reverse — clears the marks</button>");
@@ -376,9 +390,10 @@ async fn review(
         .store
         .case(&case_id)?
         .ok_or_else(|| Error::NotFound(format!("case {case_id}")))?;
-    if form.outcome == "uphold" && case.appeal_state != "pending" {
+    let new_holder = case.appeal_state == "new-holder-pending";
+    if form.outcome == "uphold" && case.appeal_state != "pending" && !new_holder {
         return Err(Error::CaseState(
-            "there is no appeal pending on this case to uphold".into(),
+            "there is no appeal or new-holder claim pending on this case to decide".into(),
         ));
     }
     if form.outcome == "reverse" && case.disposition.as_deref() != Some("ban") {
@@ -387,19 +402,26 @@ async fn review(
 
     match form.outcome.as_str() {
         "uphold" => {
-            state.store.set_appeal_state(
-                &case_id,
-                "upheld",
-                &stamp,
-                "appeal_upheld",
-                &form.reasoning,
-            )?;
+            // The case log has to say which kind of review happened. A
+            // device-changed-hands claim recorded as "appeal upheld"
+            // is a record of a review nobody asked for.
+            let (state_after, event) = if new_holder {
+                ("new-holder-refused", "new_holder_claim_refused")
+            } else {
+                ("upheld", "appeal_upheld")
+            };
+            state.store.set_appeal_state(&case_id, state_after, &stamp, event, &form.reasoning)?;
         }
         "reverse" => {
             // The reviewer saw the classifier's assessment on the way
             // here, so the decision is recorded as assisted rather than
             // as unaided human judgment.
-            decisions::apply(
+            // The reversal and the record of the review that produced
+            // it commit together. Separately, a failure between them
+            // left the case reversed while its appeal still read
+            // pending — back in the queue, with the review that
+            // decided it missing from the file.
+            decisions::apply_with_appeal_state(
                 &state,
                 &case_id,
                 Disposition::Reverse,
@@ -408,14 +430,15 @@ async fn review(
                 // form was submitted from, so the reviewer did see it.
                 Decider::HumanAssisted,
                 now,
+                Some(if new_holder { "new-holder-granted" } else { "reversed" }),
             )
             .await?;
-            state.store.set_appeal_state(
+            state.store.append_event_bounded(
                 &case_id,
-                "reversed",
                 &stamp,
-                "appeal_reversed",
+                if new_holder { "new_holder_claim_granted" } else { "appeal_reversed" },
                 &form.reasoning,
+                32,
             )?;
         }
         other => return Err(Error::BadRequest(format!("unknown outcome {other:?}"))),
@@ -627,6 +650,60 @@ mod tests {
         .unwrap();
 
         assert_eq!(state.store.case("c1").unwrap().unwrap().appeal_state, "upheld");
+    }
+
+
+    /// A new-holder claim reaching the panel must be decided as one.
+    /// Recorded as "appeal upheld", the case log would claim a review
+    /// nobody asked for.
+    #[tokio::test]
+    async fn a_new_holder_claim_is_refused_as_itself_not_as_an_appeal() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        state.store.put_case(&reviewable_case(Some("ban"), "new-holder-pending")).unwrap();
+
+        review(
+            State(state.clone()),
+            Path("c1".to_string()),
+            signed_in(&state),
+            Form(ReviewForm { outcome: "uphold".into(), reasoning: "hash:reviewed".into() }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.store.case("c1").unwrap().unwrap().appeal_state, "new-holder-refused");
+        let events = state.store.events("c1").unwrap();
+        assert!(events.iter().any(|(_, kind, _)| kind == "new_holder_claim_refused"));
+        assert!(
+            !events.iter().any(|(_, kind, _)| kind == "appeal_upheld"),
+            "the log must not claim an appeal was upheld"
+        );
+    }
+
+    /// Reversing on appeal moves the case and the appeal together.
+    /// Separately, a failure between them left the case reversed while
+    /// its appeal still read pending — back in the queue, with the
+    /// review that decided it missing from the file.
+    #[tokio::test]
+    async fn a_reversal_and_its_appeal_state_move_together() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        state.store.put_case(&reviewable_case(Some("ban"), "pending")).unwrap();
+
+        review(
+            State(state.clone()),
+            Path("c1".to_string()),
+            signed_in(&state),
+            Form(ReviewForm { outcome: "reverse".into(), reasoning: "hash:reviewed".into() }),
+        )
+        .await
+        .unwrap();
+
+        let case = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(case.disposition.as_deref(), Some("reversed"));
+        assert_eq!(case.appeal_state, "reversed");
+        assert!(
+            state.store.cases_awaiting_appeal_review().unwrap().is_empty(),
+            "a reviewed appeal leaves the queue"
+        );
     }
 
 }

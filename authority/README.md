@@ -109,6 +109,18 @@ Three configurations, chosen with `AUTHORITY_TRIAGE_MODE`:
 moderation model triages each case, and a person reads the file when
 someone says the machine got it wrong. Appeals are the panel's queue.
 
+With triage enabled, an `AUTHORITY_TRIAGE_URL` that is not on this host
+is a **startup failure**, not a warning. Case evidence is content a
+reporter disclosed for adjudication; a log line about having sent it to
+a third party arrives after the disclosure has happened.
+
+**A new-holder claim is queued as itself, not as an appeal.** It does
+not say the verdict was wrong — it says the device changed hands and
+the mark is now punishing someone the case was never about. Both reach
+a human, and the panel says which it is showing, because "appeal
+upheld" in the log of a case nobody appealed is a record of a review
+that did not happen.
+
 Whatever the mode, three things do not change:
 
 - **A ban waits for the response window** — and so does the assessment
@@ -264,10 +276,16 @@ classify-on-arrival path, because there is nothing for one to do.
 The sweep spaces retries out and gives up eventually: a model that
 could not read a case a moment ago is unlikely to read it thirty
 seconds later, and a case it will never read should end at its decision
-deadline — dismissed — rather than being retried until then. It also
-runs after verdict delivery and is bounded per tick, so one hung
-inference cannot hold up verdicts already signed and waiting to
-execute.
+deadline — dismissed — rather than being retried until then. A failed
+round-trip counts as an attempt, which is the failure the backoff
+exists for; recording only the model's *readable* answers would have
+left an unreachable model re-hit for every due case, every tick.
+
+Assessment runs in its own task, on its own clock. Deadlines and
+delivery never wait behind it: 25 cases awaited in turn at a two-minute
+timeout is a tick far longer than the interval, and "undecided is
+dismissal" is the invariant that must not queue behind an unrelated
+inference.
 
 Every untrusted field is fenced, and text that would close its own
 fence is defanged on the way in — visibly, so a reviewer can see the

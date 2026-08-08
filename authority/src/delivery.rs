@@ -250,6 +250,7 @@ mod tests {
                 credited_reporters: &[],
                 expect_stage: "open",
                 expect_disposition: None,
+                appeal_state: None,
             })
             .unwrap();
     }

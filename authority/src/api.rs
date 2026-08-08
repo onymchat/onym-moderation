@@ -2684,5 +2684,80 @@ mod tests {
         harness.state.store.mark_delivered(&opening_ref).unwrap();
         assert!(harness.state.store.open_case_verdict_delivered(&case_id).unwrap());
     }
+    /// Re-filing a valid signed appeal used to reset `appeal_state` to
+    /// `pending`, so an accused could flip a completed review — even a
+    /// reversal — back into the queue by POSTing the same object
+    /// again. That erases the record of a review that did happen, in
+    /// the place the panel reads it from.
+    #[tokio::test]
+    async fn an_appeal_cannot_be_refiled_to_reopen_a_completed_review() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+
+        // Ban it, so there is something to appeal.
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        let appeal = || {
+            signed(
+                json!({"caseId": case_id, "kind": "appeal", "statement": "it was a quotation"}),
+                "signature",
+                &[ACCUSED_SEED],
+            )
+        };
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(harness.state.store.case(&case_id).unwrap().unwrap().appeal_state, "pending");
+
+        // A moderator reviews it.
+        harness
+            .state
+            .store
+            .set_appeal_state(&case_id, "upheld", "2026-08-09T00:00:00Z", "appeal_upheld", "hash:r")
+            .unwrap();
+
+        // Re-filing must not put it back in the queue.
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            harness.state.store.case(&case_id).unwrap().unwrap().appeal_state,
+            "upheld",
+            "the completed review stands"
+        );
+    }
+
+    /// A device-changed-hands claim is not an appeal against the
+    /// verdict, and must not be queued as one — the panel's uphold
+    /// branch would otherwise write "appeal upheld" into the log of a
+    /// case nobody appealed.
+    #[tokio::test]
+    async fn a_new_holder_claim_is_queued_as_itself() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        let claim = serde_json::to_vec(&json!({
+            "caseId": case_id,
+            "kind": "new-holder-claim",
+            "statement": "I bought this device secondhand",
+        }))
+        .unwrap();
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), claim).await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert_eq!(
+            harness.state.store.case(&case_id).unwrap().unwrap().appeal_state,
+            "new-holder-pending",
+            "not 'pending' — it is not an appeal"
+        );
+        // It still reaches a human: both kinds are in the queue.
+        assert_eq!(harness.state.store.cases_awaiting_appeal_review().unwrap().len(), 1);
+    }
 
 }

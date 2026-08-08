@@ -140,16 +140,66 @@ impl Triage {
 
         let document = casedoc::build(&state.store, case)?;
         if document.evidence_items == 0 {
-            return Err(Error::Internal(format!(
-                "case {} has no stored evidence to classify",
-                case.case_id
-            )));
+            // Recorded, not returned as an error. A case with no
+            // evidence will never acquire any, so retrying it forever
+            // is pure noise; recording a no-decision lets the attempt
+            // counter carry it to its decision deadline, where it is
+            // dismissed.
+            return self.record(
+                state,
+                case,
+                profile,
+                "",
+                &document,
+                Assessed {
+                    outcome: Outcome::NoDecision,
+                    score: None,
+                    labels: Vec::new(),
+                    note: format!(
+                        "case {} has no stored evidence to classify",
+                        case.case_id
+                    ),
+                },
+                now,
+            );
         }
 
         let body = profile
             .request_body(&case.class_id, &document.text)
             .map_err(Error::Internal)?;
-        let output = self.infer(config, body).await?;
+
+        // A failed round-trip is an *attempt*, and has to be recorded
+        // as one. Returning early here meant no `assessments` row was
+        // written, so the case came back with `attempts = 0` on the
+        // next sweep — and the backoff and the give-up counter, which
+        // exist for exactly this failure, never applied to it. A model
+        // that was down got re-hit for every due case, every tick,
+        // until each case's decision deadline.
+        let output = match self.infer(config, body).await {
+            Ok(output) => output,
+            Err(e) => {
+                let assessment = self.record(
+                    state,
+                    case,
+                    profile,
+                    "",
+                    &document,
+                    Assessed {
+                        outcome: Outcome::NoDecision,
+                        score: None,
+                        labels: Vec::new(),
+                        note: format!("the model could not be consulted: {e}"),
+                    },
+                    now,
+                )?;
+                // Still an error to the caller: nothing was decided,
+                // and the log should say the model failed rather than
+                // that it declined to decide.
+                tracing::warn!(case_id = %case.case_id, error = %e, "inference failed; attempt recorded");
+                let _ = assessment;
+                return Err(e);
+            }
+        };
         let assessed = profile.evaluate(&case.class_id, &output);
 
         self.record(state, case, profile, &output.text, &document, assessed, now)
@@ -187,11 +237,12 @@ impl Triage {
         let raw = serde_json::to_vec(&assessment)
             .map_err(|e| Error::Internal(format!("encode assessment: {e}")))?;
         state.store.put_assessment(&case.case_id, &raw, &assessment.outcome)?;
-        state.store.append_event(
+        state.store.append_event_bounded(
             &case.case_id,
             &util::format_timestamp(now),
             "triage_assessed",
             &format!("{} by {} ({})", assessment.outcome, profile.id, assessment.note),
+            128,
         )?;
         Ok(assessment)
     }
@@ -695,8 +746,7 @@ mod tests {
         case.responded = true;
         let reply = serde_json::json!({"caseId": "c1", "statement": "it is a song lyric"});
         store
-            .put_response(&case, &serde_json::to_vec(&reply).unwrap(), false,
-                          "2026-08-03T00:00:00Z", "response", "it is a song lyric")
+            .put_response(&crate::store::ResponseFiling { case: &case, raw: &serde_json::to_vec(&reply).unwrap(), late: false, filed_at: "2026-08-03T00:00:00Z", event_kind: "response", event_detail: "it is a song lyric", limit: 32 })
             .unwrap();
 
         let state =
@@ -728,4 +778,88 @@ mod tests {
         }
         assert_eq!(unmappable_classes(&narrowed, &manifest), vec!["csam".to_string()]);
     }
+
+    /// The failure the backoff and the give-up counter were written
+    /// for, and the one they did not cover. A failed round-trip
+    /// returned early without writing an assessment row, so the case
+    /// came back with `attempts = 0` every sweep: no backoff, no cap,
+    /// and a model that was down got re-hit for every due case until
+    /// each case's decision deadline.
+    #[tokio::test]
+    async fn a_failed_inference_records_an_attempt() {
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "csam", "2026-08-04T00:00:00Z");
+        // A port nothing is listening on.
+        let state = AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            "http://127.0.0.1:1/v1/chat/completions",
+            TriageMode::Autonomous,
+        );
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let (raw, applied) = state
+            .store
+            .assessment("c1")
+            .unwrap()
+            .expect("a failed attempt is still an attempt, and has to be on file");
+        assert!(!applied);
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(assessment.outcome, "no-decision");
+        assert!(
+            assessment.note.contains("could not be consulted"),
+            "the record must say the model failed, not that it declined: {}",
+            assessment.note
+        );
+
+        // And the case is still open, still due — but now carrying an
+        // attempt, so the sweep can space the next one out.
+        let due = state.store.cases_awaiting_assessment("2026-08-10T00:00:00Z").unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].1, 1, "the attempt was counted");
+        assert!(due[0].2.is_some(), "and timestamped, so backoff has something to measure");
+    }
+
+    /// A case with no evidence will never acquire any, so retrying it
+    /// until its deadline is noise. It is recorded as a no-decision and
+    /// carried to the deadline by the attempt counter.
+    #[tokio::test]
+    async fn a_case_with_no_evidence_is_recorded_not_retried_forever() {
+        let store = crate::store::Store::in_memory().unwrap();
+        let case = CaseRecord {
+            case_id: "c1".into(),
+            accused: "onym:key:acc".into(),
+            reporter: "onym:key:rep".into(),
+            class_id: "csam".into(),
+            mandate_ref: "m1".into(),
+            device_binding: "d1".into(),
+            stage: "open".into(),
+            opened_at: "2026-08-01T00:00:00Z".into(),
+            response_deadline: "2026-08-04T00:00:00Z".into(),
+            decision_deadline: "2026-08-30T00:00:00Z".into(),
+            responded: false,
+            disposition: None,
+            appeal_deadline: None,
+            appeal_state: "none".into(),
+        };
+        store.put_case(&case).unwrap();
+        let state = AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            "http://127.0.0.1:1/v1/chat/completions",
+            TriageMode::Autonomous,
+        );
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let (raw, _) = state.store.assessment("c1").unwrap().expect("recorded");
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(assessment.outcome, "no-decision");
+        assert!(assessment.note.contains("no stored evidence"), "{}", assessment.note);
+        assert_eq!(state.store.case("c1").unwrap().unwrap().stage, "open");
+    }
+
 }

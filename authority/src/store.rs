@@ -51,6 +51,10 @@ pub struct Decision<'a> {
     /// verdicts for one case and credit its reporters twice.
     pub expect_stage: &'a str,
     pub expect_disposition: Option<&'a str>,
+    /// An appeal state to move in the same transaction, when this
+    /// decision *is* the answer to an appeal. Left `None` by the
+    /// deciders that have nothing to do with one.
+    pub appeal_state: Option<&'a str>,
 }
 
 /// A verdict awaiting delivery, carrying the manifest bytes the case
@@ -1066,7 +1070,9 @@ impl Store {
     pub fn cases_awaiting_appeal_review(&self) -> Result<Vec<CaseRecord>, Error> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(&format!(
-            "SELECT {} FROM cases WHERE appeal_state = 'pending' ORDER BY opened_at",
+            "SELECT {} FROM cases
+              WHERE appeal_state IN ('pending', 'new-holder-pending')
+              ORDER BY opened_at",
             Self::CASE_COLUMNS
         ))?;
         let rows = statement.query_map([], Self::case_from_row)?;
@@ -1123,15 +1129,6 @@ impl Store {
         Ok(out)
     }
 
-    /// Open cases ready for automated assessment: the accused's
-    /// response window has closed, and either nothing has assessed them
-    /// yet or the last attempt reached no decision.
-    ///
-    /// The window condition is policy, not scheduling — §4.1 has the
-    /// authority assess the *completed* case document. Retrying a
-    /// no-decision is the "valid retry" §4.2 allows: a model that
-    /// returned garbage once may answer on the next pass, and if it
-    /// never does, the decision deadline dismisses the case.
     /// Open cases ready for automated assessment: the accused's
     /// response window has closed, and either nothing has assessed them
     /// yet or the last attempt reached no decision.
@@ -1261,6 +1258,7 @@ impl Store {
             credited_reporters,
             expect_stage,
             expect_disposition,
+            appeal_state,
         } = decision;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -1306,6 +1304,15 @@ impl Store {
         )?;
         for reporter in *credited_reporters {
             Self::credit_reporter(&tx, reporter, *disposition == "ban")?;
+        }
+        // Same transaction: a reversal that committed while its appeal
+        // stayed `pending` would leave the case reversed and still in
+        // the panel's queue, with the review it answers unrecorded.
+        if let Some(appeal_state) = appeal_state {
+            tx.execute(
+                "UPDATE cases SET appeal_state = ?2 WHERE case_id = ?1",
+                params![case.case_id, appeal_state],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -1598,6 +1605,7 @@ mod tests {
                 credited_reporters: &credited,
                 expect_stage: "open",
                 expect_disposition: None,
+                appeal_state: None,
             })
             .unwrap();
     }
@@ -1886,6 +1894,7 @@ mod tests {
             credited_reporters: &["onym:key:aa".to_string()],
             expect_stage: "open",
             expect_disposition: None,
+            appeal_state: None,
         });
 
         assert!(matches!(second, Err(Error::CaseState(_))), "{second:?}");
@@ -1917,6 +1926,7 @@ mod tests {
             credited_reporters: &[],
             expect_stage: "decided",
             expect_disposition: Some("ban"),
+            appeal_state: None,
         });
         assert!(matches!(result, Err(Error::CaseState(_))), "a dismissal is not a ban to reverse");
     }

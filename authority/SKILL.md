@@ -118,8 +118,9 @@ The line reports the profile, model repository, revision and digests
 actually in force — check them against the profile document users were
 shown.
 
-If the logs carry `the moderation model is NOT on this host`, stop:
-case evidence is being sent to a third party. If they carry `this
+If the service exits with `AUTHORITY_TRIAGE_URL is ... not on this
+host`, that is deliberate: case evidence would be sent to a third
+party. Run the model locally or turn triage off; do not work around it. If they carry `this
 profile has no rule or native category for these manifest classes`,
 cases in those classes will never be decided automatically; they wait
 for a human and dismiss at their deadline.

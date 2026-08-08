@@ -69,6 +69,7 @@ async fn sweep_overdue(
             // meantime, theirs stands and this one does not land.
             expect_stage: "open",
             expect_disposition: None,
+            appeal_state: None,
         });
         match committed {
             Ok(()) => {}
@@ -127,7 +128,9 @@ const MAX_ASSESSMENT_ATTEMPTS: i64 = 24;
 fn retry_due(attempts: i64, last_attempt: Option<&str>, now: OffsetDateTime) -> bool {
     let Some(last) = last_attempt else { return true };
     let Ok(last) = util::parse_timestamp(last) else { return true };
-    let minutes = (5i64 << attempts.min(6)).min(360);
+    // Clamped at 7 shifts, so the doubling actually reaches the stated
+    // ceiling: `5 << 6` is 320, which `min(360)` never touched.
+    let minutes = (5i64 << attempts.min(7)).min(360);
     now >= last + time::Duration::minutes(minutes)
 }
 
@@ -170,20 +173,31 @@ pub async fn triage_sweep(state: &AppState, now: OffsetDateTime) -> Result<(), E
 /// costs nothing.
 pub fn spawn(state: Arc<AppState>) {
     let interval = std::time::Duration::from_secs(state.config.deadline_sweep_secs);
+
+    // Deadlines and delivery run in their own task, on their own
+    // clock. Sharing a loop with assessment meant a slow model delayed
+    // them: 25 cases awaited in turn at a two-minute timeout is a
+    // worst-case tick far longer than the interval, and "undecided is
+    // dismissal" is the invariant that must not wait behind an
+    // unrelated inference. Nothing here calls the model.
+    let deadlines = state.clone();
     tokio::spawn(async move {
         loop {
-            if let Err(e) = sweep(&state, OffsetDateTime::now_utc()).await {
+            if let Err(e) = sweep(&deadlines, OffsetDateTime::now_utc()).await {
                 tracing::error!(error = %e, "deadline sweep failed");
             }
-            // Delivery before triage. Assessment awaits each case in
-            // turn against a model that may take two minutes, so one
-            // hung inference used to hold up every verdict already
-            // signed and waiting to be executed — a decided case would
-            // sit undelivered because an unrelated undecided one was
-            // slow.
-            if let Err(e) = state.delivery.flush(&state.store).await {
+            if let Err(e) = deadlines.delivery.flush(&deadlines.store).await {
                 tracing::error!(error = %e, "verdict delivery failed");
             }
+            tokio::time::sleep(interval).await;
+        }
+    });
+
+    if state.triage.is_none() {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
             if let Err(e) = triage_sweep(&state, OffsetDateTime::now_utc()).await {
                 tracing::error!(error = %e, "triage sweep failed");
             }
@@ -264,7 +278,11 @@ mod tests {
         // The wait grows, and stops growing at six hours.
         assert!(!retry_due(6, Some("2026-08-09T08:00:00Z"), now));
         assert!(retry_due(6, Some("2026-08-09T05:00:00Z"), now));
-        assert!(retry_due(50, Some("2026-08-09T05:00:00Z"), now), "the ceiling is six hours");
+        // The documented ceiling is six hours, and the shift now
+        // actually reaches it: `5 << 6` is 320 minutes, so the clamp at
+        // 6 made `min(360)` dead code and the real ceiling 5h20m.
+        assert!(!retry_due(9, Some("2026-08-09T06:30:00Z"), now), "5h30m is inside six hours");
+        assert!(retry_due(9, Some("2026-08-09T05:30:00Z"), now), "6h30m is past it");
 
         // An unreadable timestamp does not wedge the case: it retries.
         assert!(retry_due(3, Some("not a timestamp"), now));

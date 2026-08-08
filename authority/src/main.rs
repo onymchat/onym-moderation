@@ -154,14 +154,22 @@ async fn main() {
             );
         }
         if Config::triage_leaves_this_host(triage) {
-            tracing::error!(
-                url = %triage.url,
-                "the moderation model is NOT on this host: case evidence — content a reporter \
-                 disclosed for adjudication — will be sent to a third party. That is a \
-                 confidentiality change the manifest must declare (§8 obligation 6). Run the \
-                 model locally, or publish a manifest whose confidentiality policy says where \
-                 evidence goes."
+            // Fatal, not logged. Everything else consent-critical here
+            // refuses to start — no default profile, no mode without a
+            // profile — and this is the one that puts recipient-
+            // disclosed evidence in front of a third party. A log line
+            // is exactly what an operator misses, and by the time they
+            // read it the disclosure has already happened.
+            eprintln!(
+                "Configuration error: AUTHORITY_TRIAGE_URL is {}, which is not on this host.\n\n\
+                 Case evidence is content a reporter disclosed for adjudication. Sending it to \
+                 a third party is a further disclosure — one the manifest's confidentiality \
+                 policy must declare (§8 obligation 6), and one the reference policy makes a \
+                 change requiring fresh consent.\n\n\
+                 Run the model on this host, or set AUTHORITY_TRIAGE_MODE=off.",
+                triage.url
             );
+            std::process::exit(1);
         }
         if state.config.manifest.confidentiality.is_none() {
             tracing::warn!(

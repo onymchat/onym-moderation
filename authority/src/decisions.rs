@@ -78,6 +78,24 @@ pub async fn apply(
     decider: Decider,
     now: OffsetDateTime,
 ) -> Result<Issued, Error> {
+    apply_with_appeal_state(state, case_id, disposition, reasoning, decider, now, None).await
+}
+
+/// As `apply`, moving the case's appeal state in the same transaction.
+/// Used by the panel: a reversal on appeal and the record of that
+/// appeal having been reviewed are one fact, and committing them
+/// separately left the case reversed while its appeal still read
+/// `pending`.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_with_appeal_state(
+    state: &AppState,
+    case_id: &str,
+    disposition: Disposition,
+    reasoning: &str,
+    decider: Decider,
+    now: OffsetDateTime,
+    appeal_state: Option<&str>,
+) -> Result<Issued, Error> {
     let mut case = state
         .store
         .case(case_id)?
@@ -182,6 +200,7 @@ pub async fn apply(
         // here, one of them a background sweep.
         expect_stage: if disposition == Disposition::Reverse { "decided" } else { "open" },
         expect_disposition: if disposition == Disposition::Reverse { Some("ban") } else { None },
+        appeal_state,
     })?;
 
     state.delivery.flush(&state.store).await?;

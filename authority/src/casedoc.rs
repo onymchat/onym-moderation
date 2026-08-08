@@ -215,14 +215,15 @@ mod tests {
             "evidence": [{"disclosedContent": "send me that", "authenticityProof": "sig"}],
         });
         store
-            .put_response(
-                &case(),
-                &serde_json::to_vec(&response).unwrap(),
-                false,
-                "2026-08-03T00:00:00Z",
-                "response",
-                "they asked me to send it",
-            )
+            .put_response(&crate::store::ResponseFiling {
+                case: &case(),
+                raw: &serde_json::to_vec(&response).unwrap(),
+                late: false,
+                filed_at: "2026-08-03T00:00:00Z",
+                event_kind: "response",
+                event_detail: "they asked me to send it",
+                limit: 32,
+            })
             .unwrap();
 
         let doc = build(&store, &case()).unwrap();
@@ -239,14 +240,15 @@ mod tests {
         let store = store_with_report("the material", None);
         let response = serde_json::json!({"caseId": "c1", "statement": "sorry, travelling"});
         store
-            .put_response(
-                &case(),
-                &serde_json::to_vec(&response).unwrap(),
-                true,
-                "2026-08-06T00:00:00Z",
-                "response_late",
-                "sorry, travelling",
-            )
+            .put_response(&crate::store::ResponseFiling {
+                case: &case(),
+                raw: &serde_json::to_vec(&response).unwrap(),
+                late: true,
+                filed_at: "2026-08-06T00:00:00Z",
+                event_kind: "response_late",
+                event_detail: "sorry, travelling",
+                limit: 32,
+            })
             .unwrap();
 
         let doc = build(&store, &case()).unwrap();
