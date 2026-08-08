@@ -574,7 +574,9 @@ fn join_case(
         .ok_or_else(|| Error::ClassOutsideMandate(existing.class_id.clone()))?;
     let response_days = util::parse_days(&class.response_window)
         .map_err(|e| Error::Internal(format!("manifest responseWindow: {e}")))?;
-    let decision_days = util::parse_days(&class.decision_deadline)
+    // Parsed to validate the consented terms, though the horizon it
+    // describes was fixed when this case opened and does not move.
+    util::parse_days(&class.decision_deadline)
         .map_err(|e| Error::Internal(format!("manifest decisionDeadline: {e}")))?;
 
     // The response window restarts — the accused needs time to answer
@@ -766,15 +768,15 @@ async fn respond(
     // The response is stored whole — statement *and* evidence. Keeping
     // only a summary line would mean deciding, and later reviewing on
     // appeal, without the material the accused actually offered.
-    state.store.put_response(
-        &case,
-        &body,
+    state.store.put_response(&crate::store::ResponseFiling {
+        case: &case,
+        raw: &body,
         late,
-        &stamp,
-        if late { "response_late" } else { "response" },
-        &response.statement,
-        MAX_RESPONSES_PER_CASE,
-    )?;
+        filed_at: &stamp,
+        event_kind: if late { "response_late" } else { "response" },
+        event_detail: &response.statement,
+        limit: MAX_RESPONSES_PER_CASE,
+    })?;
 
     Ok(Json(json!({ "caseId": case_id, "recorded": true, "late": late })))
 }

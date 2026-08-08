@@ -179,9 +179,11 @@ impl Store {
         // opened by an earlier build — and every read selecting it then
         // fails. On a deployment holding live marks that means coming
         // back up dead.
-        for (table, column, definition) in
-            [("verdicts", "decided_at", "TEXT NOT NULL DEFAULT ''")]
-        {
+        // One entry today; the list is the shape the next column will
+        // need, and forgetting to build it is how the authority's
+        // stores nearly came back up dead.
+        let added: &[(&str, &str, &str)] = &[("verdicts", "decided_at", "TEXT NOT NULL DEFAULT ''")];
+        for (table, column, definition) in added {
             Self::add_column(&conn, table, column, definition)?;
         }
         Ok(())

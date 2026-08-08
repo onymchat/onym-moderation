@@ -16,6 +16,19 @@ pub struct Store {
 /// moving the case, recording the event, and adjusting reporters'
 /// standing cannot drift apart into separate calls that a crash could
 /// interleave.
+/// One filed response: the material, when it arrived, and how many the
+/// case will hold. Grouped so the storage bound travels with the thing
+/// it bounds rather than as a trailing argument.
+pub struct ResponseFiling<'a> {
+    pub case: &'a CaseRecord,
+    pub raw: &'a [u8],
+    pub late: bool,
+    pub filed_at: &'a str,
+    pub event_kind: &'a str,
+    pub event_detail: &'a str,
+    pub limit: usize,
+}
+
 pub struct Decision<'a> {
     pub case: &'a CaseRecord,
     pub verdict_ref: &'a str,
@@ -563,16 +576,9 @@ impl Store {
 
     /// Store the accused's response whole, and mark the case as
     /// answered, in one write.
-    pub fn put_response(
-        &self,
-        case: &CaseRecord,
-        raw: &[u8],
-        late: bool,
-        filed_at: &str,
-        event_kind: &str,
-        event_detail: &str,
-        limit: usize,
-    ) -> Result<(), Error> {
+    pub fn put_response(&self, filing: &ResponseFiling<'_>) -> Result<(), Error> {
+        let ResponseFiling { case, raw, late, filed_at, event_kind, event_detail, limit } = filing;
+        let (late, limit) = (*late, *limit);
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let count: i64 = tx.query_row(
@@ -1334,38 +1340,38 @@ mod tests {
         store.put_case(&case).unwrap();
 
         store
-            .put_response(
-                &case,
-                b"{\"statement\":\"one\"}",
-                false,
-                "t1",
-                "response",
-                "one",
-                2,
-            )
+            .put_response(&ResponseFiling {
+                case: &case,
+                raw: b"{\"statement\":\"one\"}",
+                late: false,
+                filed_at: "t1",
+                event_kind: "response",
+                event_detail: "one",
+                limit: 2,
+            })
             .unwrap();
         store
-            .put_response(
-                &case,
-                b"{\"statement\":\"two\"}",
-                true,
-                "t2",
-                "response_late",
-                "two",
-                2,
-            )
+            .put_response(&ResponseFiling {
+                case: &case,
+                raw: b"{\"statement\":\"two\"}",
+                late: true,
+                filed_at: "t2",
+                event_kind: "response_late",
+                event_detail: "two",
+                limit: 2,
+            })
             .unwrap();
         assert!(
             store
-                .put_response(
-                    &case,
-                    b"{\"statement\":\"three\"}",
-                    false,
-                    "t3",
-                    "response",
-                    "three",
-                    2,
-                )
+                .put_response(&ResponseFiling {
+                    case: &case,
+                    raw: b"{\"statement\":\"three\"}",
+                    late: false,
+                    filed_at: "t3",
+                    event_kind: "response",
+                    event_detail: "three",
+                    limit: 2,
+                })
                 .is_err(),
             "the count and insert enforce the bound under one store lock"
         );
