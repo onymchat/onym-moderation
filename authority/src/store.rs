@@ -384,8 +384,12 @@ impl Store {
     pub fn mandates_for_user(&self, user_key: &str) -> Result<Vec<MandateRecord>, Error> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(
+            // `acceptedAt` is client-signed metadata, not a trustworthy
+            // ordering clock. Row insertion order is the authority's
+            // observation of which consent arrived last; INSERT OR
+            // IGNORE above makes replay unable to refresh it.
             "SELECT mandate_ref, user_key, device_binding, classes, manifest_hash
-               FROM mandates WHERE user_key = ?1 ORDER BY accepted_at DESC, rowid DESC",
+               FROM mandates WHERE user_key = ?1 ORDER BY rowid DESC",
         )?;
         let rows = statement.query_map(params![user_key], Self::mandate_from_row)?;
         let mut out = Vec::new();
@@ -400,7 +404,7 @@ impl Store {
         let record = conn
             .query_row(
                 "SELECT mandate_ref, user_key, device_binding, classes, manifest_hash
-                 FROM mandates WHERE user_key = ?1 ORDER BY accepted_at DESC, rowid DESC LIMIT 1",
+                 FROM mandates WHERE user_key = ?1 ORDER BY rowid DESC LIMIT 1",
                 params![user_key],
                 Self::mandate_from_row,
             )
@@ -797,6 +801,34 @@ impl Store {
             params![case_id, at, kind, detail],
         )?;
         Ok(())
+    }
+
+    /// Append an event only while fewer than `limit` events of this
+    /// kind exist for the case. The count and insert share the store
+    /// lock, so concurrent requests cannot all observe the same free
+    /// slot and overflow the bound.
+    pub fn append_event_bounded(
+        &self,
+        case_id: &str,
+        at: &str,
+        kind: &str,
+        detail: &str,
+        limit: usize,
+    ) -> Result<bool, Error> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM case_events WHERE case_id = ?1 AND kind = ?2",
+            params![case_id, kind],
+            |row| row.get(0),
+        )?;
+        if count >= limit as i64 {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
+            params![case_id, at, kind, detail],
+        )?;
+        Ok(true)
     }
 
     pub fn events(&self, case_id: &str) -> Result<Vec<(String, String, String)>, Error> {

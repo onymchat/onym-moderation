@@ -49,6 +49,15 @@ const MAX_STATEMENT_BYTES: usize = 16 * 1024;
 /// it — but not unbounded.
 const MAX_RESPONSES_PER_CASE: usize = 32;
 
+/// An authenticated accused may supplement an appeal, but cannot use
+/// the case event log as unbounded storage.
+const MAX_APPEALS_PER_CASE: usize = 32;
+
+/// The interface and authority may observe consent a few seconds apart.
+/// Anything farther in the future is a client-controlled ordering bid,
+/// not a credible consent timestamp.
+const MAX_MANDATE_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
+
 /// How many new-holder claims one case will record. Bounded rather
 /// than capped at one: this path cannot be authenticated, so a cap of
 /// one lets any stranger consume the genuine new owner's only remedy.
@@ -178,9 +187,28 @@ async fn accept_mandate(
         }
     }
 
+    if mandate.classes.is_empty() {
+        return Err(Error::BadRequest("mandate must consent to at least one class".into()));
+    }
+    if let Some(class_id) = mandate
+        .classes
+        .iter()
+        .find(|class_id| state.config.manifest.violation_class(class_id).is_none())
+    {
+        return Err(Error::BadRequest(format!(
+            "mandate class {class_id:?} is not declared by this authority"
+        )));
+    }
+
     let mandate_ref = util::sha256_hex(&signing_bytes);
     let accepted_at = util::parse_timestamp(&mandate.accepted_at)
         .map_err(|e| Error::BadRequest(format!("acceptedAt: {e}")))?;
+    let now = OffsetDateTime::now_utc();
+    if accepted_at > now + time::Duration::seconds(MAX_MANDATE_CLOCK_SKEW_SECONDS) {
+        return Err(Error::BadRequest(
+            "acceptedAt is too far in the future".into(),
+        ));
+    }
     // The manifest bytes are stored alongside the mandate, not merely
     // referenced: this mandate consents to *these* terms, and when the
     // published manifest is superseded the case must still be judged by
@@ -734,25 +762,34 @@ async fn appeal(
             return Err(Error::NotFound(format!("case {case_id}")));
         }
 
-        // Late filing of an appeal is refused (§10 `window_closed`).
-        // The new-holder path is not bounded this way: it stays open
-        // for as long as the ban runs.
-        if let Some(deadline) = case.appeal_deadline.as_deref() {
-            let deadline = util::parse_timestamp(deadline)
-                .map_err(|e| Error::Internal(format!("stored appealDeadline: {e}")))?;
-            if OffsetDateTime::now_utc() > deadline {
-                return Err(Error::WindowClosed("the appeal window has closed".into()));
-            }
+        if case.disposition.as_deref() != Some("ban") {
+            return Err(Error::CaseState("only a ban may be appealed".into()));
+        }
+        let deadline = case
+            .appeal_deadline
+            .as_deref()
+            .ok_or_else(|| Error::Internal("a banned case has no appealDeadline".into()))?;
+        let deadline = util::parse_timestamp(deadline)
+            .map_err(|e| Error::Internal(format!("stored appealDeadline: {e}")))?;
+        if OffsetDateTime::now_utc() > deadline {
+            return Err(Error::WindowClosed("the appeal window has closed".into()));
         }
     }
 
     let stamp = util::format_timestamp(OffsetDateTime::now_utc());
-    state.store.append_event(
+    let filed = state.store.append_event_bounded(
         &case_id,
         &stamp,
-        if new_holder { "new_holder_claim" } else { "appeal_filed" },
+        "appeal_filed",
         &submission.statement,
+        MAX_APPEALS_PER_CASE,
     )?;
+    if !filed {
+        return Err(Error::CaseState(format!(
+            "this case already holds {MAX_APPEALS_PER_CASE} appeals; further material belongs \
+             in one of them rather than in another filing"
+        )));
+    }
 
     tracing::info!(%case_id, kind = %submission.kind, "appeal filed");
     Ok(Json(json!({
@@ -1346,7 +1383,9 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
 
         let mut narrow = mandate_json(ACCUSED_SEED, json!(["csam"]), &manifest_hash);
-        narrow["acceptedAt"] = json!("2026-08-09T00:00:00Z");
+        // Deliberately older than the broad mandate: receipt order,
+        // not this client-controlled timestamp, decides precedence.
+        narrow["acceptedAt"] = json!("2026-07-31T00:00:00Z");
         let narrow = signed(narrow, "signatures", &[ACCUSED_SEED, INTERFACE_SEED]);
         let (status, narrow_response) = harness.post("/v1/mandates", narrow).await;
         assert_eq!(status, StatusCode::OK);
@@ -1365,6 +1404,40 @@ mod tests {
             narrow_response["mandateRef"].as_str().unwrap()
         );
         assert_eq!(current.classes, vec!["csam".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_future_or_policy_empty_mandate_is_refused() {
+        let harness = Harness::new();
+        let manifest_hash = util::sha256_hex(&harness.state.config.manifest_raw);
+
+        let mut future = mandate_json(ACCUSED_SEED, json!(["csam"]), &manifest_hash);
+        future["acceptedAt"] = json!("2099-01-01T00:00:00Z");
+        let (status, response) = harness
+            .post(
+                "/v1/mandates",
+                signed(future, "signatures", &[ACCUSED_SEED, INTERFACE_SEED]),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+
+        for classes in [json!([]), json!(["not-in-the-manifest"])] {
+            let body = signed(
+                mandate_json(ACCUSED_SEED, classes, &manifest_hash),
+                "signatures",
+                &[ACCUSED_SEED, INTERFACE_SEED],
+            );
+            let (status, response) = harness.post("/v1/mandates", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        }
+        assert!(
+            harness
+                .state
+                .store
+                .mandate_for_user(&testing::key_reference(ACCUSED_SEED))
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Without a configured interface key a countersignature cannot be
@@ -1647,6 +1720,67 @@ mod tests {
             .iter()
             .filter(|(_, kind, _)| kind == "new_holder_claim")
             .count()
+    }
+
+    /// Appeals are authenticated, but their statements are still
+    /// untrusted storage. They apply only to a ban and are bounded just
+    /// like repeated responses.
+    #[tokio::test]
+    async fn appeals_are_only_for_bans_and_bounded() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let appeal = |statement: String| {
+            signed(
+                json!({
+                    "caseId": &case_id,
+                    "kind": "appeal",
+                    "statement": statement,
+                }),
+                "signature",
+                &[ACCUSED_SEED],
+            )
+        };
+
+        let (status, _) = harness
+            .post(&format!("/v1/cases/{case_id}/appeal"), appeal("too early".into()))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        let (status, response) = harness
+            .decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+
+        for index in 0..MAX_APPEALS_PER_CASE {
+            let (status, response) = harness
+                .post(
+                    &format!("/v1/cases/{case_id}/appeal"),
+                    appeal(format!("appeal material {index}")),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+        }
+        let (status, _) = harness
+            .post(
+                &format!("/v1/cases/{case_id}/appeal"),
+                appeal("one filing too many".into()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            harness
+                .state
+                .store
+                .events(&case_id)
+                .unwrap()
+                .iter()
+                .filter(|(_, kind, _)| kind == "appeal_filed")
+                .count(),
+            MAX_APPEALS_PER_CASE
+        );
     }
 
     /// The genuine new owner's remedy is mandatory (§5.7) and must not
@@ -2097,7 +2231,7 @@ mod tests {
         let manifest_hash = util::sha256_hex(&harness.state.config.manifest_raw);
         let mut later =
             mandate_json(REPORTER_SEED, json!(["csam"]), &manifest_hash);
-        later["acceptedAt"] = json!("2026-08-09T00:00:00Z");
+        later["acceptedAt"] = json!("2026-08-02T00:00:00Z");
         let (status, response) = harness
             .post("/v1/mandates", signed(later, "signatures", &[REPORTER_SEED, INTERFACE_SEED]))
             .await;

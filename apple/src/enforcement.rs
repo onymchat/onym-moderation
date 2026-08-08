@@ -176,7 +176,6 @@ impl Engine {
         // reverses only the case it names rather than clearing an
         // unrelated sanction.
         let mut bans: Vec<(String, Verdict, bool)> = Vec::new();
-        let mut ban_was_ever_executed = false;
         let mut authorized_by = String::from("reconciliation");
         let mut realizes: Vec<String> = Vec::new();
 
@@ -223,7 +222,6 @@ impl Engine {
                     realizes.push(stored.verdict_ref.clone());
                 }
                 crate::types::Disposition::Ban => {
-                    ban_was_ever_executed |= stored.executed;
                     // Decided, so no longer an open case — whatever
                     // else is true of the ban. A ban waiting on its
                     // `executeAfter` used to `continue` before this,
@@ -286,11 +284,12 @@ impl Engine {
         let ban = bans
             .last()
             .map(|(verdict_ref, verdict, _)| (verdict_ref.clone(), verdict.clone()));
-        // Historical execution matters too. An expired ban disappears
-        // from `bans`, but it still proves that this identity was
-        // branded onto some device. Forgetting that fact can make a
-        // later ban brand a clean device that may have a new owner.
-        let ban_executed = ban_was_ever_executed;
+        // Only an executed ban still in force indicates that the
+        // current banned bit should already exist on this identity's
+        // device. An expired or reversed ban was deliberately cleared;
+        // remembering it here would prevent every later ban from ever
+        // writing its mark.
+        let ban_executed = bans.iter().any(|(_, _, executed)| *executed);
 
         // A ban in force is the reason the banned bit is set, so it
         // names the write even when a dismissal in some other case
@@ -722,11 +721,10 @@ mod tests {
         );
     }
 
-    /// Expiry clears a sanction, not the historical fact that its mark
-    /// was written. If a later active ban has not been written yet,
-    /// that history still protects a clean replacement device.
+    /// Once an executed ban expires and reconciliation clears its bit,
+    /// it must not prevent a later independent ban from executing.
     #[test]
-    fn an_expired_executed_ban_still_counts_as_historical_branding() {
+    fn an_expired_executed_ban_does_not_block_a_later_ban() {
         let engine = engine();
 
         let mut expired = verdict("case-csam", Disposition::Ban, "csam");
@@ -762,8 +760,8 @@ mod tests {
         let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
         assert!(intended.bits.banned, "the newer ban is still active");
         assert!(
-            intended.ban_executed,
-            "the expired ban already branded this identity onto a device"
+            !intended.ban_executed,
+            "the active ban has not executed; the expired ban was already cleared"
         );
     }
 
