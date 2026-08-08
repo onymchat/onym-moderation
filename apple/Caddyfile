@@ -1,0 +1,18 @@
+# Caddy provisions and renews the certificate automatically. The
+# email is only used for ACME expiry notices.
+{
+	email {$CADDY_EMAIL}
+}
+
+{$MODERATION_HOST} {
+	encode zstd gzip
+
+	# The enforcement backend. Everything is POST/GET JSON; no
+	# websockets, no large bodies (the service caps at 256 KiB itself).
+	reverse_proxy moderation:8080
+
+	log {
+		output stdout
+		format console
+	}
+}

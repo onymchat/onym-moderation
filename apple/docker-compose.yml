@@ -1,0 +1,63 @@
+name: onym-moderation-apple
+
+# The enforcement backend behind Caddy, which terminates TLS and
+# provisions/renews Let's Encrypt certificates automatically — the same
+# shape onym-infra uses, so operating this is not a new skill.
+#
+# Only Caddy publishes ports. The service itself is reachable solely on
+# the private `internal` network, which matters here more than usual:
+# the container holds the Apple DeviceCheck key, and the only write path
+# to any device's bits runs through it.
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3 (QUIC)
+    environment:
+      - CADDY_EMAIL=${CADDY_EMAIL:-}
+      - MODERATION_HOST=${MODERATION_HOST:-moderation.onym.app}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Persists issued certificates + the ACME account across restarts.
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [internal]
+    depends_on: [moderation]
+
+  moderation:
+    build: .
+    image: onym-moderation-apple:latest
+    restart: unless-stopped
+    environment:
+      - MODERATION_BIND=0.0.0.0:8080
+      - MODERATION_STORE_PATH=/data/moderation.sqlite
+      - MODERATION_DEVICECHECK_KEY_PATH=/secrets/devicecheck.p8
+      - MODERATION_DEVICECHECK_KEY_ID=${MODERATION_DEVICECHECK_KEY_ID:-}
+      - MODERATION_DEVICECHECK_TEAM_ID=${MODERATION_DEVICECHECK_TEAM_ID:-}
+      - MODERATION_DEVICECHECK_ENV=${MODERATION_DEVICECHECK_ENV:-production}
+      - MODERATION_INTERFACE_SIGNING_SEED=${MODERATION_INTERFACE_SIGNING_SEED:?set in .env}
+      - MODERATION_INTERFACE_COMPONENT_ID=${MODERATION_INTERFACE_COMPONENT_ID:-onym:component:onym-ios}
+      - MODERATION_ENFORCE_SIGNATURES=${MODERATION_ENFORCE_SIGNATURES:-false}
+      - MODERATION_AUTHORITY_TOKEN=${MODERATION_AUTHORITY_TOKEN:-}
+      - RUST_LOG=${RUST_LOG:-info}
+    volumes:
+      # The verdict record and the write log. Losing this volume loses
+      # the meaning behind every bit Apple is holding — the bits alone
+      # cannot be reconstructed into verdicts (profile §8 gap 2), so
+      # back it up.
+      - moderation-data:/data
+      # The .p8 never enters the image.
+      - ./secrets:/secrets:ro
+    networks: [internal]
+
+networks:
+  internal:
+
+volumes:
+  caddy-data:
+  caddy-config:
+  moderation-data:
