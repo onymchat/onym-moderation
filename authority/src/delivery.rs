@@ -439,4 +439,122 @@ mod tests {
             status.to_string(),
         )
     }
+
+    /// `flush_soon` ran once per report and per decision, each draining
+    /// the whole backlog. With a slow interface those overlap and
+    /// re-POST the same verdicts, inflating `attempts` — the number the
+    /// refusal budget and the operator both read.
+    ///
+    /// The counted thing here is *tasks started*, not requests sent:
+    /// the fixture has no interface configured, so a flush completes
+    /// without touching the network. That is the right unit anyway,
+    /// since the fan-out is what multiplies the requests.
+    #[tokio::test]
+    async fn flush_soon_runs_one_background_drain_at_a_time() {
+        use std::sync::atomic::Ordering;
+
+        let state =
+            std::sync::Arc::new(crate::state::AppState::for_tests(Store::in_memory().unwrap()));
+
+        // Hold the gate as an in-flight flush would.
+        assert!(!state.delivery.flush_in_flight.swap(true, Ordering::AcqRel));
+        for _ in 0..25 {
+            flush_soon(&state);
+        }
+        assert!(
+            state.delivery.flush_in_flight.load(Ordering::Acquire),
+            "the flag is still held by the flush that took it"
+        );
+
+        // Released, the next call is free to run — and clears the flag
+        // when it finishes, so this is not a one-shot latch.
+        state.delivery.flush_in_flight.store(false, Ordering::Release);
+        state.delivery.flush_again.store(false, Ordering::Release);
+        flush_soon(&state);
+        settle(&state).await;
+        assert!(
+            !state.delivery.flush_in_flight.load(Ordering::Acquire),
+            "a finished flush must release the gate, or flush_soon is dead for the process"
+        );
+    }
+
+    /// A dropped call is not a discarded one. `flush` snapshots its
+    /// backlog before its loop, so the drain in progress cannot see
+    /// what the losing caller just enqueued — dropping it outright left
+    /// a fresh notice waiting up to `deadline_sweep_secs` on a healthy
+    /// interface, which is the case `flush_soon` exists to serve.
+    #[tokio::test]
+    async fn a_call_that_loses_the_gate_re_arms_the_drain() {
+        use std::sync::atomic::Ordering;
+
+        let state =
+            std::sync::Arc::new(crate::state::AppState::for_tests(Store::in_memory().unwrap()));
+
+        // A drain is running, and a verdict is enqueued behind its
+        // snapshot.
+        state.delivery.flush_in_flight.store(true, Ordering::Release);
+        flush_soon(&state);
+        assert!(
+            state.delivery.flush_again.load(Ordering::Acquire),
+            "the losing call has to leave a mark; otherwise its verdict waits for the sweep"
+        );
+
+        // When that drain finishes it consumes the re-arm and goes
+        // round again, ending with both flags down and nothing left
+        // owing.
+        state.delivery.flush_in_flight.store(false, Ordering::Release);
+        flush_soon(&state);
+        settle(&state).await;
+        assert!(!state.delivery.flush_in_flight.load(Ordering::Acquire));
+        assert!(
+            !state.delivery.flush_again.load(Ordering::Acquire),
+            "a consumed re-arm must not stay set, or every later drain runs twice"
+        );
+    }
+
+    /// The release has to survive an unwind, not just an `Err`.
+    ///
+    /// Every `Store` method takes `conn.lock().unwrap()`, so one panic
+    /// under that lock poisons the mutex and every subsequent `flush`
+    /// panics too. With the release sitting after the `.await`,
+    /// `tokio::spawn` swallowed the unwind into a `JoinError` nobody
+    /// reads and the gate stayed shut for the life of the process —
+    /// with the symptom looking like a slow interface.
+    #[test]
+    fn a_panicking_drain_still_releases_the_gate() {
+        use std::sync::atomic::Ordering;
+
+        let state =
+            std::sync::Arc::new(crate::state::AppState::for_tests(Store::in_memory().unwrap()));
+        state.delivery.flush_in_flight.store(true, Ordering::Release);
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _gate = FlushGate(std::sync::Arc::clone(&state));
+            panic!("the store mutex is poisoned");
+        }));
+        std::panic::set_hook(previous);
+
+        assert!(unwound.is_err(), "the fixture must actually panic");
+        assert!(
+            !state.delivery.flush_in_flight.load(Ordering::Acquire),
+            "a panicking drain must not pin the gate shut"
+        );
+    }
+
+    /// Wait for the background drain to finish. Bounded, so a
+    /// regression that never releases fails the assertion rather than
+    /// hanging the suite.
+    async fn settle(state: &std::sync::Arc<crate::state::AppState>) {
+        use std::sync::atomic::Ordering;
+        for _ in 0..100 {
+            if !state.delivery.flush_in_flight.load(Ordering::Acquire)
+                && !state.delivery.flush_again.load(Ordering::Acquire)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
 }

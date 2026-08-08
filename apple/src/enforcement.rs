@@ -1039,4 +1039,191 @@ mod tests {
         assert!(!engine.intended_marks(DEVICE, now()).unwrap().unwrap().bits.banned);
     }
 
+    // ─── Notices ─────────────────────────────────────────────────────
+
+    /// A mandate with its consented manifest attached, so notices can
+    /// be rendered from real class terms rather than invented dates.
+    fn mandate_with_manifest(store: &Store, mandate_ref: &str) {
+        let manifest = serde_json::json!({
+            "componentId": "onym:component:authority",
+            "operator": "onym:key:operator",
+            "violationClasses": [{
+                "classId": "csam",
+                "responseWindow": "P3D",
+                "decisionDeadline": "P7D",
+                "banTerm": "permanent",
+                "appealWindow": "P30D",
+                "appealEffect": "non-suspensive",
+            }],
+        });
+        let raw = serde_json::to_vec(&manifest).unwrap();
+        store
+            .put_mandate(
+                &crate::store::MandateRecord {
+                    mandate_ref: mandate_ref.into(),
+                    user_key: "onym:key:accused".into(),
+                    authority: "onym:component:authority".into(),
+                    device_binding: DEVICE.into(),
+                    manifest_hash: util::sha256_hex(&raw),
+                    classes: vec!["csam".into()],
+                },
+                b"{}",
+                "2026-08-01T00:00:00Z",
+            )
+            .unwrap();
+        store.attach_manifest(mandate_ref, &raw).unwrap();
+    }
+
+    fn open_case_at(case_id: &str, decided_at: &str) -> Verdict {
+        let mut verdict = verdict(case_id, Disposition::OpenCase, "csam");
+        verdict.decided_at = decided_at.into();
+        verdict.marks = Marks { case_open: true, banned: false };
+        verdict
+    }
+
+    /// The authority issues one `open-case` verdict per report joined
+    /// to a case, and none supersede each other. Serving all of them
+    /// handed the accused three notices for one case, two of which
+    /// carried a `responseDeadline` that had already lapsed — while the
+    /// authority was working to the newest. Telling someone their time
+    /// to answer is gone when it is not is the worst version of the
+    /// invented-date failure this function exists to avoid.
+    #[test]
+    fn a_re_noticed_case_serves_one_notice_the_latest() {
+        let engine = engine();
+        mandate_with_manifest(&engine.store, MANDATE);
+
+        for (reference, decided_at) in [
+            ("notice-1", "2026-08-01T00:00:00Z"),
+            ("notice-2", "2026-08-04T00:00:00Z"),
+            ("notice-3", "2026-08-07T00:00:00Z"),
+        ] {
+            store_verdict(&engine.store, reference, open_case_at("case-csam", decided_at), decided_at);
+        }
+
+        let notices = engine.open_case_notices(DEVICE).unwrap();
+
+        assert_eq!(notices.len(), 1, "one live case, one notice");
+        let notice = &notices[0];
+        assert_eq!(notice.case_id, "case-csam");
+        // Counted from the newest `decidedAt`: 2026-08-07 + P3D.
+        assert_eq!(notice.response_deadline, "2026-08-10T00:00:00Z");
+        assert_eq!(notice.decision_deadline, "2026-08-14T00:00:00Z");
+    }
+
+    /// Deduping per case must not collapse *different* cases.
+    #[test]
+    fn separate_cases_each_keep_their_notice() {
+        let engine = engine();
+        mandate_with_manifest(&engine.store, MANDATE);
+
+        store_verdict(
+            &engine.store,
+            "notice-a",
+            open_case_at("case-a", "2026-08-01T00:00:00Z"),
+            "2026-08-01T00:00:00Z",
+        );
+        store_verdict(
+            &engine.store,
+            "notice-b",
+            open_case_at("case-b", "2026-08-02T00:00:00Z"),
+            "2026-08-02T00:00:00Z",
+        );
+
+        let mut served: Vec<String> =
+            engine.open_case_notices(DEVICE).unwrap().into_iter().map(|n| n.case_id).collect();
+        served.sort();
+        assert_eq!(served, vec!["case-a".to_string(), "case-b".to_string()]);
+    }
+
+    /// The case is claimed before the render checks, so a case whose
+    /// *newest* notice cannot be rendered serves nothing rather than
+    /// falling back to an older one. The fallback would satisfy the
+    /// omission rule's letter while doing exactly what it forbids:
+    /// showing a lapsed deadline as though it were live.
+    #[test]
+    fn a_case_whose_latest_notice_cannot_be_rendered_serves_nothing() {
+        let engine = engine();
+        // The older notice's mandate has a manifest; the newer one's
+        // does not — the authority has not yet delivered a verdict
+        // carrying those bytes.
+        mandate_with_manifest(&engine.store, MANDATE);
+
+        store_verdict(
+            &engine.store,
+            "notice-old",
+            open_case_at("case-csam", "2026-08-01T00:00:00Z"),
+            "2026-08-01T00:00:00Z",
+        );
+        let mut newer = open_case_at("case-csam", "2026-08-07T00:00:00Z");
+        newer.mandate_ref = "mandate-unknown".into();
+        let raw = serde_json::to_vec(&newer).unwrap();
+        engine
+            .store
+            .put_verdict(
+                &StoredVerdict {
+                    verdict_ref: "notice-new".into(),
+                    case_id: "case-csam".into(),
+                    decided_at: newer.decided_at.clone(),
+                    mandate_ref: "mandate-unknown".into(),
+                    device_binding: DEVICE.into(),
+                    raw,
+                    disposition: "open-case".into(),
+                    ban_expires: None,
+                    execute_after: None,
+                    executed: true,
+                    superseded: false,
+                },
+                "2026-08-07T00:00:00Z",
+            )
+            .unwrap();
+
+        let notices = engine.open_case_notices(DEVICE).unwrap();
+        assert!(
+            notices.is_empty(),
+            "a stale notice is not a safe substitute for the one in force: {notices:?}"
+        );
+    }
+
+    /// A superseded notice is not served even when it is the newest
+    /// row for its case — the pre-existing filter still applies ahead
+    /// of the dedupe.
+    #[test]
+    fn a_superseded_notice_does_not_claim_its_case() {
+        let engine = engine();
+        mandate_with_manifest(&engine.store, MANDATE);
+
+        store_verdict(
+            &engine.store,
+            "notice-live",
+            open_case_at("case-csam", "2026-08-01T00:00:00Z"),
+            "2026-08-01T00:00:00Z",
+        );
+        let newer = open_case_at("case-csam", "2026-08-07T00:00:00Z");
+        let raw = serde_json::to_vec(&newer).unwrap();
+        engine
+            .store
+            .put_verdict(
+                &StoredVerdict {
+                    verdict_ref: "notice-superseded".into(),
+                    case_id: "case-csam".into(),
+                    decided_at: newer.decided_at.clone(),
+                    mandate_ref: MANDATE.into(),
+                    device_binding: DEVICE.into(),
+                    raw,
+                    disposition: "open-case".into(),
+                    ban_expires: None,
+                    execute_after: None,
+                    executed: true,
+                    superseded: true,
+                },
+                "2026-08-07T00:00:00Z",
+            )
+            .unwrap();
+
+        let notices = engine.open_case_notices(DEVICE).unwrap();
+        assert_eq!(notices.len(), 1);
+        // The live one, counted from its own decidedAt.
+        assert_eq!(notices[0].response_deadline, "2026-08-04T00:00:00Z");
+    }
 }

@@ -1861,6 +1861,138 @@ mod tests {
         assert_eq!(harness.state.store.case(&case_id).unwrap().unwrap().stage, "open");
     }
 
+    /// The refusal has to be actionable. A notice still in the queue
+    /// and a notice the interface has given up on look the same to
+    /// `open_case_verdict_delivered`, and the old error said only "the
+    /// opening verdict has not reached the interface" for both — so a
+    /// moderator could not tell a case that will clear itself from one
+    /// that never will without an operator.
+    #[tokio::test]
+    async fn a_ban_refused_for_an_undelivered_notice_names_it() {
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+        let body = signed(report_json(&reporter_mandate, "r-1"), "signature", &[REPORTER_SEED]);
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let case_id = response["caseId"].as_str().unwrap().to_string();
+
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+
+        let stuck = harness.state.store.undelivered_verdicts().unwrap();
+        assert_eq!(stuck.len(), 1);
+        let stuck_ref = stuck[0].verdict_ref.clone();
+
+        // Still queued: name it, and say nothing about requeueing —
+        // waiting is the right thing to do.
+        let (status, response) =
+            harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{response}");
+        let message = response["message"].as_str().unwrap_or_default().to_string();
+        assert!(message.contains(&stuck_ref), "{message}");
+        assert!(!message.contains("requeue"), "nothing is stuck yet: {message}");
+
+        // Given up on: the case is now unbannable for life unless an
+        // operator intervenes, so say so and name the route out.
+        harness.state.store.mark_undeliverable(&stuck_ref).unwrap();
+        let (status, response) =
+            harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{response}");
+        let message = response["message"].as_str().unwrap_or_default().to_string();
+        assert!(message.contains(&stuck_ref), "{message}");
+        assert!(message.contains("given up on"), "{message}");
+        assert!(
+            message.contains(&format!("/v1/verdicts/{stuck_ref}/requeue")),
+            "the only way out has to be in the error: {message}"
+        );
+
+        // And the guard itself has not softened.
+        assert_eq!(harness.state.store.case(&case_id).unwrap().unwrap().stage, "open");
+    }
+
+    /// A case can hold more than one stuck notice, and each needs its
+    /// own requeue. Listing every ref and then one URL built from the
+    /// first left a moderator with two problems and one instruction.
+    #[tokio::test]
+    async fn every_stuck_notice_gets_its_own_requeue_url() {
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+
+        let first = signed(report_json(&reporter_mandate, "r-1"), "signature", &[REPORTER_SEED]);
+        let (status, response) = harness.post("/v1/reports", first).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let case_id = response["caseId"].as_str().unwrap().to_string();
+
+        // A second report joins the case, which issues a second notice.
+        let mut report = report_json(&reporter_mandate, "r-2");
+        report["evidence"][0]["disclosedContent"] = json!("a different prohibited thing");
+        report["evidence"][0]["authenticityProof"] =
+            json!(testing::sign(ACCUSED_SEED, b"a different prohibited thing"));
+        let (status, response) =
+            harness.post("/v1/reports", signed(report, "signature", &[REPORTER_SEED])).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["caseId"], case_id);
+
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+
+        let stuck: Vec<String> = harness
+            .state
+            .store
+            .undelivered_verdicts()
+            .unwrap()
+            .into_iter()
+            .map(|v| v.verdict_ref)
+            .collect();
+        assert_eq!(stuck.len(), 2, "two joined reports, two notices");
+        for reference in &stuck {
+            harness.state.store.mark_undeliverable(reference).unwrap();
+        }
+
+        let (status, response) =
+            harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{response}");
+        let message = response["message"].as_str().unwrap_or_default().to_string();
+        for reference in &stuck {
+            assert!(
+                message.contains(&format!("POST /v1/verdicts/{reference}/requeue")),
+                "every stuck notice needs its own requeue, not just the first: {message}"
+            );
+        }
+        assert!(message.contains("notices"), "plural, since there are two: {message}");
+    }
+
+    /// The refusal used to be assembled from two reads — a yes-or-no
+    /// and then a lookup — so a flush marking the last notice delivered
+    /// in between produced a message asserting the case had *no*
+    /// notice, on a case that had one and had just been served. One
+    /// query now, so the answer cannot contradict itself; the
+    /// no-notice wording is reserved for a case that genuinely has
+    /// none.
+    #[tokio::test]
+    async fn a_case_with_no_notice_at_all_says_so_without_asserting_a_queue() {
+        let harness = Harness::new();
+        assert_eq!(
+            harness.state.store.notice_delivery("case-that-does-not-exist").unwrap(),
+            crate::store::NoticeDelivery::NoneIssued
+        );
+
+        let case_id = open_case(&harness).await;
+        let delivered = harness.state.store.undelivered_verdicts().unwrap();
+        for verdict in &delivered {
+            harness.state.store.mark_delivered(&verdict.verdict_ref).unwrap();
+        }
+        assert_eq!(
+            harness.state.store.notice_delivery(&case_id).unwrap(),
+            crate::store::NoticeDelivery::AllDelivered,
+            "every notice served: the guard must let the ban through on its own merits"
+        );
+    }
+
     #[tokio::test]
     async fn a_ban_fails_closed_when_its_mandate_row_is_missing() {
         let harness = Harness::new();
