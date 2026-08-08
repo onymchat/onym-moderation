@@ -257,7 +257,17 @@ is a fact about the case rather than an absence in the prompt.
 
 It is built **after the response window closes**, never on arrival.
 Assessing earlier would ask the model about a document the accused had
-not finished answering, and then decide the case on that reading.
+not finished answering, and then decide the case on that reading. The
+sweep is the only thing that starts an assessment; there is no
+classify-on-arrival path, because there is nothing for one to do.
+
+The sweep spaces retries out and gives up eventually: a model that
+could not read a case a moment ago is unlikely to read it thirty
+seconds later, and a case it will never read should end at its decision
+deadline — dismissed — rather than being retried until then. It also
+runs after verdict delivery and is bounded per tick, so one hung
+inference cannot hold up verdicts already signed and waiting to
+execute.
 
 Every untrusted field is fenced, and text that would close its own
 fence is defanged on the way in — visibly, so a reviewer can see the

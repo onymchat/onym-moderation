@@ -1038,6 +1038,12 @@ struct Decision {
     /// definition. Mandatory: an unexplained ban is nonconforming even
     /// where confidentiality keeps it private.
     reasoning: String,
+    /// Whether the decider actually saw the classifier's assessment.
+    /// Recorded on the case, so "a human decided this" and "a human
+    /// signed off what a model concluded" stay distinguishable. It is
+    /// an assertion by the caller, which is the only party that knows.
+    #[serde(default)]
+    reviewed_assessment: bool,
 }
 
 /// The moderator's decision. This is the one place human judgment
@@ -1052,12 +1058,20 @@ async fn decide(
     authorize_moderator(&state, &headers)?;
 
     let disposition = decisions::Disposition::parse(&decision.disposition)?;
-    // A moderator who has seen the classifier's assessment is deciding
-    // with assistance, and the record should say so rather than
-    // flattening both into "human".
-    let decider = match state.store.assessment(&case_id)? {
-        Some(_) => decisions::Decider::HumanAssisted,
-        None => decisions::Decider::Human,
+    // Unassisted, unless the caller says otherwise. The field exists to
+    // tell a user what kind of judgment they got, so it has to record
+    // what was actually put in front of the decider — and an API caller
+    // may never have seen the assessment at all. Inferring it from the
+    // mere existence of an assessment row made the distinction noise:
+    // it would have marked a decision "assisted" by an assessment that
+    // reached no decision and therefore recommended nothing.
+    //
+    // The panel sets this, because the panel renders the assessment on
+    // the page the moderator decided from.
+    let decider = if decision.reviewed_assessment {
+        decisions::Decider::HumanAssisted
+    } else {
+        decisions::Decider::Human
     };
 
     let issued = decisions::apply(
@@ -2226,6 +2240,7 @@ mod tests {
             responded: false,
             disposition: None,
             appeal_deadline: None,
+            appeal_state: "none".into(),
         };
         for report_id in ["r1", "r2", "r3"] {
             store

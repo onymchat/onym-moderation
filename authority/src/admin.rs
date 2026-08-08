@@ -364,12 +364,26 @@ async fn review(
         return Err(Error::BadRequest("reasoning is required".into()));
     }
 
-    state
+    let now = OffsetDateTime::now_utc();
+    let stamp = util::format_timestamp(now);
+
+    // The buttons are hidden when they do not apply, but a form POST
+    // is reachable without them. Without these, a moderator could
+    // stamp "appeal upheld" on a case nobody appealed — a record of a
+    // review that never happened, in the one place a user is supposed
+    // to be able to check that it did.
+    let case = state
         .store
         .case(&case_id)?
         .ok_or_else(|| Error::NotFound(format!("case {case_id}")))?;
-    let now = OffsetDateTime::now_utc();
-    let stamp = util::format_timestamp(now);
+    if form.outcome == "uphold" && case.appeal_state != "pending" {
+        return Err(Error::CaseState(
+            "there is no appeal pending on this case to uphold".into(),
+        ));
+    }
+    if form.outcome == "reverse" && case.disposition.as_deref() != Some("ban") {
+        return Err(Error::CaseState("only a ban can be reversed".into()));
+    }
 
     match form.outcome.as_str() {
         "uphold" => {
@@ -390,6 +404,8 @@ async fn review(
                 &case_id,
                 Disposition::Reverse,
                 &form.reasoning,
+                // The panel renders the assessment on the page this
+                // form was submitted from, so the reviewer did see it.
                 Decider::HumanAssisted,
                 now,
             )
@@ -518,4 +534,99 @@ mod tests {
         let empty = HeaderMap::new();
         assert_eq!(session_cookie(&empty), None);
     }
+
+    use crate::store::{CaseRecord, Store};
+
+    /// An authenticated moderator's headers.
+    fn signed_in(state: &AppState) -> HeaderMap {
+        let now = OffsetDateTime::now_utc();
+        state
+            .store
+            .create_admin_session(
+                "session-token",
+                &util::format_timestamp(now),
+                &util::format_timestamp(now + time::Duration::hours(1)),
+            )
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, format!("{SESSION_COOKIE}=session-token").parse().unwrap());
+        headers
+    }
+
+    fn reviewable_case(disposition: Option<&str>, appeal_state: &str) -> CaseRecord {
+        CaseRecord {
+            case_id: "c1".into(),
+            accused: "onym:key:acc".into(),
+            reporter: "onym:key:rep".into(),
+            class_id: "csam".into(),
+            mandate_ref: "m1".into(),
+            device_binding: "d1".into(),
+            stage: "decided".into(),
+            opened_at: "2026-08-01T00:00:00Z".into(),
+            response_deadline: "2026-08-04T00:00:00Z".into(),
+            decision_deadline: "2026-08-08T00:00:00Z".into(),
+            responded: false,
+            disposition: disposition.map(str::to_string),
+            appeal_deadline: None,
+            appeal_state: appeal_state.into(),
+        }
+    }
+
+    /// The buttons are hidden when they do not apply, but the POST is
+    /// reachable without them. Upholding an appeal nobody filed writes
+    /// a record of a review that never happened — in the one place a
+    /// user is supposed to be able to check that it did.
+    #[tokio::test]
+    async fn upholding_requires_a_pending_appeal() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        state.store.put_case(&reviewable_case(Some("ban"), "none")).unwrap();
+
+        let result = review(
+            State(state.clone()),
+            Path("c1".to_string()),
+            signed_in(&state),
+            Form(ReviewForm { outcome: "uphold".into(), reasoning: "hash:reviewed".into() }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::CaseState(_))), "no appeal is pending");
+        assert_eq!(state.store.case("c1").unwrap().unwrap().appeal_state, "none");
+    }
+
+    /// And reversing needs a ban to reverse.
+    #[tokio::test]
+    async fn reversing_requires_a_ban() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        state.store.put_case(&reviewable_case(Some("dismiss"), "pending")).unwrap();
+
+        let result = review(
+            State(state.clone()),
+            Path("c1".to_string()),
+            signed_in(&state),
+            Form(ReviewForm { outcome: "reverse".into(), reasoning: "hash:reviewed".into() }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::CaseState(_))), "a dismissal is not a ban");
+    }
+
+    /// A pending appeal can be upheld, which is the path these guards
+    /// must not have broken.
+    #[tokio::test]
+    async fn a_pending_appeal_can_be_upheld() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        state.store.put_case(&reviewable_case(Some("ban"), "pending")).unwrap();
+
+        review(
+            State(state.clone()),
+            Path("c1".to_string()),
+            signed_in(&state),
+            Form(ReviewForm { outcome: "uphold".into(), reasoning: "hash:reviewed".into() }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.store.case("c1").unwrap().unwrap().appeal_state, "upheld");
+    }
+
 }

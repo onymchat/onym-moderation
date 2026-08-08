@@ -112,13 +112,54 @@ async fn sweep_overdue(
 /// is the "valid retry" the policy allows. If none ever lands, the
 /// decision deadline dismisses the case — and because the dismissal
 /// sweep runs first, an overdue case is dismissed rather than decided.
+const MAX_ASSESSMENTS_PER_SWEEP: usize = 25;
+
+/// How many times one case is put to the model before the sweep stops
+/// trying. Generous, because a model can be down for maintenance and a
+/// response window is days long — but not unbounded: a case the model
+/// will never read should end at its decision deadline, dismissed, not
+/// be retried until then.
+const MAX_ASSESSMENT_ATTEMPTS: i64 = 24;
+
+/// Retry spacing. A model that could not read a case a moment ago is
+/// unlikely to read it thirty seconds later, so each failed attempt
+/// pushes the next one further out, to a ceiling of six hours.
+fn retry_due(attempts: i64, last_attempt: Option<&str>, now: OffsetDateTime) -> bool {
+    let Some(last) = last_attempt else { return true };
+    let Ok(last) = util::parse_timestamp(last) else { return true };
+    let minutes = (5i64 << attempts.min(6)).min(360);
+    now >= last + time::Duration::minutes(minutes)
+}
+
 pub async fn triage_sweep(state: &AppState, now: OffsetDateTime) -> Result<(), Error> {
     if state.triage.is_none() {
         return Ok(());
     }
 
-    for case in state.store.cases_awaiting_assessment(&util::format_timestamp(now))? {
+    // Bounded per tick. Each case is awaited in turn against a model
+    // that may take two minutes, so an unbounded backlog would make a
+    // single tick run for hours and starve the next deadline sweep.
+    // What is left over is picked up on the following tick, and a case
+    // that waits is a case that stays open — never one that gets
+    // decided by default early.
+    let due: Vec<_> = state
+        .store
+        .cases_awaiting_assessment(&util::format_timestamp(now))?
+        .into_iter()
+        .filter(|(_, attempts, last)| {
+            *attempts < MAX_ASSESSMENT_ATTEMPTS && retry_due(*attempts, last.as_deref(), now)
+        })
+        .collect();
+    let total = due.len();
+    for (case, _, _) in due.into_iter().take(MAX_ASSESSMENTS_PER_SWEEP) {
         crate::triage::assess_and_maybe_decide(state, &case.case_id, now).await;
+    }
+    if total > MAX_ASSESSMENTS_PER_SWEEP {
+        tracing::info!(
+            assessed = MAX_ASSESSMENTS_PER_SWEEP,
+            waiting = total - MAX_ASSESSMENTS_PER_SWEEP,
+            "assessment backlog exceeds one sweep; the rest wait for the next tick"
+        );
     }
 
     Ok(())
@@ -134,11 +175,17 @@ pub fn spawn(state: Arc<AppState>) {
             if let Err(e) = sweep(&state, OffsetDateTime::now_utc()).await {
                 tracing::error!(error = %e, "deadline sweep failed");
             }
-            if let Err(e) = triage_sweep(&state, OffsetDateTime::now_utc()).await {
-                tracing::error!(error = %e, "triage sweep failed");
-            }
+            // Delivery before triage. Assessment awaits each case in
+            // turn against a model that may take two minutes, so one
+            // hung inference used to hold up every verdict already
+            // signed and waiting to be executed — a decided case would
+            // sit undelivered because an unrelated undecided one was
+            // slow.
             if let Err(e) = state.delivery.flush(&state.store).await {
                 tracing::error!(error = %e, "verdict delivery failed");
+            }
+            if let Err(e) = triage_sweep(&state, OffsetDateTime::now_utc()).await {
+                tracing::error!(error = %e, "triage sweep failed");
             }
             tokio::time::sleep(interval).await;
         }
@@ -200,6 +247,27 @@ mod tests {
         let now = util::parse_timestamp("2026-08-09T00:00:00Z").unwrap();
         assert_eq!(sweep(&state, now).await.unwrap(), 0);
         assert_eq!(state.store.case("c1").unwrap().unwrap().stage, "open");
+    }
+
+    /// A model that could not read a case a moment ago is unlikely to
+    /// read it thirty seconds later, so retries space out — and stop.
+    #[test]
+    fn assessment_retries_back_off_and_are_capped() {
+        let now = util::parse_timestamp("2026-08-09T12:00:00Z").unwrap();
+
+        // Never attempted: due immediately.
+        assert!(retry_due(0, None, now));
+        // Just attempted: not due again yet.
+        assert!(!retry_due(1, Some("2026-08-09T11:58:00Z"), now));
+        // Ten minutes on, a second attempt is due.
+        assert!(retry_due(1, Some("2026-08-09T11:45:00Z"), now));
+        // The wait grows, and stops growing at six hours.
+        assert!(!retry_due(6, Some("2026-08-09T08:00:00Z"), now));
+        assert!(retry_due(6, Some("2026-08-09T05:00:00Z"), now));
+        assert!(retry_due(50, Some("2026-08-09T05:00:00Z"), now), "the ceiling is six hours");
+
+        // An unreadable timestamp does not wedge the case: it retries.
+        assert!(retry_due(3, Some("not a timestamp"), now));
     }
 
     /// Sweeping twice must not issue a second dismissal — the case is

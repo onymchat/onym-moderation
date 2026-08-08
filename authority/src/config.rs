@@ -203,32 +203,69 @@ impl Config {
     /// change the manifest has to declare (§8 obligation 6), not a
     /// deployment detail.
     pub fn triage_leaves_this_host(triage: &TriageConfig) -> bool {
-        let host = triage
-            .url
+        !Self::is_local_host(Self::host_of(&triage.url))
+    }
+
+    /// The host part of a URL, with a bracketed IPv6 literal unwrapped.
+    ///
+    /// Splitting on `:` to drop the port cannot come first: `[::1]:8000`
+    /// would become `[`, and every IPv6 arm below would be dead code
+    /// that only looked like it was doing something.
+    fn host_of(url: &str) -> &str {
+        let authority = url
             .split("://")
             .nth(1)
-            .unwrap_or(&triage.url)
+            .unwrap_or(url)
             .split('/')
             .next()
-            .unwrap_or("")
-            .split(':')
-            .next()
             .unwrap_or("");
-        !(host == "localhost"
-            || host == "127.0.0.1"
-            || host == "::1"
-            || host == "[::1]"
-            // Compose service names resolve on the private network.
-            || !host.contains('.')
-            || host.starts_with("10.")
-            || host.starts_with("192.168.")
-            || host.starts_with("172.16.")
-            || host.starts_with("172.17.")
-            || host.starts_with("172.18.")
-            || host.starts_with("172.19.")
-            || host.starts_with("172.2")
-            || host.starts_with("172.30.")
-            || host.starts_with("172.31."))
+        match authority.strip_prefix('[') {
+            // `[::1]:8000` → `::1`
+            Some(rest) => rest.split(']').next().unwrap_or(""),
+            None => authority.split(':').next().unwrap_or(""),
+        }
+    }
+
+    /// Whether a host is this machine or the private network it shares
+    /// with a sibling container.
+    ///
+    /// The private ranges are parsed rather than prefix-matched.
+    /// `starts_with("172.2")` accepted `172.20.0.5`, which is private,
+    /// and `172.2.3.4`, which is a routable address on the public
+    /// internet — and this check is the one thing standing between
+    /// "the model runs here" and shipping disclosed evidence to a
+    /// stranger.
+    fn is_local_host(host: &str) -> bool {
+        if host.is_empty() {
+            return false;
+        }
+        if host == "localhost" || host == "::1" || host.ends_with(".localhost") {
+            return true;
+        }
+        // A bare name with no dots is a compose service, resolved on
+        // the private network.
+        if !host.contains('.') && !host.contains(':') {
+            return true;
+        }
+        let Some(octets) = Self::ipv4_octets(host) else {
+            return false;
+        };
+        match octets {
+            [127, _, _, _] => true,
+            [10, _, _, _] => true,
+            [192, 168, _, _] => true,
+            [172, second, _, _] => (16..=31).contains(&second),
+            _ => false,
+        }
+    }
+
+    fn ipv4_octets(host: &str) -> Option<[u8; 4]> {
+        let mut parts = host.split('.');
+        let mut octets = [0u8; 4];
+        for octet in octets.iter_mut() {
+            *octet = parts.next()?.parse().ok()?;
+        }
+        parts.next().is_none().then_some(octets)
     }
 
     pub fn usage() -> &'static str {
@@ -277,5 +314,62 @@ Automated assessment (a model decides; a human reviews on appeal):
   AUTHORITY_TRIAGE_API_KEY     Only if the local server requires one
   AUTHORITY_TRIAGE_TIMEOUT_SECS  Inference timeout (default: 120)
 "#
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `starts_with("172.2")` matched `172.20.0.5`, which is private,
+    /// and `172.2.3.4`, which is a routable address on the public
+    /// internet. This check is the one thing standing between "the
+    /// model runs here" and shipping disclosed evidence to a stranger,
+    /// so the octets are parsed.
+    #[test]
+    fn private_ranges_are_parsed_not_prefix_matched() {
+        for local in [
+            "http://localhost:8000/v1/chat/completions",
+            "http://127.0.0.1:8000/v1",
+            "http://10.1.2.3:8000/v1",
+            "http://192.168.1.10:8000/v1",
+            "http://172.16.0.1:8000/v1",
+            "http://172.20.0.5:8000/v1",
+            "http://172.31.255.254:8000/v1",
+            "http://moderation-model:8000/v1",
+        ] {
+            assert!(Config::is_local_host(Config::host_of(local)), "{local}");
+        }
+
+        for remote in [
+            // The one the prefix match got wrong: routable, not private.
+            "http://172.2.3.4:8000/v1",
+            "http://172.15.0.1:8000/v1",
+            "http://172.32.0.1:8000/v1",
+            "http://api.example.com/v1/chat/completions",
+            "https://10.example.com/v1",
+            "http://192.168.1.10.example.com/v1",
+        ] {
+            assert!(!Config::is_local_host(Config::host_of(remote)), "{remote}");
+        }
+    }
+
+    /// Dropping the port by splitting on `:` cannot come first — an
+    /// IPv6 literal is full of colons, and `[::1]:8000` became `[`.
+    #[test]
+    fn bracketed_ipv6_literals_survive_port_stripping() {
+        assert_eq!(Config::host_of("http://[::1]:8000/v1/chat/completions"), "::1");
+        assert!(Config::is_local_host(Config::host_of("http://[::1]:8000/v1")));
+        assert_eq!(Config::host_of("http://[2001:db8::1]:8000/v1"), "2001:db8::1");
+        assert!(
+            !Config::is_local_host(Config::host_of("http://[2001:db8::1]:8000/v1")),
+            "a routable IPv6 address is not this host"
+        );
+    }
+
+    #[test]
+    fn the_host_is_taken_from_the_url_not_the_path() {
+        assert_eq!(Config::host_of("http://example.com:8000/localhost"), "example.com");
+        assert_eq!(Config::host_of("http://example.com/v1"), "example.com");
     }
 }

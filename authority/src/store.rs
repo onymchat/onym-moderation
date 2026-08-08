@@ -247,7 +247,12 @@ impl Store {
                 raw            BLOB NOT NULL,
                 recommendation TEXT NOT NULL,
                 applied        INTEGER NOT NULL DEFAULT 0,
-                assessed_at    TEXT NOT NULL
+                assessed_at    TEXT NOT NULL,
+                -- How many times this case has been put to the model.
+                -- A no-decision is retried, but not forever and not
+                -- every tick: a model that cannot read a case now is
+                -- unlikely to read it thirty seconds later.
+                attempts       INTEGER NOT NULL DEFAULT 0
             );
 
             -- Moderator panel sessions. Short-lived and revocable; the
@@ -310,6 +315,9 @@ impl Store {
             ("verdicts", "refusals", "INTEGER NOT NULL DEFAULT 0"),
             ("verdicts", "last_error", "TEXT"),
             ("verdicts", "undeliverable", "INTEGER NOT NULL DEFAULT 0"),
+            // The moderator panel's appeal queue.
+            ("cases", "appeal_state", "TEXT NOT NULL DEFAULT 'none'"),
+            ("assessments", "attempts", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             Self::add_column(&conn, table, column, definition)?;
         }
@@ -768,8 +776,8 @@ impl Store {
             "INSERT INTO cases
              (case_id, accused, reporter, class_id, mandate_ref, device_binding, stage,
               opened_at, response_deadline, decision_deadline, responded, disposition,
-              appeal_deadline)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              appeal_deadline, appeal_state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 case.case_id,
                 case.accused,
@@ -784,6 +792,7 @@ impl Store {
                 case.responded as i32,
                 case.disposition,
                 case.appeal_deadline,
+                case.appeal_state,
             ],
         ) {
             Ok(_) => {}
@@ -929,6 +938,12 @@ impl Store {
     const CASE_COLUMNS: &'static str = "case_id, accused, reporter, class_id, mandate_ref, \
          device_binding, stage, opened_at, response_deadline, decision_deadline, responded, \
          disposition, appeal_deadline, appeal_state";
+
+    /// The same list, qualified — `assessments` also has a `case_id`,
+    /// so an unqualified join is ambiguous.
+    const CASE_COLUMNS_C: &'static str = "c.case_id, c.accused, c.reporter, c.class_id, \
+         c.mandate_ref, c.device_binding, c.stage, c.opened_at, c.response_deadline, \
+         c.decision_deadline, c.responded, c.disposition, c.appeal_deadline, c.appeal_state";
 
     pub fn case(&self, case_id: &str) -> Result<Option<CaseRecord>, Error> {
         let conn = self.conn.lock().unwrap();
@@ -1117,20 +1132,36 @@ impl Store {
     /// no-decision is the "valid retry" §4.2 allows: a model that
     /// returned garbage once may answer on the next pass, and if it
     /// never does, the decision deadline dismisses the case.
-    pub fn cases_awaiting_assessment(&self, now: &str) -> Result<Vec<CaseRecord>, Error> {
+    /// Open cases ready for automated assessment: the accused's
+    /// response window has closed, and either nothing has assessed them
+    /// yet or the last attempt reached no decision.
+    ///
+    /// The window condition is policy, not scheduling — §4.1 has the
+    /// authority assess the *completed* case document. Retrying a
+    /// no-decision is the "valid retry" §4.2 allows: a model that
+    /// returned garbage once may answer on the next pass, and if it
+    /// never does, the decision deadline dismisses the case.
+    /// Each case comes back with how many times it has already been
+    /// put to the model, and when it last was, so the caller can space
+    /// retries out instead of hammering an unhealthy model every tick.
+    pub fn cases_awaiting_assessment(
+        &self,
+        now: &str,
+    ) -> Result<Vec<(CaseRecord, i64, Option<String>)>, Error> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(&format!(
-            "SELECT {} FROM cases c
+            "SELECT {}, COALESCE(a.attempts, 0), a.assessed_at
+               FROM cases c
+               LEFT JOIN assessments a ON a.case_id = c.case_id
               WHERE c.stage = 'open'
                 AND c.response_deadline <= ?1
-                AND NOT EXISTS (
-                      SELECT 1 FROM assessments a
-                       WHERE a.case_id = c.case_id
-                         AND a.recommendation <> 'no-decision')
+                AND (a.case_id IS NULL OR a.recommendation = 'no-decision')
               ORDER BY c.opened_at",
-            Self::CASE_COLUMNS
+            Self::CASE_COLUMNS_C
         ))?;
-        let rows = statement.query_map(params![now], Self::case_from_row)?;
+        let rows = statement.query_map(params![now], |row| {
+            Ok((Self::case_from_row(row)?, row.get(14)?, row.get(15)?))
+        })?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -1146,10 +1177,12 @@ impl Store {
     ) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO assessments (case_id, raw, recommendation, applied, assessed_at)
+            "INSERT OR REPLACE INTO assessments
+             (case_id, raw, recommendation, applied, assessed_at, attempts)
              VALUES (?1, ?2, ?3,
                      COALESCE((SELECT applied FROM assessments WHERE case_id = ?1), 0),
-                     ?4)",
+                     ?4,
+                     COALESCE((SELECT attempts FROM assessments WHERE case_id = ?1), 0) + 1)",
             params![case_id, raw, recommendation, crate::util::format_timestamp(
                 time::OffsetDateTime::now_utc()
             )],
@@ -1777,8 +1810,25 @@ mod tests {
                     issued_at   TEXT NOT NULL,
                     delivered   INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE cases (
+                    case_id           TEXT PRIMARY KEY,
+                    accused           TEXT NOT NULL,
+                    reporter          TEXT NOT NULL,
+                    class_id          TEXT NOT NULL,
+                    mandate_ref       TEXT NOT NULL,
+                    device_binding    TEXT NOT NULL,
+                    stage             TEXT NOT NULL,
+                    opened_at         TEXT NOT NULL,
+                    response_deadline TEXT NOT NULL,
+                    decision_deadline TEXT NOT NULL,
+                    responded         INTEGER NOT NULL DEFAULT 0,
+                    disposition       TEXT,
+                    appeal_deadline   TEXT
+                );
                 INSERT INTO mandates VALUES ('m1', 'onym:key:u', 'd1', 'csam', X'7b7d', 't0');
                 INSERT INTO verdicts VALUES ('v1', 'c1', 'dismiss', X'7b7d', 't0', 0);
+                INSERT INTO cases VALUES ('c1', 'onym:key:a', 'onym:key:r', 'csam', 'm1', 'd1',
+                                          'open', 't0', 't1', 't2', 0, NULL, NULL);
                 "#,
             )
             .unwrap();
@@ -1794,6 +1844,14 @@ mod tests {
         assert_eq!(mandate.manifest_hash, "", "no snapshot was kept for it, and that is the truth");
         assert_eq!(store.undelivered_verdicts().unwrap().len(), 1);
         assert!(store.undeliverable_verdicts().unwrap().is_empty());
+
+        // The case read is the one that would have taken the service
+        // down: `CASE_COLUMNS` selects `appeal_state`, which an old
+        // `cases` table does not have.
+        let case = store.case("c1").unwrap().expect("the old case survives");
+        assert_eq!(case.stage, "open");
+        assert_eq!(case.appeal_state, "none", "an old case has never been appealed");
+        assert_eq!(store.cases_overdue("t9").unwrap().len(), 1);
 
         // Migrating twice is not an error.
         drop(store);

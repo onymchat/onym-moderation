@@ -176,6 +176,12 @@ pub async fn apply(
         event_kind: "decided",
         event_detail: &format!("{} by {}", disposition.as_str(), decider.as_str()),
         credited_reporters: credited,
+        // The state the guards above found. Re-asserted inside the
+        // transaction, because they read the case under a lock this
+        // function has long since released — and three callers reach
+        // here, one of them a background sweep.
+        expect_stage: if disposition == Disposition::Reverse { "decided" } else { "open" },
+        expect_disposition: if disposition == Disposition::Reverse { Some("ban") } else { None },
     })?;
 
     state.delivery.flush(&state.store).await?;
@@ -229,7 +235,8 @@ fn require_decision_deadline_not_passed(
         .map_err(|e| Error::Internal(format!("stored decisionDeadline: {e}")))?;
     if now > deadline {
         return Err(Error::WindowClosed(format!(
-            "the decision deadline passed at {}; this case is dismissed by default and cannot              be banned",
+            "the decision deadline passed at {}; this case is dismissed by default and cannot \
+             be banned",
             case.decision_deadline
         )));
     }
