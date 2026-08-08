@@ -37,11 +37,14 @@ reviewing:
 - **No sanction before notice.** A ban is refused until the consented
   response window has *elapsed* — answering early does not shorten it,
   because the accused was promised the time, not merely one chance to
-  speak. Joined evidence produces another signed notice and restarts
-  both the response and decision windows; the latest notice must reach
-  the interface before a ban can issue. A ban is also refused once the
-  decision deadline has passed, since by then the case is already
-  dismissed by default. The case-open mark is the only pre-verdict effect.
+  speak. Joined evidence with different disclosed material or context
+  produces another signed notice and restarts the response window; the
+  case's fixed decision deadline never moves. Byte-identical evidence
+  is already before the accused and does not restart the window. Every
+  notice must reach the interface before a ban can issue. A ban is also
+  refused once the decision deadline has passed, since by then the case
+  is already dismissed by default. The case-open mark is the only
+  pre-verdict effect.
 - **No unexplained verdicts.** `reasoning` is required on every
   disposition, including dismissals and case openings.
 - **No case without consent to *these* terms.** Every mandate is stored
