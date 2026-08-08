@@ -251,21 +251,41 @@ fn require_open(case: &crate::store::CaseRecord) -> Result<(), Error> {
 }
 
 /// The terms a case is judged by: the manifest its accused's mandate
-/// pinned, falling back to the published one only for mandates
-/// predating manifest snapshots.
+/// pinned. Missing jurisdiction state must never fall forward to terms
+/// published after the accused consented.
 fn consented_manifest(
     state: &AppState,
     case: &crate::store::CaseRecord,
 ) -> Result<crate::types::AuthorityManifest, Error> {
-    let snapshot = state
+    let mandate = state
         .store
         .mandate(&case.mandate_ref)?
-        .and_then(|mandate| state.store.manifest_bytes(&mandate.manifest_hash).transpose())
-        .transpose()?;
-    match snapshot {
+        .ok_or_else(|| {
+            Error::Internal(format!(
+                "case {} references missing mandate {}; refusing to judge under published \
+                 terms the accused may not have consented to",
+                case.case_id, case.mandate_ref
+            ))
+        })?;
+    match state.store.manifest_bytes(&mandate.manifest_hash)? {
         Some(raw) => serde_json::from_slice(&raw)
             .map_err(|e| Error::Internal(format!("stored consented manifest unparseable: {e}"))),
-        None => Ok(state.config.manifest.clone()),
+        None => {
+            let published_hash = util::sha256_hex(&state.config.manifest_raw);
+            if published_hash == mandate.manifest_hash {
+                tracing::warn!(
+                    mandate_ref = %mandate.mandate_ref,
+                    "legacy mandate has no snapshot; published bytes still match its hash"
+                );
+                Ok(state.config.manifest.clone())
+            } else {
+                Err(Error::Internal(format!(
+                    "mandate {} pins manifest {}, but its snapshot is missing and the published \
+                     manifest hashes to {published_hash}; refusing to judge under unconsented terms",
+                    mandate.mandate_ref, mandate.manifest_hash
+                )))
+            }
+        }
     }
 }
 
@@ -339,7 +359,28 @@ fn require_response_window_closed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{CaseRecord, Store};
+    use crate::store::{CaseRecord, MandateRecord, Store};
+
+    fn state_with_mandate() -> std::sync::Arc<AppState> {
+        let state = std::sync::Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        let manifest_hash = util::sha256_hex(&state.config.manifest_raw);
+        state
+            .store
+            .put_mandate(
+                &MandateRecord {
+                    mandate_ref: "m1".into(),
+                    user_key: "onym:key:acc".into(),
+                    device_binding: "d1".into(),
+                    classes: vec!["unsolicited-pornography".into()],
+                    manifest_hash,
+                },
+                b"{}",
+                &state.config.manifest_raw,
+                "2026-08-01T00:00:00Z",
+            )
+            .unwrap();
+        state
+    }
 
     fn case(responded: bool, response_deadline: &str) -> CaseRecord {
         CaseRecord {
@@ -394,7 +435,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_ban_after_the_window_is_allowed() {
-        let state = std::sync::Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        let state = state_with_mandate();
         state.store.put_case(&case(false, "2026-08-05T00:00:00Z")).unwrap();
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
         notice_served(&state, "c1");
@@ -459,7 +500,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_decider_is_recorded_on_the_case() {
-        let state = std::sync::Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        let state = state_with_mandate();
         state.store.put_case(&case(false, "2026-08-05T00:00:00Z")).unwrap();
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
         notice_served(&state, "c1");

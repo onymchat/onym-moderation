@@ -1350,6 +1350,17 @@ mod tests {
         }
     }
 
+    fn party_status_request(case_id: &str, seed: [u8; 32]) -> Request<Body> {
+        let timestamp = util::format_timestamp(OffsetDateTime::now_utc());
+        let message = format!("query-status:{case_id}:{timestamp}");
+        Request::get(format!("/v1/cases/{case_id}/status"))
+            .header("x-onym-key", testing::key_reference(seed))
+            .header("x-onym-timestamp", timestamp)
+            .header("x-onym-signature", testing::sign(seed, message.as_bytes()))
+            .body(Body::empty())
+            .unwrap()
+    }
+
     /// Serialize, sign the canonical bytes, and put the signature back
     /// — the shape a real client produces.
     fn signed(mut object: Value, signature_field: &str, seeds: &[[u8; 32]]) -> Vec<u8> {
@@ -2988,14 +2999,7 @@ mod tests {
             .put_assessment(&case_id, br#"{"outcome":"no-decision"}"#, "no-decision", &document.text, true)
             .unwrap();
 
-        let message = format!("query-status:{case_id}");
-        let url = format!(
-            "/v1/cases/{case_id}/status?key={}&signature={}",
-            testing::key_reference(ACCUSED_SEED),
-            urlencode(&testing::sign(ACCUSED_SEED, message.as_bytes()))
-        );
-        let (status, accused_view) =
-            harness.send(Request::get(url).body(Body::empty()).unwrap()).await;
+        let (status, accused_view) = harness.send(party_status_request(&case_id, ACCUSED_SEED)).await;
         assert_eq!(status, StatusCode::OK);
 
         let seen = accused_view["assessment"]["document"].as_str().expect("the record is served");
@@ -3042,13 +3046,7 @@ mod tests {
             .put_assessment(&case_id, br#"{"outcome":"ban"}"#, "ban", &document.text, true)
             .unwrap();
 
-        let message = format!("query-status:{case_id}");
-        let url = format!(
-            "/v1/cases/{case_id}/status?key={}&signature={}",
-            testing::key_reference(REPORTER_SEED),
-            urlencode(&testing::sign(REPORTER_SEED, message.as_bytes()))
-        );
-        let (status, view) = harness.send(Request::get(url).body(Body::empty()).unwrap()).await;
+        let (status, view) = harness.send(party_status_request(&case_id, REPORTER_SEED)).await;
         assert_eq!(status, StatusCode::OK, "a reporter is still a party");
         assert!(view["assessment"].is_null(), "but the record is not theirs");
     }
@@ -3151,13 +3149,7 @@ mod tests {
             )
             .unwrap();
 
-        let message = format!("query-status:{case_id}");
-        let url = format!(
-            "/v1/cases/{case_id}/status?key={}&signature={}",
-            testing::key_reference(ACCUSED_SEED),
-            urlencode(&testing::sign(ACCUSED_SEED, message.as_bytes()))
-        );
-        let (status, view) = harness.send(Request::get(url).body(Body::empty()).unwrap()).await;
+        let (status, view) = harness.send(party_status_request(&case_id, ACCUSED_SEED)).await;
         assert_eq!(status, StatusCode::OK);
 
         // Nowhere in the answer — not the document, not the model's

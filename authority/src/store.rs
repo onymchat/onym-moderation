@@ -1138,6 +1138,21 @@ impl Store {
         Ok(true)
     }
 
+    pub fn append_event(
+        &self,
+        case_id: &str,
+        at: &str,
+        kind: &str,
+        detail: &str,
+    ) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
+            params![case_id, at, kind, detail],
+        )?;
+        Ok(())
+    }
+
     pub fn append_event_bounded(
         &self,
         case_id: &str,
