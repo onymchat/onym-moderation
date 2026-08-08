@@ -234,6 +234,11 @@ impl Store {
                 -- and the mismatch shows up as a log line nobody reads
                 -- rather than as a thing that is stuck.
                 attempts      INTEGER NOT NULL DEFAULT 0,
+                -- Counted separately from `attempts`, because only
+                -- these justify giving up: an interface that was
+                -- unreachable for three sweeps must not make the next
+                -- 4xx the last straw.
+                refusals      INTEGER NOT NULL DEFAULT 0,
                 last_error    TEXT,
                 -- Set when the interface has refused the verdict's
                 -- shape enough times that retrying is pointless. Not a
@@ -263,6 +268,7 @@ impl Store {
             // Delivery bookkeeping, so a verdict the interface refuses
             // becomes visibly stuck instead of retrying forever.
             ("verdicts", "attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("verdicts", "refusals", "INTEGER NOT NULL DEFAULT 0"),
             ("verdicts", "last_error", "TEXT"),
             ("verdicts", "undeliverable", "INTEGER NOT NULL DEFAULT 0"),
         ] {
@@ -476,9 +482,25 @@ impl Store {
         )?;
         if inserted == 0 {
             return Err(Error::BadRequest(format!(
-                "a different report is already on file under reportId {report_id:?};                  report ids are immutable once filed"
+                "a different report is already on file under reportId {report_id:?}; \
+                 report ids are immutable once filed"
             )));
         }
+        Ok(())
+    }
+
+    /// Attach a stored report to the case it opened or joined.
+    pub fn attach_report_to_case(
+        &self,
+        reporter: &str,
+        report_id: &str,
+        case_id: &str,
+    ) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE reports SET case_id = ?3 WHERE reporter = ?1 AND report_id = ?2",
+            params![reporter, report_id, case_id],
+        )?;
         Ok(())
     }
 
@@ -814,23 +836,36 @@ impl Store {
         Ok(())
     }
 
-    /// Record a refused delivery, returning how many have now been
-    /// counted for this verdict.
-    pub fn record_delivery_failure(&self, verdict_ref: &str, error: &str) -> Result<i64, Error> {
+    /// Record a failed delivery. `refused` distinguishes the interface
+    /// rejecting the verdict itself from it being unreachable, and only
+    /// refusals are counted toward giving up: an interface down for
+    /// three sweeps must not make the next 4xx the last straw.
+    ///
+    /// Returns how many refusals this verdict has now had.
+    pub fn record_delivery_failure(
+        &self,
+        verdict_ref: &str,
+        error: &str,
+        refused: bool,
+    ) -> Result<i64, Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE verdicts SET attempts = attempts + 1, last_error = ?2 WHERE verdict_ref = ?1",
-            params![verdict_ref, error],
+            "UPDATE verdicts
+                SET attempts = attempts + 1,
+                    refusals = refusals + ?3,
+                    last_error = ?2
+              WHERE verdict_ref = ?1",
+            params![verdict_ref, error, refused as i64],
         )?;
-        let attempts = conn
+        let refusals = conn
             .query_row(
-                "SELECT attempts FROM verdicts WHERE verdict_ref = ?1",
+                "SELECT refusals FROM verdicts WHERE verdict_ref = ?1",
                 params![verdict_ref],
                 |row| row.get(0),
             )
             .optional()?
             .unwrap_or(0);
-        Ok(attempts)
+        Ok(refusals)
     }
 
     /// Stop retrying a verdict the interface refuses. Not a deletion:

@@ -208,16 +208,22 @@ async fn file_report(
                 report.report_id
             )));
         }
-        let case_id = existing.case_id.unwrap_or_default();
-        let case = state.store.case(&case_id)?;
-        return Ok(Json(json!({
-            "reportId": report.report_id,
-            "receivedAt": case.as_ref().map(|c| c.opened_at.clone()),
-            "caseId": case_id,
-            "duplicate": true,
-            "responseDeadline": case.as_ref().map(|c| c.response_deadline.clone()),
-            "decisionDeadline": case.as_ref().map(|c| c.decision_deadline.clone()),
-        })));
+        // A report already attached to a case is a replay, and gets the
+        // original receipt. One with no case yet is a filing that was
+        // interrupted between storing the evidence and opening the
+        // case; falling through re-attempts that rather than handing
+        // back a receipt naming no case.
+        if let Some(case_id) = existing.case_id {
+            let case = state.store.case(&case_id)?;
+            return Ok(Json(json!({
+                "reportId": report.report_id,
+                "receivedAt": case.as_ref().map(|c| c.opened_at.clone()),
+                "caseId": case_id,
+                "duplicate": true,
+                "responseDeadline": case.as_ref().map(|c| c.response_deadline.clone()),
+                "decisionDeadline": case.as_ref().map(|c| c.decision_deadline.clone()),
+            })));
+        }
     }
 
     // Standing follows the reporter's mandate: reporting requires
@@ -276,6 +282,23 @@ async fn file_report(
     let stamp = util::format_timestamp(now);
     let weight = state.store.reporter(&report.reporter)?.weight();
 
+    // The report goes on file *before* a case exists for it, and is
+    // attached afterwards. The other order left a window where a case
+    // — and the mark it sets — existed with no report behind it, which
+    // is a mark the accused could not be shown a reason for. A report
+    // with no case yet is the harmless direction: it is evidence
+    // sitting on file, and re-filing it picks up where this left off.
+    state.store.put_report(
+        &report.report_id,
+        &report.reporter,
+        &report.accused,
+        &report.class_id,
+        None,
+        weight,
+        &body,
+        &stamp,
+    )?;
+
     // Further reports join an open case rather than opening a second
     // one. Opening a case sets a mark before any response, so
     // duplicate cases would be a way to punish without deciding.
@@ -316,16 +339,7 @@ async fn file_report(
         }
     };
 
-    state.store.put_report(
-        &report.report_id,
-        &report.reporter,
-        &report.accused,
-        &report.class_id,
-        Some(&case.case_id),
-        weight,
-        &body,
-        &stamp,
-    )?;
+    state.store.attach_report_to_case(&report.reporter, &report.report_id, &case.case_id)?;
 
     Ok(Json(json!({
         "reportId": report.report_id,
@@ -485,10 +499,25 @@ async fn respond(
             "statement exceeds {MAX_STATEMENT_BYTES} bytes"
         )));
     }
-    let mut case = state
-        .store
-        .case(&case_id)?
-        .ok_or_else(|| Error::NotFound(format!("case {case_id}")))?;
+    // Nothing about the case is said before the caller proves they are
+    // the accused. Reading the stage first meant an unauthenticated
+    // holder of a case id learned it existed (404 vs anything else) and
+    // whether it had been decided (409) — the same probe the status
+    // endpoint refuses, through a door left open beside it.
+    //
+    // A wrong signature therefore answers "no such case" rather than
+    // "bad signature". Less helpful to a client with a bug, and the
+    // only shape that tells a stranger nothing.
+    let case = match state.store.case(&case_id)? {
+        Some(case) => case,
+        None => return Err(Error::NotFound(format!("case {case_id}"))),
+    };
+    let signing_bytes = canonical::report_signing_bytes(&body)?;
+    if verify_signature(&case.accused, &signing_bytes, &response.signature).is_err() {
+        return Err(Error::NotFound(format!("case {case_id}")));
+    }
+    let mut case = case;
+
     if case.stage != "open" {
         return Err(Error::CaseState("case is already decided".into()));
     }
@@ -503,10 +532,6 @@ async fn respond(
              belongs in one of them rather than in another filing"
         )));
     }
-
-    let signing_bytes = canonical::report_signing_bytes(&body)?;
-    verify_signature(&case.accused, &signing_bytes, &response.signature)
-        .map_err(|_| Error::SignatureInvalid("accused signature did not verify".into()))?;
 
     // Counter-evidence must verify against the accused's own key, the
     // same rule the reporter's evidence is held to.
@@ -562,10 +587,10 @@ async fn appeal(
             "statement exceeds {MAX_STATEMENT_BYTES} bytes"
         )));
     }
-    let case = state
-        .store
-        .case(&case_id)?
-        .ok_or_else(|| Error::NotFound(format!("case {case_id}")))?;
+    let case = match state.store.case(&case_id)? {
+        Some(case) => case,
+        None => return Err(Error::NotFound(format!("case {case_id}"))),
+    };
 
     let new_holder = match submission.kind.as_str() {
         "appeal" => false,
@@ -586,28 +611,31 @@ async fn appeal(
     // one may be pending at a time. Real attestation that the device
     // changed hands needs the interface, which holds the device key;
     // this service cannot verify it alone.
+    // This path answers strangers, so its refusals must all look
+    // alike. Refusing a claim against a non-banned case with a
+    // *distinguishable* error let anyone holding a case id read the
+    // disposition off the status code — precisely what an
+    // unauthenticated endpoint must not do, and the reason the bounds
+    // below are stated as one answer rather than three.
     if new_holder {
-        if case.disposition.as_deref() != Some("ban") {
-            return Err(Error::CaseState(
-                "a new-holder claim applies to a ban in force; this case carries none".into(),
-            ));
-        }
-        let pending = state
+        let already_claimed = state
             .store
             .events(&case_id)?
             .iter()
             .any(|(_, kind, _)| kind == "new_holder_claim");
-        if pending {
-            return Err(Error::CaseState(
-                "a new-holder claim is already pending on this case".into(),
-            ));
+        if case.disposition.as_deref() != Some("ban") || already_claimed {
+            return Err(Error::NotFound(format!("case {case_id}")));
         }
     }
 
     if !new_holder {
         let signing_bytes = canonical::report_signing_bytes(&body)?;
-        verify_signature(&case.accused, &signing_bytes, &submission.signature)
-            .map_err(|_| Error::SignatureInvalid("accused signature did not verify".into()))?;
+        // As on `respond`: a caller who cannot prove they are the
+        // accused learns nothing about the case, including whether it
+        // exists.
+        if verify_signature(&case.accused, &signing_bytes, &submission.signature).is_err() {
+            return Err(Error::NotFound(format!("case {case_id}")));
+        }
 
         // Late filing of an appeal is refused (§10 `window_closed`).
         // The new-holder path is not bounded this way: it stays open
@@ -871,7 +899,14 @@ async fn decide(
     Ok(Json(json!({
         "caseId": case_id,
         "verdictRef": issued.verdict_ref,
-        "disposition": issued.disposition,
+        // The case's disposition, which for a reversal is "reversed".
+        // The *verdict* still says "dismiss": that is the only wire
+        // value meaning "clear the marks", and the interface's
+        // vocabulary is open-case | dismiss | ban. Reporting the
+        // verdict's word here made a reversal read as a dismissal in
+        // the one place a caller looks to confirm what it just did.
+        "disposition": case.disposition.clone().unwrap_or_else(|| issued.disposition.clone()),
+        "verdictDisposition": issued.disposition,
     })))
 }
 
@@ -903,11 +938,13 @@ fn authorize_case_party(
         return Ok(());
     }
     let (Some(key), Some(signature)) = (query.key.as_deref(), query.signature.as_deref()) else {
-        return Err(Error::SignatureInvalid(
-            "query-status requires `key` and `signature` over \"query-status:<caseId>\", or a \
-             moderator token"
-                .into(),
-        ));
+        // Not `SignatureInvalid`. A 401 here and a 404 for a case that
+        // does not exist would let anyone holding a case id tell the
+        // two apart with no credential at all — the whole probe, in one
+        // request with no query string. The advice about what to send
+        // belongs in the docs, not in a reply that doubles as an
+        // existence oracle.
+        return Err(Error::NotFound(format!("case {case_id}")));
     };
 
     // Signature first, party membership second — and the same refusal
@@ -1375,7 +1412,9 @@ mod tests {
             &[STRANGER_SEED],
         );
         let (status, _) = harness.post(&format!("/v1/cases/{case_id}/respond"), body).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // Not 401: a caller who cannot prove they are the accused must
+        // not learn that the case exists either.
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     /// The new-holder path cannot be signature-checked — the new owner
@@ -1395,8 +1434,11 @@ mod tests {
             .unwrap()
         };
 
+        // Refused, and indistinguishably from a case that does not
+        // exist: this path answers strangers, so the disposition must
+        // not be readable off the status code.
         let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), claim(&case_id)).await;
-        assert_eq!(status, StatusCode::CONFLICT, "no ban to be relieved of");
+        assert_eq!(status, StatusCode::NOT_FOUND, "no ban to be relieved of");
 
         // Ban the case, then the claim lands — once.
         let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
@@ -1408,7 +1450,11 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
 
         let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), claim(&case_id)).await;
-        assert_eq!(status, StatusCode::CONFLICT, "an unauthenticated endpoint must not be unbounded");
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an unauthenticated endpoint must not be unbounded"
+        );
     }
 
     // ─── Confidentiality ─────────────────────────────────────────────
@@ -1422,7 +1468,7 @@ mod tests {
 
         let (status, _) =
             harness.send(Request::get(format!("/v1/cases/{case_id}/status")).body(Body::empty()).unwrap()).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(status, StatusCode::NOT_FOUND);
 
         // A stranger who signs correctly is still not a party — and
         // gets the same answer as for a case that does not exist.
@@ -1641,6 +1687,70 @@ mod tests {
         );
         let (status, _) = harness.post(&format!("/v1/cases/{case_id}/respond"), body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+
+    /// The probe the confidentiality story stands or falls on: no
+    /// credentials at all, on a real case and an invented one. If those
+    /// two answers differ, a case id alone tells a stranger that a
+    /// named person is under investigation — and every endpoint taking
+    /// a case id is a place to ask.
+    #[tokio::test]
+    async fn no_endpoint_reveals_whether_a_case_exists_to_an_unauthenticated_caller() {
+        let harness = Harness::new();
+        let real = open_case(&harness).await;
+        let invented = "case-00000000-0000-0000-0000-000000000000".to_string();
+
+        // query-status, with nothing at all.
+        let mut status = Vec::new();
+        for id in [&real, &invented] {
+            status.push(
+                harness
+                    .send(Request::get(format!("/v1/cases/{id}/status")).body(Body::empty()).unwrap())
+                    .await
+                    .0,
+            );
+        }
+        assert_eq!(status[0], status[1], "query-status leaks existence");
+
+        // respond, signed by someone who is not the accused.
+        let mut responded = Vec::new();
+        for id in [&real, &invented] {
+            let body = signed(
+                json!({"caseId": id, "statement": "not me", "evidence": []}),
+                "signature",
+                &[STRANGER_SEED],
+            );
+            responded.push(harness.post(&format!("/v1/cases/{id}/respond"), body).await.0);
+        }
+        assert_eq!(responded[0], responded[1], "respond leaks existence");
+
+        // appeal, likewise.
+        let mut appealed = Vec::new();
+        for id in [&real, &invented] {
+            let body = signed(
+                json!({"caseId": id, "kind": "appeal", "statement": "wrong"}),
+                "signature",
+                &[STRANGER_SEED],
+            );
+            appealed.push(harness.post(&format!("/v1/cases/{id}/appeal"), body).await.0);
+        }
+        assert_eq!(appealed[0], appealed[1], "appeal leaks existence");
+
+        // And the new-holder path, which is unauthenticated by design.
+        // The real case here is open, not banned, so a distinguishable
+        // refusal would disclose its disposition.
+        let mut claimed = Vec::new();
+        for id in [&real, &invented] {
+            let body = serde_json::to_vec(&json!({
+                "caseId": id,
+                "kind": "new-holder-claim",
+                "statement": "I bought this device secondhand",
+            }))
+            .unwrap();
+            claimed.push(harness.post(&format!("/v1/cases/{id}/appeal"), body).await.0);
+        }
+        assert_eq!(claimed[0], claimed[1], "the new-holder path leaks the disposition");
     }
 
 }

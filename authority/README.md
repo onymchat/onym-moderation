@@ -128,8 +128,10 @@ reachable; an undelivered verdict is a delivery problem, never an
 undecided case. Unreachable and 5xx are retried indefinitely.
 
 A **4xx is different**: the interface refused the verdict's shape, and
-identical bytes will be refused identically forever. After three
-refusals the verdict is marked undeliverable and stops being retried —
+identical bytes will be refused identically forever. Refusals are
+counted separately from unreachability — an interface down for three
+sweeps must not make the next 4xx the last straw — and after three
+*refusals* the verdict is marked undeliverable and stops being retried —
 not deleted, and not treated as delivered. It appears in `/health` as
 `undeliverableVerdicts` with the interface's own error, because each
 one is a mark that should have moved and did not: for a dismissal

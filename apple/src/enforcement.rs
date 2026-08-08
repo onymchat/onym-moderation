@@ -274,10 +274,15 @@ impl Engine {
         let ban = bans
             .last()
             .map(|(verdict_ref, verdict, _)| (verdict_ref.clone(), verdict.clone()));
-        let ban_executed = bans
-            .last()
-            .map(|(_, _, executed)| *executed)
-            .unwrap_or(false);
+        // *Any* executed ban, not just the newest. This feeds the
+        // moved-device check: if some ban on this identity has already
+        // been written to a device, a device presenting clean bits is a
+        // different piece of hardware. Reading only the newest missed
+        // the case of two live bans where the older one was written and
+        // the newer has not been yet — and the cost of missing it is
+        // branding a device the verdict never named, quite possibly a
+        // new owner's.
+        let ban_executed = bans.iter().any(|(_, _, executed)| *executed);
 
         // A ban in force is the reason the banned bit is set, so it
         // names the write even when a dismissal in some other case
@@ -662,6 +667,51 @@ mod tests {
         let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
         assert!(intended.bits.banned);
         assert_eq!(intended.authorized_by, "ban-csam");
+    }
+
+
+    /// The moved-device check reads `ban_executed`. With two live bans
+    /// where the older was written to a device and the newer has not
+    /// been yet, taking only the newest answered "never branded" — and
+    /// the engine would then write bits onto a device presenting clean
+    /// ones, which is exactly the hardware that may have changed hands.
+    #[test]
+    fn any_executed_ban_counts_as_having_branded_a_device() {
+        let engine = engine();
+        // Older ban, already written.
+        store_verdict(
+            &engine.store,
+            "ban-csam",
+            verdict("case-csam", Disposition::Ban, "csam"),
+            "2026-08-08T00:00:00Z",
+        );
+        // Newer ban in another case, not yet written.
+        let mut fresh = StoredVerdict {
+            verdict_ref: "ban-violence".into(),
+            case_id: "case-violence".into(),
+            mandate_ref: MANDATE.into(),
+            device_binding: DEVICE.into(),
+            raw: serde_json::to_vec(&verdict(
+                "case-violence",
+                Disposition::Ban,
+                "credible-violence",
+            ))
+            .unwrap(),
+            disposition: "ban".into(),
+            ban_expires: None,
+            execute_after: Some("2026-08-08T00:00:00Z".into()),
+            executed: false,
+            superseded: false,
+        };
+        fresh.executed = false;
+        engine.store.put_verdict(&fresh, "2026-08-08T01:00:00Z").unwrap();
+
+        let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
+        assert!(intended.bits.banned);
+        assert!(
+            intended.ban_executed,
+            "an earlier ban was already branded onto a device; this identity has been marked"
+        );
     }
 
 }

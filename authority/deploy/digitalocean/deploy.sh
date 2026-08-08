@@ -60,8 +60,11 @@ if [ -z "${AUTHORITY_INTERFACE_URL:-}" ]; then
     warn "delivered, so no mark will ever move."
 fi
 if [ -z "${AUTHORITY_INTERFACE_KEY:-}" ]; then
-    warn "AUTHORITY_INTERFACE_KEY is empty — registered mandates will be accepted without"
-    warn "checking the interface countersignature, so a forged designation would pass."
+    warn "AUTHORITY_INTERFACE_KEY is empty — mandate registration will be REFUSED outright,"
+    warn "because an unverifiable designation is the forgery the countersignature exists to"
+    warn "catch. The service will run and acquire no jurisdiction at all: users will appear"
+    warn "to consent and nothing will register. Set it to the interface's countersigning key"
+    warn "(its /health)."
 fi
 
 save_env() {
