@@ -88,9 +88,15 @@ Stop and raise these with the user rather than proceeding:
   endpoint can ban a device, because unverifiable verdict signatures
   are accepted. It defaults to false only so a deployment can exist
   before authorities publish signing keys.
-- **`MODERATION_AUTHORITY_TOKEN` is empty on a public host.** The
-  verdict endpoint would then be an unauthenticated write into the
+- **`MODERATION_AUTHORITY_TOKEN` is empty.** The verdict endpoint now
+  fails closed and refuses everything, so the deployment is inert
+  rather than dangerous — but it is still not a working deployment.
+  Never "fix" it by setting `MODERATION_ALLOW_UNAUTHENTICATED_AUTHORITY=true`
+  on a reachable host; that opens an unauthenticated write into the
   store.
+- **`MODERATION_AUDIT_TOKEN` is empty and someone wants the write
+  log.** Set the token; do not expose the endpoint another way. It
+  names every device binding, verdict reference, and mark transition.
 - **You are about to generate a new signing seed for a service that
   already has one.** Confirm explicitly; this breaks existing mandates.
 - **The user asks you to change a device's bits directly.** There is no

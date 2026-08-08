@@ -34,6 +34,21 @@ pub struct Config {
     /// Transport-level authentication only — the verdict's own
     /// signature is what actually authorizes a mark.
     pub authority_token: Option<String>,
+
+    /// Explicit opt-out from requiring `authority_token`. Absent it,
+    /// an unset token fails closed: an open verdict endpoint is an
+    /// unauthenticated write into the store, and "degraded toward
+    /// blocking" is the stance everywhere else here.
+    pub allow_unauthenticated_authority: bool,
+
+    /// Bearer token for `GET /v1/write-log`. The log names every
+    /// device binding, verdict, and mark transition, so it is not
+    /// public. No token means the endpoint is closed.
+    pub audit_token: Option<String>,
+
+    /// How far a signed session timestamp may be from our clock before
+    /// the request is refused, in seconds.
+    pub session_max_skew_secs: i64,
 }
 
 impl Config {
@@ -79,6 +94,14 @@ impl Config {
             .unwrap_or(false);
 
         let authority_token = env::var("MODERATION_AUTHORITY_TOKEN").ok().filter(|t| !t.is_empty());
+        let allow_unauthenticated_authority = env::var("MODERATION_ALLOW_UNAUTHENTICATED_AUTHORITY")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let audit_token = env::var("MODERATION_AUDIT_TOKEN").ok().filter(|t| !t.is_empty());
+        let session_max_skew_secs = env::var("MODERATION_SESSION_MAX_SKEW_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
 
         Ok(Self {
             bind_addr,
@@ -91,6 +114,9 @@ impl Config {
             interface_component_id,
             enforce_signatures,
             authority_token,
+            allow_unauthenticated_authority,
+            audit_token,
+            session_max_skew_secs,
         })
     }
 
@@ -117,7 +143,13 @@ Optional:
   MODERATION_INTERFACE_COMPONENT_ID   Default: onym:component:onym-ios
   MODERATION_ENFORCE_SIGNATURES       true to reject unverifiable verdict signatures
                                       (default: false — MUST be true in production)
-  MODERATION_AUTHORITY_TOKEN          Bearer token an authority presents on POST /v1/verdicts
+  MODERATION_AUTHORITY_TOKEN          Bearer token an authority presents on POST /v1/verdicts.
+                                      Required: without it the endpoint refuses every request
+                                      unless MODERATION_ALLOW_UNAUTHENTICATED_AUTHORITY=true
+  MODERATION_AUDIT_TOKEN              Bearer token for GET /v1/write-log. Unset closes the
+                                      endpoint — the log names devices, verdicts, and marks
+  MODERATION_SESSION_MAX_SKEW_SECS    Freshness window for signed session timestamps
+                                      (default: 300)
 "#
     }
 }

@@ -127,17 +127,53 @@ cp /path/to/AuthKey_XXXXXXXXXX.p8 secrets/devicecheck.p8
 ./deploy/digitalocean/deploy.sh
 ```
 
+## Submitting a verdict
+
+The authority POSTs an envelope, not a bare verdict:
+
+```json
+{
+  "verdict": { "...": "the signed verdict object" },
+  "consentedManifest": "<base64 of the manifest's exact bytes>"
+}
+```
+
+The manifest travels as **exact bytes** because the mandate pins their
+SHA-256, and only the original bytes reproduce that hash. That binding
+is what makes the submission safe to trust: both the class terms the
+verdict is measured against *and* the operator key its signature is
+checked against come from the manifest the **user** consented to, not
+from the request. Supplying a substituted manifest fails the hash
+check; supplying the real one means signing with the real operator key
+or not at all.
+
 ## Status
 
-Reference implementation. Two things are **not** production-ready
-without a decision from the operator:
+Reference implementation. One thing is **not** production-ready without
+a decision from the operator:
 
-1. `MODERATION_ENFORCE_SIGNATURES` defaults to `false`, so verdicts with
-   unverifiable authority signatures are accepted. That is for the
-   pre-launch world where no authority publishes a signing key yet. Set
-   it `true` before anyone can reach the endpoint.
-2. The verdict endpoint takes the consented manifest inline
-   (`consentedManifest`) to obtain the class terms it validates against.
-   A real deployment should cache authority manifests by hash and look
-   them up from the mandate instead, so an authority cannot supply the
-   terms its own verdict is checked against.
+- `MODERATION_ENFORCE_SIGNATURES` defaults to `false`, so verdicts with
+  unverifiable authority signatures are accepted. That is for the
+  pre-launch world where no authority publishes a signing key yet. Set
+  it `true` before anyone can reach the endpoint.
+
+The verdict endpoint and the write log both fail closed: without
+`MODERATION_AUTHORITY_TOKEN` the former refuses everything (unless
+`MODERATION_ALLOW_UNAUTHENTICATED_AUTHORITY=true` is set deliberately),
+and without `MODERATION_AUDIT_TOKEN` the latter is closed entirely,
+since it names every device binding, verdict, and mark transition.
+
+### A limit worth stating plainly
+
+DeviceCheck tokens are ephemeral and unlinkable by design, so this
+service cannot tell one device from another across sessions. It
+validates the token with Apple at enrollment, which proves a real
+device was there, but it cannot prove the *same* device returns later.
+
+The consequence is handled rather than hidden: when a banned identity
+presents a device whose bits are clean and the ban has already been
+written somewhere, the service refuses the identity but leaves that
+device's bits alone. Branding it would mark hardware the verdict never
+named — quite possibly a new owner's. That follows the contract's own
+division, where the identity refusal covers every surface while device
+marks reach only the devices a verdict names (§5.3 constraint 4).

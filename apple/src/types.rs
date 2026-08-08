@@ -214,6 +214,21 @@ pub struct ModerationMandate {
     pub signatures: Vec<String>,
 }
 
+/// What an authority POSTs to `/v1/verdicts`.
+///
+/// The manifest travels as **base64 of its exact bytes**, not as a
+/// nested object: the mandate pins `SHA-256` of the bytes the user
+/// consented to, and only the original bytes can reproduce that hash.
+/// Re-serializing a parsed manifest would not, which is precisely what
+/// lets the hash bind the manifest — and therefore bind the operator
+/// key a verdict signature is checked against.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerdictSubmission {
+    pub verdict: serde_json::Value,
+    pub consented_manifest: String,
+}
+
 /// A violation class's consented terms, as the authority's manifest
 /// declares them. The backend needs these to validate a verdict's
 /// derived deadlines (§5.6 constraint 3).

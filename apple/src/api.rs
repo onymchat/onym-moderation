@@ -64,6 +64,23 @@ async fn enroll(
     let token = decode_optional_token(request.device_token.as_deref())?;
     let signed = payload::enrollment(token.as_deref(), &request.user_key, &request.timestamp);
     verify_user_signature(&request.user_key, &signed, &request.signature)?;
+    claim_session(&state, &request.timestamp, &request.signature)?;
+
+    // Establishing the linkage the profile describes means Apple has to
+    // agree the token is real. Without this the "device" in
+    // deviceBinding is only an assertion by whoever called us.
+    if let Some(device_check) = state.engine.device_check.as_ref() {
+        let Some(raw_token) = request.device_token.as_deref() else {
+            return Err(Error::BadRequest(
+                "deviceToken is required when DeviceCheck is configured".into(),
+            ));
+        };
+        if device_check.query(raw_token).await?.is_none() {
+            return Err(Error::SignatureInvalid(
+                "Apple did not validate this device token".into(),
+            ));
+        }
+    }
 
     let now = util::format_timestamp(OffsetDateTime::now_utc());
     let enrollment = state.engine.store.enrollment_for(&request.user_key, &now)?;
@@ -92,10 +109,18 @@ async fn countersign(
     // countersignature asserts that this interface witnessed *that
     // user* consenting.
     let signing_bytes = canonical::mandate_signing_bytes(&body)?;
-    let user_signature = mandate
-        .signatures
-        .first()
-        .ok_or_else(|| Error::BadRequest("mandate carries no user signature".into()))?;
+    // Exactly one signature: the user's. A mandate arriving with more
+    // has already been countersigned, and `first()` would then be
+    // verifying whichever signature happened to be at index 0.
+    let user_signature = match mandate.signatures.as_slice() {
+        [user_signature] => user_signature,
+        [] => return Err(Error::BadRequest("mandate carries no user signature".into())),
+        _ => {
+            return Err(Error::BadRequest(
+                "mandate is already countersigned; expected exactly the user's signature".into(),
+            ))
+        }
+    };
     verify_user_signature(&mandate.user, &signing_bytes, user_signature)?;
 
     // The device binding must be one we issued to this identity.
@@ -142,6 +167,7 @@ async fn gate_check(
         &request.timestamp,
     );
     verify_user_signature(&request.user_key, &signed, &request.signature)?;
+    claim_session(&state, &request.timestamp, &request.signature)?;
 
     let result = state
         .engine
@@ -176,9 +202,14 @@ async fn receive_verdict(
 ) -> Result<Json<VerdictAccepted>, Error> {
     authorize_authority(&state, &headers)?;
 
-    let parsed: Verdict = serde_json::from_slice(&body)
+    let submission: VerdictSubmission = serde_json::from_slice(&body)
+        .map_err(|e| Error::BadRequest(format!("malformed submission: {e}")))?;
+
+    let verdict_bytes = serde_json::to_vec(&submission.verdict)
+        .map_err(|e| Error::Internal(format!("re-encode verdict: {e}")))?;
+    let parsed: Verdict = serde_json::from_slice(&verdict_bytes)
         .map_err(|e| Error::BadRequest(format!("malformed verdict: {e}")))?;
-    let signing_bytes = canonical::verdict_signing_bytes(&body)?;
+    let signing_bytes = canonical::verdict_signing_bytes(&verdict_bytes)?;
     let verdict_ref = util::sha256_hex(&signing_bytes);
 
     let mandate = state
@@ -187,22 +218,35 @@ async fn receive_verdict(
         .mandate(&parsed.mandate_ref)?
         .ok_or(Error::NoMandate)?;
 
-    // The manifest the mandate pinned carries the consented terms this
-    // verdict must respect. Until an authority-manifest cache exists,
-    // the operator supplies it alongside the verdict.
-    let manifest: Option<AuthorityManifest> = serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|v| v.get("consentedManifest").cloned())
-        .and_then(|m| serde_json::from_value(m).ok());
+    // The consented manifest carries both the class terms this verdict
+    // must respect and the operator key its signature is checked
+    // against. Taking either from the request unchecked would make
+    // enforcement circular — a caller could supply its own key, sign
+    // with the matching private key, and pass. The mandate pins the
+    // hash of the manifest the *user* consented to, so requiring the
+    // supplied bytes to reproduce that hash is what makes the key
+    // trustworthy.
+    let manifest_raw = util::base64_decode(&submission.consented_manifest)
+        .ok_or_else(|| Error::BadRequest("consentedManifest is not base64".into()))?;
+    if util::sha256_hex(&manifest_raw) != mandate.manifest_hash {
+        return Err(Error::VerdictInvalid(
+            "consentedManifest does not hash to the manifest the mandate pinned".into(),
+        ));
+    }
+    let manifest: AuthorityManifest = serde_json::from_slice(&manifest_raw)
+        .map_err(|e| Error::BadRequest(format!("malformed consentedManifest: {e}")))?;
+    if manifest.component_id != mandate.authority {
+        return Err(Error::VerdictInvalid(
+            "consentedManifest belongs to a different authority than the mandate".into(),
+        ));
+    }
+    state
+        .engine
+        .store
+        .attach_manifest(&parsed.mandate_ref, &manifest_raw)?;
 
-    let violation_class = manifest
-        .as_ref()
-        .and_then(|m| m.violation_class(&parsed.class_id))
-        .cloned();
-    let operator_key = manifest
-        .as_ref()
-        .map(|m| m.operator_key.clone())
-        .unwrap_or_else(|| format!("{}unknown", util::KEY_REFERENCE_PREFIX));
+    let violation_class = manifest.violation_class(&parsed.class_id).cloned();
+    let operator_key = manifest.operator_key.clone();
 
     let outcome = verdict::validate(ValidationInput {
         verdict: &parsed,
@@ -224,7 +268,7 @@ async fn receive_verdict(
             case_id: parsed.case_id.clone(),
             mandate_ref: parsed.mandate_ref.clone(),
             device_binding: mandate.device_binding.clone(),
-            raw: body.to_vec(),
+            raw: verdict_bytes.clone(),
             disposition: match parsed.disposition {
                 Disposition::OpenCase => "open-case".into(),
                 Disposition::Dismiss => "dismiss".into(),
@@ -260,7 +304,11 @@ async fn receive_verdict(
 
 /// The write log, plus the result of recomputing its hash chain. This
 /// is what an audit-seat attestation reads.
-async fn write_log(State(state): State<Arc<AppState>>) -> Result<Json<Value>, Error> {
+async fn write_log(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, Error> {
+    authorize_audit(&state, &headers)?;
     let entries = state.engine.store.write_log(1000)?;
     let broken_at = state.engine.store.verify_write_log()?;
     Ok(Json(json!({
@@ -281,6 +329,37 @@ async fn write_log(State(state): State<Arc<AppState>>) -> Result<Json<Value>, Er
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────
+
+/// A signed session is fresh and single-use.
+///
+/// The signature covers a timestamp, so without a freshness check a
+/// captured body is replayable forever. The window bounds that; taking
+/// the signature single-use closes it entirely, since a replay inside
+/// the window presents the same signature bytes.
+fn claim_session(state: &AppState, timestamp: &str, signature: &str) -> Result<(), Error> {
+    let stamped = util::parse_timestamp(timestamp)
+        .map_err(|e| Error::BadRequest(format!("timestamp: {e}")))?;
+    let now = OffsetDateTime::now_utc();
+    let skew = (now - stamped).whole_seconds().abs();
+    if skew > state.config.session_max_skew_secs {
+        return Err(Error::SignatureInvalid(format!(
+            "session timestamp is {skew}s from now (limit {}s)",
+            state.config.session_max_skew_secs
+        )));
+    }
+
+    let retain_before =
+        util::format_timestamp(now - time::Duration::seconds(state.config.session_max_skew_secs * 2));
+    let fresh = state.engine.store.claim_signature(
+        signature,
+        &util::format_timestamp(now),
+        &retain_before,
+    )?;
+    if !fresh {
+        return Err(Error::SignatureInvalid("session signature already used".into()));
+    }
+    Ok(())
+}
 
 fn decode_optional_token(raw: Option<&str>) -> Result<Option<Vec<u8>>, Error> {
     match raw {
@@ -314,14 +393,53 @@ fn verify_user_signature(user_key: &str, message: &[u8], signature: &str) -> Res
 /// the endpoint from being an open write to the store.
 fn authorize_authority(state: &AppState, headers: &HeaderMap) -> Result<(), Error> {
     let Some(expected) = state.config.authority_token.as_deref() else {
-        return Ok(());
+        // Fail closed. An unset token used to mean "open", which made
+        // the verdict endpoint an unauthenticated write into the store
+        // for anyone who found the host.
+        if state.config.allow_unauthenticated_authority {
+            tracing::warn!(
+                "verdict accepted without authority authentication \
+                 (MODERATION_ALLOW_UNAUTHENTICATED_AUTHORITY=true)"
+            );
+            return Ok(());
+        }
+        return Err(Error::SignatureInvalid(
+            "MODERATION_AUTHORITY_TOKEN is not configured; the verdict endpoint is closed".into(),
+        ));
     };
+    require_bearer(headers, expected, "authority")
+}
+
+/// The write log names every device binding, verdict reference, and
+/// mark transition. It is for the operator and the audit seat, not for
+/// the internet, so an unset token closes it rather than opening it.
+fn authorize_audit(state: &AppState, headers: &HeaderMap) -> Result<(), Error> {
+    let Some(expected) = state.config.audit_token.as_deref() else {
+        return Err(Error::SignatureInvalid(
+            "MODERATION_AUDIT_TOKEN is not configured; the write log is closed".into(),
+        ));
+    };
+    require_bearer(headers, expected, "audit")
+}
+
+fn require_bearer(headers: &HeaderMap, expected: &str, label: &str) -> Result<(), Error> {
     let presented = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     match presented {
-        Some(token) if token == expected => Ok(()),
-        _ => Err(Error::SignatureInvalid("authority bearer token missing or wrong".into())),
+        // Constant-time compare: these are shared secrets, and a
+        // byte-by-byte early exit leaks their prefix.
+        Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => Ok(()),
+        _ => Err(Error::SignatureInvalid(format!(
+            "{label} bearer token missing or wrong"
+        ))),
     }
+}
+
+fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
+    if lhs.len() != rhs.len() {
+        return false;
+    }
+    lhs.iter().zip(rhs).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }

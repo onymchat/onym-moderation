@@ -56,6 +56,18 @@ if [ "${MODERATION_ENFORCE_SIGNATURES:-false}" != "true" ]; then
     warn "MODERATION_ENFORCE_SIGNATURES is not true — unverifiable verdict signatures are"
     warn "accepted. Do not run a production deployment this way."
 fi
+if [ -z "${MODERATION_AUTHORITY_TOKEN:-}" ]; then
+    if [ "${MODERATION_ALLOW_UNAUTHENTICATED_AUTHORITY:-false}" = "true" ]; then
+        err "MODERATION_ALLOW_UNAUTHENTICATED_AUTHORITY=true with no authority token means"
+        err "anyone who reaches this host can ban a device. Refusing to deploy."
+        exit 1
+    fi
+    warn "MODERATION_AUTHORITY_TOKEN is empty — the verdict endpoint will refuse every"
+    warn "request, so no authority can act. Set it (openssl rand -hex 32)."
+fi
+if [ -z "${MODERATION_AUDIT_TOKEN:-}" ]; then
+    warn "MODERATION_AUDIT_TOKEN is empty — /v1/write-log will be closed, including to you."
+fi
 
 save_env() {
     local tmp; tmp="$(mktemp)"

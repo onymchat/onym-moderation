@@ -111,10 +111,24 @@ impl Store {
                 manifest_hash  TEXT NOT NULL,
                 classes        TEXT NOT NULL,
                 raw            BLOB NOT NULL,
-                created_at     TEXT NOT NULL
+                created_at     TEXT NOT NULL,
+                -- The consented manifest's exact bytes, learned when a
+                -- verdict first arrives carrying a manifest whose hash
+                -- matches `manifest_hash`. Holding it lets the gate
+                -- derive real case deadlines from consented windows
+                -- instead of inventing them.
+                manifest_raw   BLOB
             );
             CREATE INDEX IF NOT EXISTS mandates_by_device
                 ON mandates (device_binding);
+
+            -- Session signatures are single-use within their freshness
+            -- window, so a captured enroll or gate-check body cannot be
+            -- replayed even before its timestamp goes stale.
+            CREATE TABLE IF NOT EXISTS seen_signatures (
+                signature  TEXT PRIMARY KEY,
+                seen_at    TEXT NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS verdicts (
                 verdict_ref    TEXT PRIMARY KEY,
@@ -176,6 +190,29 @@ impl Store {
         Ok(Enrollment { device_binding })
     }
 
+    // ─── Session replay ──────────────────────────────────────────────
+
+    /// Record a session signature, returning false if it has been seen
+    /// before. The freshness window bounds how long entries matter, so
+    /// anything older than `retain_before` is swept on the way past.
+    pub fn claim_signature(
+        &self,
+        signature: &str,
+        now: &str,
+        retain_before: &str,
+    ) -> Result<bool, Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM seen_signatures WHERE seen_at < ?1",
+            params![retain_before],
+        )?;
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO seen_signatures (signature, seen_at) VALUES (?1, ?2)",
+            params![signature, now],
+        )?;
+        Ok(inserted == 1)
+    }
+
     // ─── Mandates ────────────────────────────────────────────────────
 
     pub fn put_mandate(&self, record: &MandateRecord, raw: &[u8], now: &str) -> Result<(), Error> {
@@ -196,6 +233,31 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Pin the consented manifest's exact bytes to a mandate. Called
+    /// only after the caller has checked they hash to the mandate's
+    /// `manifest_hash`, so this can never store a substituted manifest.
+    pub fn attach_manifest(&self, mandate_ref: &str, manifest_raw: &[u8]) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE mandates SET manifest_raw = ?1 WHERE mandate_ref = ?2 AND manifest_raw IS NULL",
+            params![manifest_raw, mandate_ref],
+        )?;
+        Ok(())
+    }
+
+    pub fn manifest_for_mandate(&self, mandate_ref: &str) -> Result<Option<Vec<u8>>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let raw = conn
+            .query_row(
+                "SELECT manifest_raw FROM mandates WHERE mandate_ref = ?1",
+                params![mandate_ref],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(raw)
     }
 
     pub fn mandate(&self, mandate_ref: &str) -> Result<Option<MandateRecord>, Error> {
@@ -465,6 +527,63 @@ mod tests {
         assert_eq!(entries[0].previous_hash, "genesis");
         assert_eq!(entries[1].previous_hash, entries[0].entry_hash);
         assert_eq!(store.verify_write_log().unwrap(), None);
+    }
+
+    #[test]
+    fn session_signatures_are_single_use() {
+        let store = Store::in_memory().unwrap();
+        let retain_before = "2026-08-08T00:00:00Z";
+        assert!(store
+            .claim_signature("sig-a", "2026-08-08T12:00:00Z", retain_before)
+            .unwrap());
+        // A replay presents the same signature bytes.
+        assert!(!store
+            .claim_signature("sig-a", "2026-08-08T12:00:01Z", retain_before)
+            .unwrap());
+        assert!(store
+            .claim_signature("sig-b", "2026-08-08T12:00:02Z", retain_before)
+            .unwrap());
+    }
+
+    /// Entries older than the freshness window are swept, so the table
+    /// stays bounded — and a signature that old is rejected on
+    /// timestamp anyway.
+    #[test]
+    fn old_session_signatures_are_swept() {
+        let store = Store::in_memory().unwrap();
+        assert!(store
+            .claim_signature("sig-a", "2026-08-08T12:00:00Z", "2026-08-08T00:00:00Z")
+            .unwrap());
+        assert!(store
+            .claim_signature("sig-b", "2026-08-09T12:00:00Z", "2026-08-09T00:00:00Z")
+            .unwrap());
+        // sig-a was swept by the second call's retention bound.
+        assert!(store
+            .claim_signature("sig-a", "2026-08-09T12:00:01Z", "2026-08-09T00:00:00Z")
+            .unwrap());
+    }
+
+    #[test]
+    fn manifest_attaches_once_and_reads_back() {
+        let store = Store::in_memory().unwrap();
+        let record = MandateRecord {
+            mandate_ref: "m1".into(),
+            user_key: "onym:key:aa".into(),
+            authority: "onym:component:a".into(),
+            device_binding: "d1".into(),
+            manifest_hash: "hash".into(),
+            classes: vec!["csam".into()],
+        };
+        store.put_mandate(&record, b"{}", "2026-08-08T00:00:00Z").unwrap();
+        assert_eq!(store.manifest_for_mandate("m1").unwrap(), None);
+
+        store.attach_manifest("m1", b"{\"a\":1}").unwrap();
+        assert_eq!(store.manifest_for_mandate("m1").unwrap().unwrap(), b"{\"a\":1}");
+
+        // Attach is write-once: a later call cannot swap the manifest
+        // a mandate is understood to have consented to.
+        store.attach_manifest("m1", b"{\"a\":2}").unwrap();
+        assert_eq!(store.manifest_for_mandate("m1").unwrap().unwrap(), b"{\"a\":1}");
     }
 
     /// The point of the chain: a doctored row is detectable without

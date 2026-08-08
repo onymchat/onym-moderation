@@ -33,6 +33,8 @@ struct Intended {
     /// Verdicts whose marks this write realizes, so they can be flagged
     /// executed once Apple accepts it.
     realizes: Vec<String>,
+    /// Whether the ban in force has already been written to a device.
+    ban_executed: bool,
 }
 
 impl Engine {
@@ -77,19 +79,43 @@ impl Engine {
 
         if let Some(intended) = intended.as_ref() {
             if intended.bits != bits {
-                self.write_bits(
-                    device_check,
-                    device_token,
-                    binding.as_deref().unwrap_or("unresolved"),
-                    intended.bits,
-                    &intended.authorized_by,
-                    now,
-                )
-                .await?;
-                // Only now — after Apple accepted the write — are the
-                // verdicts behind it actually executed.
-                for verdict_ref in &intended.realizes {
-                    self.store.mark_executed(verdict_ref)?;
+                // A ban we have already branded onto a device, meeting
+                // a device whose bits are clean, is a *different piece
+                // of hardware* presenting the same identity — someone
+                // who moved to a new phone. DeviceCheck tokens are
+                // unlinkable, so this is the only signal available, and
+                // branding on it would mark a device the verdict never
+                // named, quite possibly someone else's.
+                //
+                // The contract already says what to do: the identity
+                // refusal covers the named keys on every surface, while
+                // device marks reach only the devices the verdict names
+                // (§5.3 constraint 4). So refuse the identity below,
+                // and leave this device's bits alone.
+                let would_brand_another_device =
+                    intended.bits.banned && !bits.banned && intended.ban_executed;
+
+                if would_brand_another_device {
+                    tracing::warn!(
+                        binding = %binding.as_deref().unwrap_or("unresolved"),
+                        "banned identity presented a device with clean bits; refusing the \
+                         identity without marking this device"
+                    );
+                } else {
+                    self.write_bits(
+                        device_check,
+                        device_token,
+                        binding.as_deref().unwrap_or("unresolved"),
+                        intended.bits,
+                        &intended.authorized_by,
+                        now,
+                    )
+                    .await?;
+                    // Only now — after Apple accepted the write — are
+                    // the verdicts behind it actually executed.
+                    for verdict_ref in &intended.realizes {
+                        self.store.mark_executed(verdict_ref)?;
+                    }
                 }
             }
         }
@@ -140,6 +166,7 @@ impl Engine {
         let mut ban: Option<(String, Verdict)> = None;
         let mut authorized_by = String::from("reconciliation");
         let mut realizes: Vec<String> = Vec::new();
+        let mut ban_executed = false;
 
         for stored in verdicts.iter().rev() {
             if stored.superseded {
@@ -152,11 +179,15 @@ impl Engine {
                     continue;
                 }
             };
-            realizes.push(stored.verdict_ref.clone());
+            // `realizes` collects only verdicts whose marks this write
+            // actually puts into effect — a ban still waiting on its
+            // executeAfter must not be flagged executed because some
+            // unrelated write succeeded.
             match verdict.disposition {
                 crate::types::Disposition::OpenCase => {
                     case_open = true;
                     authorized_by = stored.verdict_ref.clone();
+                    realizes.push(stored.verdict_ref.clone());
                 }
                 crate::types::Disposition::Dismiss => {
                     // Dismissal clears the case-open mark, and a
@@ -164,6 +195,7 @@ impl Engine {
                     case_open = false;
                     ban = None;
                     authorized_by = stored.verdict_ref.clone();
+                    realizes.push(stored.verdict_ref.clone());
                 }
                 crate::types::Disposition::Ban => {
                     if !Self::ban_in_force(stored, now) {
@@ -178,6 +210,8 @@ impl Engine {
                     case_open = false;
                     ban = Some((stored.verdict_ref.clone(), verdict));
                     authorized_by = stored.verdict_ref.clone();
+                    realizes.push(stored.verdict_ref.clone());
+                    ban_executed = stored.executed;
                 }
             }
         }
@@ -187,6 +221,7 @@ impl Engine {
             authorized_by,
             ban,
             realizes,
+            ban_executed,
         }))
     }
 
@@ -228,6 +263,13 @@ impl Engine {
 
     /// Notices for cases still open against this device. The client
     /// displays these; the case-open mark must not degrade service.
+    ///
+    /// The deadlines are *derived from the consented manifest* — the
+    /// response window and decision deadline the user agreed to,
+    /// counted from the case's opening. A notice whose manifest we
+    /// don't hold yet is omitted rather than served with invented
+    /// dates: these are shown to an accused person deciding when to
+    /// respond, and a plausible wrong date is worse than none.
     fn open_case_notices(&self, device_binding: &str) -> Result<Vec<crate::types::CaseNotice>, Error> {
         let verdicts = self.store.verdicts_for_device(device_binding)?;
         let mut notices = Vec::new();
@@ -235,20 +277,45 @@ impl Engine {
             if stored.superseded || stored.disposition != "open-case" {
                 continue;
             }
-            if let Ok(verdict) = serde_json::from_slice::<Verdict>(&stored.raw) {
-                notices.push(crate::types::CaseNotice {
-                    notice_version: 1,
-                    case_id: verdict.case_id.clone(),
-                    authority: verdict.authority.clone(),
-                    accused: verdict.accused_keys.first().cloned().unwrap_or_default(),
-                    mandate_ref: verdict.mandate_ref.clone(),
-                    class_id: verdict.class_id.clone(),
-                    evidence_summary: verdict.reasoning.clone(),
-                    response_deadline: verdict.decided_at.clone(),
-                    decision_deadline: verdict.decided_at.clone(),
-                    signature: verdict.signature.clone(),
-                });
-            }
+            let Ok(verdict) = serde_json::from_slice::<Verdict>(&stored.raw) else {
+                continue;
+            };
+            let Some(manifest_raw) = self.store.manifest_for_mandate(&verdict.mandate_ref)? else {
+                continue;
+            };
+            let Ok(manifest) = serde_json::from_slice::<crate::types::AuthorityManifest>(&manifest_raw)
+            else {
+                continue;
+            };
+            let Some(class) = manifest.violation_class(&verdict.class_id) else {
+                continue;
+            };
+            let Ok(decided_at) = util::parse_timestamp(&verdict.decided_at) else {
+                continue;
+            };
+            let (Ok(response_days), Ok(decision_days)) = (
+                util::parse_days(&class.response_window),
+                util::parse_days(&class.decision_deadline),
+            ) else {
+                continue;
+            };
+
+            notices.push(crate::types::CaseNotice {
+                notice_version: 1,
+                case_id: verdict.case_id.clone(),
+                authority: verdict.authority.clone(),
+                accused: verdict.accused_keys.first().cloned().unwrap_or_default(),
+                mandate_ref: verdict.mandate_ref.clone(),
+                class_id: verdict.class_id.clone(),
+                evidence_summary: verdict.reasoning.clone(),
+                response_deadline: util::format_timestamp(
+                    decided_at + time::Duration::days(response_days),
+                ),
+                decision_deadline: util::format_timestamp(
+                    decided_at + time::Duration::days(decision_days),
+                ),
+                signature: verdict.signature.clone(),
+            });
         }
         Ok(notices)
     }
