@@ -74,6 +74,31 @@ expect. If the process exited at boot, read stderr: a manifest whose
 `validUntil`, both stop the service deliberately. `interfaceConfigured: false` means verdicts are signed and
 stored but never delivered — no mark will ever move.
 
+## Triage and the panel
+
+Two settings change who decides. Both default to the cautious value.
+
+- `AUTHORITY_TRIAGE_MODE` — `off` (no classifier), `advisory` (it
+  recommends, a human decides), `autonomous` (it decides; a human sees
+  a case only on appeal).
+- `AUTHORITY_ADMIN_TOKEN` — opens the moderator panel at `/admin`,
+  where appeals are reviewed. Unset, no human can review an appeal at
+  all.
+
+For autonomous triage you also need a moderation model **on the same
+host**: uncomment the `moderation-model` service in
+`docker-compose.yml`, set `AUTHORITY_TRIAGE_IMAGE`, and leave
+`AUTHORITY_TRIAGE_URL` pointing at that container. Verify after
+deploying:
+
+```bash
+ssh root@$DROPLET_IP 'cd /opt/onym-moderation-authority && \
+  docker compose logs authority | grep "triage enabled"'
+```
+
+If the logs carry `the moderation model is NOT on this host`, stop:
+case evidence is being sent to a third party.
+
 ## Refuse to deploy if
 
 - **The manifest's `operator` does not match the signing key.** The
@@ -93,6 +118,22 @@ stored but never delivered — no mark will ever move.
 - **Someone asks you to change a device's marks.** Wrong service
   entirely — and the enforcement backend will only act on a signed
   verdict, which is the point.
+- **`AUTHORITY_TRIAGE_URL` points off this host.** Case evidence is
+  content a reporter disclosed for adjudication; sending it to a
+  third-party API is a disclosure the manifest's confidentiality policy
+  must declare. Run the model locally, or get the manifest changed
+  first — and remember a changed manifest does not bind anyone who
+  already consented.
+- **Triage is autonomous and the manifest declares no confidentiality
+  policy.** Users consented without being told their disclosed evidence
+  is machine-classified.
+- **Triage is autonomous and `AUTHORITY_ADMIN_TOKEN` is unset.** Every
+  verdict would then be issued by a classifier with no route to a human
+  at all, not even on appeal.
+- **Someone asks you to raise `AUTHORITY_TRIAGE_BAN_THRESHOLD` above 1
+  or set the dismiss threshold above the ban threshold.** The service
+  refuses to start rather than run with no band in which it declines to
+  decide; that band is the model's way of saying "ask a person".
 
 ## Operating notes
 

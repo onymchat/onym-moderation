@@ -34,6 +34,132 @@ pub struct Config {
     pub moderator_token: Option<String>,
 
     pub deadline_sweep_secs: u64,
+
+    /// Triage configuration. `None` means no classifier runs at all.
+    pub triage: Option<TriageConfig>,
+
+    /// Bearer token for the moderator web panel. The panel shows
+    /// disclosed evidence, so an unset token closes it.
+    pub admin_token: Option<String>,
+}
+
+/// How much authority a classifier has over a case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriageMode {
+    /// Classify and attach a recommendation; a human decides.
+    Advisory,
+    /// Classify and decide. Still bound by every guard in
+    /// `decisions.rs` — notably, no ban before the response window.
+    Autonomous,
+}
+
+#[derive(Debug)]
+pub struct TriageConfig {
+    pub mode: TriageMode,
+    /// The moderation endpoint. Defaults to a loopback address because
+    /// the model is meant to run on this host: case evidence is
+    /// content a reporter disclosed for adjudication, and shipping it
+    /// to someone else's API is a disclosure of its own.
+    pub url: String,
+    pub model: String,
+    pub api_key: Option<String>,
+    /// Score at or above which the classifier recommends a ban.
+    pub ban_threshold: f64,
+    /// Score at or below which it recommends dismissal. Between the
+    /// two it recommends nothing and the case waits for a human (or
+    /// for the decision deadline).
+    pub dismiss_threshold: f64,
+    /// violation class id → the classifier categories that bear on it.
+    /// Without a mapping a category means nothing here: "sexual" is
+    /// not a violation, "unsolicited-pornography" is, and only the
+    /// manifest says so.
+    pub category_map: std::collections::BTreeMap<String, Vec<String>>,
+    pub timeout_secs: u64,
+}
+
+impl TriageConfig {
+    /// Categories the Mistral moderation model reports, mapped to the
+    /// example manifest's classes. This is only a default: the mapping
+    /// belongs to whoever wrote the manifest, because it is the point
+    /// where a model's taxonomy is claimed to line up with terms a user
+    /// consented to. Override with `AUTHORITY_TRIAGE_CATEGORY_MAP`.
+    fn default_category_map() -> std::collections::BTreeMap<String, Vec<String>> {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "csam".to_string(),
+            vec!["sexual".to_string(), "sexual/minors".to_string()],
+        );
+        map.insert(
+            "credible-violence".to_string(),
+            vec![
+                "violence_and_threats".to_string(),
+                "dangerous_and_criminal_content".to_string(),
+            ],
+        );
+        map.insert("unsolicited-pornography".to_string(), vec!["sexual".to_string()]);
+        map
+    }
+
+    fn from_env() -> Result<Option<Self>, String> {
+        let mode = match env::var("AUTHORITY_TRIAGE_MODE").unwrap_or_else(|_| "off".into()).as_str() {
+            "off" => return Ok(None),
+            "advisory" => TriageMode::Advisory,
+            "autonomous" => TriageMode::Autonomous,
+            other => {
+                return Err(format!(
+                    "AUTHORITY_TRIAGE_MODE {other:?} is not off | advisory | autonomous"
+                ))
+            }
+        };
+
+        let url = env::var("AUTHORITY_TRIAGE_URL")
+            .unwrap_or_else(|_| "http://moderation-model:8000/v1/moderations".into());
+        let model =
+            env::var("AUTHORITY_TRIAGE_MODEL").unwrap_or_else(|_| "mistral-moderation-latest".into());
+
+        let category_map = match env::var("AUTHORITY_TRIAGE_CATEGORY_MAP") {
+            Ok(raw) => serde_json::from_str(&raw)
+                .map_err(|e| format!("AUTHORITY_TRIAGE_CATEGORY_MAP is not a JSON object of class → [category]: {e}"))?,
+            Err(_) => Self::default_category_map(),
+        };
+
+        let ban_threshold = parse_threshold("AUTHORITY_TRIAGE_BAN_THRESHOLD", 0.9)?;
+        let dismiss_threshold = parse_threshold("AUTHORITY_TRIAGE_DISMISS_THRESHOLD", 0.2)?;
+        if dismiss_threshold >= ban_threshold {
+            return Err(
+                "AUTHORITY_TRIAGE_DISMISS_THRESHOLD must be below AUTHORITY_TRIAGE_BAN_THRESHOLD; \
+                 otherwise there is no band in which the classifier declines to decide"
+                    .into(),
+            );
+        }
+
+        Ok(Some(Self {
+            mode,
+            url,
+            model,
+            api_key: env::var("AUTHORITY_TRIAGE_API_KEY").ok().filter(|v| !v.is_empty()),
+            ban_threshold,
+            dismiss_threshold,
+            category_map,
+            timeout_secs: env::var("AUTHORITY_TRIAGE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+        }))
+    }
+}
+
+fn parse_threshold(name: &str, default: f64) -> Result<f64, String> {
+    let value = match env::var(name) {
+        Ok(raw) => raw
+            .parse::<f64>()
+            .map_err(|_| format!("{name} must be a number between 0 and 1"))?,
+        Err(_) => default,
+    };
+    if !(0.0..=1.0).contains(&value) {
+        return Err(format!("{name} must be between 0 and 1"));
+    }
+    Ok(value)
 }
 
 impl Config {
@@ -78,7 +204,46 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300),
+            triage: TriageConfig::from_env()?,
+            admin_token: env::var("AUTHORITY_ADMIN_TOKEN").ok().filter(|v| !v.is_empty()),
         })
+    }
+
+    /// Whether evidence would leave this host to be classified.
+    ///
+    /// The check is deliberately crude — loopback and RFC 1918 are
+    /// "here", everything else is "somewhere else". A classifier
+    /// reachable at a public address means recipient-disclosed
+    /// evidence travels to a third party, which is a confidentiality
+    /// change the manifest has to declare (§8 obligation 6), not a
+    /// deployment detail.
+    pub fn triage_leaves_this_host(triage: &TriageConfig) -> bool {
+        let host = triage
+            .url
+            .split("://")
+            .nth(1)
+            .unwrap_or(&triage.url)
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("");
+        !(host == "localhost"
+            || host == "127.0.0.1"
+            || host == "::1"
+            || host == "[::1]"
+            // Compose service names resolve on the private network.
+            || !host.contains('.')
+            || host.starts_with("10.")
+            || host.starts_with("192.168.")
+            || host.starts_with("172.16.")
+            || host.starts_with("172.17.")
+            || host.starts_with("172.18.")
+            || host.starts_with("172.19.")
+            || host.starts_with("172.2")
+            || host.starts_with("172.30.")
+            || host.starts_with("172.31."))
     }
 
     pub fn usage() -> &'static str {

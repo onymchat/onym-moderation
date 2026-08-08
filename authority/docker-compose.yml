@@ -40,7 +40,17 @@ services:
       - AUTHORITY_INTERFACE_TOKEN=${AUTHORITY_INTERFACE_TOKEN:-}
       - AUTHORITY_INTERFACE_KEY=${AUTHORITY_INTERFACE_KEY:-}
       - AUTHORITY_MODERATOR_TOKEN=${AUTHORITY_MODERATOR_TOKEN:-}
+      - AUTHORITY_ADMIN_TOKEN=${AUTHORITY_ADMIN_TOKEN:-}
       - AUTHORITY_DEADLINE_SWEEP_SECS=${AUTHORITY_DEADLINE_SWEEP_SECS:-300}
+      # Triage. The URL points at the sibling container below, so
+      # evidence never leaves this host.
+      - AUTHORITY_TRIAGE_MODE=${AUTHORITY_TRIAGE_MODE:-off}
+      - AUTHORITY_TRIAGE_URL=${AUTHORITY_TRIAGE_URL:-http://moderation-model:8000/v1/moderations}
+      - AUTHORITY_TRIAGE_MODEL=${AUTHORITY_TRIAGE_MODEL:-mistral-moderation-latest}
+      - AUTHORITY_TRIAGE_API_KEY=${AUTHORITY_TRIAGE_API_KEY:-}
+      - AUTHORITY_TRIAGE_BAN_THRESHOLD=${AUTHORITY_TRIAGE_BAN_THRESHOLD:-0.9}
+      - AUTHORITY_TRIAGE_DISMISS_THRESHOLD=${AUTHORITY_TRIAGE_DISMISS_THRESHOLD:-0.2}
+      - AUTHORITY_TRIAGE_CATEGORY_MAP=${AUTHORITY_TRIAGE_CATEGORY_MAP:-}
       - RUST_LOG=${RUST_LOG:-info}
     volumes:
       # Cases, reports, reporter track records, and issued verdicts.
@@ -53,6 +63,28 @@ services:
       - ./manifest:/manifest:ro
     networks: [internal]
 
+  # The moderation model, on this host.
+  #
+  # Uncomment together with AUTHORITY_TRIAGE_MODE. It publishes no
+  # ports: only the authority reaches it, over the private network, so
+  # the evidence it reads never leaves the machine the user consented
+  # to. That is the whole reason it is a sibling container rather than
+  # an API key.
+  #
+  # The image is left to the operator because what can serve Mistral's
+  # moderation shape depends on your licensing: Mistral's own
+  # self-hosted offering, or any local server exposing
+  # `POST /v1/moderations` with `{model, input}` and returning category
+  # scores. The client accepts both documented response shapes.
+  #
+  # moderation-model:
+  #   image: ${AUTHORITY_TRIAGE_IMAGE:?set AUTHORITY_TRIAGE_IMAGE in .env}
+  #   restart: unless-stopped
+  #   networks: [internal]
+  #   volumes:
+  #     - model-cache:/models
+  #   # No `ports:` — deliberately unreachable from outside.
+
 networks:
   internal:
 
@@ -60,3 +92,4 @@ volumes:
   caddy-data:
   caddy-config:
   authority-data:
+  # model-cache:

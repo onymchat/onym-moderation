@@ -21,6 +21,7 @@ use time::OffsetDateTime;
 
 use crate::canonical;
 use crate::cases;
+use crate::decisions;
 use crate::error::Error;
 use crate::state::AppState;
 use crate::store::CaseRecord;
@@ -677,6 +678,7 @@ async fn open_case(
         responded: false,
         disposition: None,
         appeal_deadline: None,
+        appeal_state: "none".into(),
     };
     let issued = cases::open_case_verdict(
         &case,
@@ -933,6 +935,12 @@ async fn appeal(
         )));
     }
 
+    // This is where a human enters. Triage decides in the first
+    // instance; an appeal puts the file in the moderator panel's queue.
+    let mut case = case;
+    case.appeal_state = "pending".into();
+    state.store.put_case(&case)?;
+
     tracing::info!(%case_id, kind = %submission.kind, "appeal filed");
     Ok(Json(json!({
         "caseId": case_id,
@@ -1015,172 +1023,25 @@ async fn decide(
 ) -> Result<Json<Value>, Error> {
     authorize_moderator(&state, &headers)?;
 
-    let mut case = state
-        .store
-        .case(&case_id)?
-        .ok_or_else(|| Error::NotFound(format!("case {case_id}")))?;
-
-    if decision.reasoning.trim().is_empty() {
-        return Err(Error::BadRequest("reasoning is required on every disposition".into()));
-    }
-
-    let now = OffsetDateTime::now_utc();
-    let stamp = util::format_timestamp(now);
-
-    // Every reporter on the case, not just whoever filed first. A case
-    // three people reported was upheld or dismissed for all three.
-    let reporters = {
-        let mut reporters = state.store.case_reporters(&case_id)?;
-        if !reporters.contains(&case.reporter) {
-            reporters.push(case.reporter.clone());
-        }
-        reporters
+    let disposition = decisions::Disposition::parse(&decision.disposition)?;
+    // A moderator who has seen the classifier's assessment is deciding
+    // with assistance, and the record should say so rather than
+    // flattening both into "human".
+    let decider = match state.store.assessment(&case_id)? {
+        Some(_) => decisions::Decider::HumanAssisted,
+        None => decisions::Decider::Human,
     };
 
-    let issued = match decision.disposition.as_str() {
-        "dismiss" => {
-            if case.stage != "open" {
-                return Err(Error::CaseState("case is already decided".into()));
-            }
-            // Notice must precede sanction, but a dismissal is not a
-            // sanction — it can land any time before the deadline.
-            cases::dismissal_verdict(
-                &case,
-                &state.config.manifest.component_id,
-                &decision.reasoning,
-                now,
-                &state.signing_key,
-            )?
-        }
-        "ban" => {
-            if case.stage != "open" {
-                return Err(Error::CaseState("case is already decided".into()));
-            }
-            if !state.store.open_case_verdict_delivered(&case_id)? {
-                return Err(Error::CaseState(
-                    "the opening verdict has not reached the interface; banning before notice \
-                     would run the response window silently"
-                        .into(),
-                ));
-            }
-            // The decision deadline is not advisory: once it passes the
-            // case is dismissed by default, whether or not the sweep
-            // has run yet (§3.5). Without this check a moderator could
-            // ban a case that the contract had already ended in the
-            // accused's favour — and the sweep would simply lose the
-            // race. "Undecided is dismissal" has to hold at the moment
-            // of decision, not at the moment a background task notices.
-            let decision_deadline = util::parse_timestamp(&case.decision_deadline)
-                .map_err(|e| Error::Internal(format!("stored decisionDeadline: {e}")))?;
-            if now > decision_deadline {
-                return Err(Error::WindowClosed(format!(
-                    "the decision deadline passed at {}; this case is dismissed by default and \
-                     cannot be banned",
-                    case.decision_deadline
-                )));
-            }
-            // The response window must have *elapsed* before any ban
-            // verdict: §8 obligation 4 says hold it, and §11.4 says the
-            // banned mark is set "only after the response window a
-            // consented class declared". Neither admits an exception
-            // for a case that has already been answered.
-            //
-            // An earlier version banned as soon as any response
-            // existed. That reads the window as a formality to be
-            // discharged rather than as time the accused was promised:
-            // they may answer on day one and keep gathering
-            // counter-evidence until day three, and a ban on day one
-            // takes the other two days away. The case-open mark is the
-            // only pre-verdict effect this authority may have.
-            let response_deadline = util::parse_timestamp(&case.response_deadline)
-                .map_err(|e| Error::Internal(format!("stored responseDeadline: {e}")))?;
-            if now < response_deadline {
-                return Err(Error::CaseState(format!(
-                    "the response window runs until {}; a ban before it closes is nonconforming",
-                    case.response_deadline
-                )));
-            }
-            let mandate = state.store.mandate(&case.mandate_ref)?.ok_or_else(|| {
-                Error::Internal(format!(
-                    "case {} references missing mandate {}; refusing to judge under published \
-                     terms the accused may not have consented to",
-                    case.case_id, case.mandate_ref
-                ))
-            })?;
-            let consented = consented_manifest(&state, &mandate)?;
-            let class = consented
-                .violation_class(&case.class_id)
-                .ok_or_else(|| Error::ClassOutsideMandate(case.class_id.clone()))?;
-            cases::ban_verdict(
-                &case,
-                class,
-                &state.config.manifest.component_id,
-                &decision.reasoning,
-                now,
-                &state.signing_key,
-            )?
-        }
-        "reverse" => {
-            // A reversal is a new verdict that clears marks — the only
-            // conforming way to correct one, since verdicts are
-            // immutable and corrections never travel as edits (§12).
-            if case.disposition.as_deref() != Some("ban") {
-                return Err(Error::CaseState("only a ban can be reversed".into()));
-            }
-            cases::reversal_verdict(
-                &case,
-                &state.config.manifest.component_id,
-                &decision.reasoning,
-                now,
-                &state.signing_key,
-            )?
-        }
-        other => {
-            return Err(Error::BadRequest(format!(
-                "unknown disposition {other:?} (expected dismiss | ban | reverse)"
-            )))
-        }
-    };
+    let issued = decisions::apply(
+        &state,
+        &case_id,
+        disposition,
+        &decision.reasoning,
+        decider,
+        OffsetDateTime::now_utc(),
+    )
+    .await?;
 
-    // A reversal ends the sanction; the case stays decided either way.
-    case.stage = "decided".into();
-    case.disposition = Some(if decision.disposition == "reverse" {
-        "reversed".into()
-    } else {
-        decision.disposition.clone()
-    });
-    if decision.disposition == "ban" {
-        let v: Value = serde_json::from_slice(&issued.raw)
-            .map_err(|e| Error::Internal(format!("re-read verdict: {e}")))?;
-        case.appeal_deadline = v["appealDeadline"].as_str().map(str::to_string);
-    }
-
-    // Verdict, case stage, event, and reporter track records commit
-    // together — and only after the verdict was successfully built and
-    // signed. Crediting reporters first meant a decision that failed to
-    // sign still moved their standing.
-    //
-    // A reversal is not a dismissal of the report: it corrects this
-    // authority's own error, so nobody's record moves for it.
-    let credited: &[String] = if decision.disposition == "reverse" { &[] } else { &reporters };
-    state.store.commit_decision(&crate::store::Decision {
-        case: &case,
-        verdict_ref: &issued.verdict_ref,
-        disposition: &issued.disposition,
-        raw: &issued.raw,
-        at: &stamp,
-        event_kind: "decided",
-        event_detail: &decision.disposition,
-        credited_reporters: credited,
-        // What the guards above checked. A reversal was found decided
-        // and banned; everything else was found open.
-        expect_stage: if decision.disposition == "reverse" { "decided" } else { "open" },
-        expect_disposition: if decision.disposition == "reverse" { Some("ban") } else { None },
-    })?;
-
-    flush_soon(&state);
-
-    tracing::info!(%case_id, verdict_ref = %issued.verdict_ref, disposition = %issued.disposition, "case decided");
     Ok(Json(json!({
         "caseId": case_id,
         "verdictRef": issued.verdict_ref,
@@ -1190,8 +1051,13 @@ async fn decide(
         // vocabulary is open-case | dismiss | ban. Reporting the
         // verdict's word here made a reversal read as a dismissal in
         // the one place a caller looks to confirm what it just did.
-        "disposition": case.disposition.clone().unwrap_or_else(|| issued.disposition.clone()),
+        "disposition": if disposition == decisions::Disposition::Reverse {
+            "reversed"
+        } else {
+            issued.disposition.as_str()
+        },
         "verdictDisposition": issued.disposition,
+        "decidedBy": decider.as_str(),
     })))
 }
 

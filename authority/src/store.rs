@@ -94,6 +94,8 @@ pub struct CaseRecord {
     pub responded: bool,
     pub disposition: Option<String>,
     pub appeal_deadline: Option<String>,
+    /// none | pending | upheld | reversed
+    pub appeal_state: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -200,7 +202,11 @@ impl Store {
                 decision_deadline TEXT NOT NULL,
                 responded         INTEGER NOT NULL DEFAULT 0,
                 disposition       TEXT,
-                appeal_deadline   TEXT
+                appeal_deadline   TEXT,
+                -- none | pending | upheld | reversed. `pending` is the
+                -- moderator panel's queue: an appeal filed against a
+                -- verdict and not yet reviewed by a human.
+                appeal_state      TEXT NOT NULL DEFAULT 'none'
             );
             CREATE INDEX IF NOT EXISTS cases_by_stage ON cases (stage);
             -- At most one open case per (accused, class). Intake checks
@@ -232,6 +238,25 @@ impl Store {
                 at         TEXT NOT NULL,
                 kind       TEXT NOT NULL,
                 detail     TEXT NOT NULL
+            );
+
+            -- What the classifier concluded, kept whole so an appeal
+            -- reviewer sees what was decided on rather than a summary.
+            CREATE TABLE IF NOT EXISTS assessments (
+                case_id        TEXT PRIMARY KEY,
+                raw            BLOB NOT NULL,
+                recommendation TEXT NOT NULL,
+                applied        INTEGER NOT NULL DEFAULT 0,
+                assessed_at    TEXT NOT NULL
+            );
+
+            -- Moderator panel sessions. Short-lived and revocable; the
+            -- panel displays disclosed evidence, so a leaked cookie is
+            -- a disclosure.
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+                token      TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS verdicts (
@@ -651,8 +676,9 @@ impl Store {
         conn.execute(
             "INSERT OR REPLACE INTO cases
              (case_id, accused, reporter, class_id, mandate_ref, device_binding, stage,
-              opened_at, response_deadline, decision_deadline, responded, disposition, appeal_deadline)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              opened_at, response_deadline, decision_deadline, responded, disposition,
+              appeal_deadline, appeal_state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 case.case_id,
                 case.accused,
@@ -667,6 +693,7 @@ impl Store {
                 case.responded as i32,
                 case.disposition,
                 case.appeal_deadline,
+                case.appeal_state,
             ],
         )?;
         Ok(())
@@ -864,12 +891,13 @@ impl Store {
             responded: row.get::<_, i32>(10)? != 0,
             disposition: row.get(11)?,
             appeal_deadline: row.get(12)?,
+            appeal_state: row.get(13)?,
         })
     }
 
     const CASE_COLUMNS: &'static str = "case_id, accused, reporter, class_id, mandate_ref, \
          device_binding, stage, opened_at, response_deadline, decision_deadline, responded, \
-         disposition, appeal_deadline";
+         disposition, appeal_deadline, appeal_state";
 
     pub fn case(&self, case_id: &str) -> Result<Option<CaseRecord>, Error> {
         let conn = self.conn.lock().unwrap();
@@ -960,6 +988,171 @@ impl Store {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// The disclosed content of every report joined to a case — what
+    /// the classifier reads and what a reviewer is shown.
+    pub fn evidence_for_case(&self, case_id: &str) -> Result<Vec<String>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare("SELECT raw FROM reports WHERE case_id = ?1 ORDER BY filed_at")?;
+        let rows = statement.query_map(params![case_id], |row| row.get::<_, Vec<u8>>(0))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let raw = row?;
+            let Ok(report) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            let Some(items) = report.get("evidence").and_then(|e| e.as_array()) else {
+                continue;
+            };
+            for item in items {
+                if let Some(content) = item.get("disclosedContent").and_then(|c| c.as_str()) {
+                    out.push(content.to_string());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Cases with an appeal awaiting human review — the moderator
+    /// panel's queue.
+    pub fn cases_awaiting_appeal_review(&self) -> Result<Vec<CaseRecord>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {} FROM cases WHERE appeal_state = 'pending' ORDER BY opened_at",
+            Self::CASE_COLUMNS
+        ))?;
+        let rows = statement.query_map([], Self::case_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn recent_cases(&self, limit: i64) -> Result<Vec<CaseRecord>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {} FROM cases ORDER BY opened_at DESC LIMIT ?1",
+            Self::CASE_COLUMNS
+        ))?;
+        let rows = statement.query_map(params![limit], Self::case_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Open cases with no assessment yet — retried by the sweep, since
+    /// a classifier outage must not strand a case.
+    pub fn cases_without_assessment(&self) -> Result<Vec<CaseRecord>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {} FROM cases WHERE stage = 'open'
+               AND case_id NOT IN (SELECT case_id FROM assessments)
+             ORDER BY opened_at",
+            Self::CASE_COLUMNS
+        ))?;
+        let rows = statement.query_map([], Self::case_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Open cases the classifier recommended banning, whose ban has not
+    /// been applied. The sweep revisits these once the accused's
+    /// response window has closed.
+    pub fn cases_with_deferred_ban(&self) -> Result<Vec<CaseRecord>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {} FROM cases WHERE stage = 'open' AND case_id IN
+               (SELECT case_id FROM assessments WHERE recommendation = 'ban' AND applied = 0)
+             ORDER BY opened_at",
+            Self::CASE_COLUMNS
+        ))?;
+        let rows = statement.query_map([], Self::case_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    // ─── Assessments ─────────────────────────────────────────────────
+
+    pub fn put_assessment(
+        &self,
+        case_id: &str,
+        raw: &[u8],
+        recommendation: &str,
+    ) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO assessments (case_id, raw, recommendation, applied, assessed_at)
+             VALUES (?1, ?2, ?3,
+                     COALESCE((SELECT applied FROM assessments WHERE case_id = ?1), 0),
+                     ?4)",
+            params![case_id, raw, recommendation, crate::util::format_timestamp(
+                time::OffsetDateTime::now_utc()
+            )],
+        )?;
+        Ok(())
+    }
+
+    /// The stored assessment and whether it has been acted on.
+    pub fn assessment(&self, case_id: &str) -> Result<Option<(Vec<u8>, bool)>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT raw, applied FROM assessments WHERE case_id = ?1",
+                params![case_id],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i32>(1)? != 0)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn mark_assessment_applied(&self, case_id: &str) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE assessments SET applied = 1 WHERE case_id = ?1",
+            params![case_id],
+        )?;
+        Ok(())
+    }
+
+    // ─── Admin sessions ──────────────────────────────────────────────
+
+    pub fn create_admin_session(&self, token: &str, now: &str, expires_at: &str) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM admin_sessions WHERE expires_at < ?1", params![now])?;
+        conn.execute(
+            "INSERT OR REPLACE INTO admin_sessions (token, created_at, expires_at) VALUES (?1, ?2, ?3)",
+            params![token, now, expires_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn admin_session_valid(&self, token: &str, now: &str) -> Result<bool, Error> {
+        let conn = self.conn.lock().unwrap();
+        let valid: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM admin_sessions WHERE token = ?1 AND expires_at > ?2",
+                params![token, now],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(valid.is_some())
+    }
+
+    pub fn destroy_admin_session(&self, token: &str) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM admin_sessions WHERE token = ?1", params![token])?;
+        Ok(())
     }
 
     // ─── Verdicts ────────────────────────────────────────────────────
@@ -1480,6 +1673,7 @@ mod tests {
             responded: false,
             disposition: None,
             appeal_deadline: None,
+            appeal_state: "none".into(),
         };
         store.put_case(&case).unwrap();
 

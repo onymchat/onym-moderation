@@ -97,14 +97,47 @@ async fn sweep_overdue(
     Ok(dismissed)
 }
 
-/// Background loop: sweep deadlines, then push any undelivered
-/// verdicts. Both are idempotent, so a missed tick costs nothing.
+/// Retry classification for open cases that have none, and apply bans
+/// the classifier recommended once the accused's response window has
+/// closed.
+///
+/// The deferral is the whole point. Triage may reach a ban the moment a
+/// report lands, but the accused is owed their consented window to
+/// answer first, so the recommendation waits here rather than being
+/// applied early. If they respond, `decisions::apply` lets it through
+/// sooner; if the classifier never comes back, the decision deadline
+/// dismisses the case.
+pub async fn triage_sweep(state: &AppState, now: OffsetDateTime) -> Result<(), Error> {
+    if state.triage.is_none() {
+        return Ok(());
+    }
+
+    for case in state.store.cases_without_assessment()? {
+        crate::triage::assess_and_maybe_decide(state, &case.case_id, now).await;
+    }
+
+    // Cases where a ban was recommended but deferred. Re-running the
+    // decision is cheap and idempotent: it either lands now or is
+    // refused again for the same reason.
+    for case in state.store.cases_with_deferred_ban()? {
+        crate::triage::apply_deferred_ban(state, &case.case_id, now).await;
+    }
+
+    Ok(())
+}
+
+/// Background loop: sweep deadlines, run triage, then push any
+/// undelivered verdicts. All three are idempotent, so a missed tick
+/// costs nothing.
 pub fn spawn(state: Arc<AppState>) {
     let interval = std::time::Duration::from_secs(state.config.deadline_sweep_secs);
     tokio::spawn(async move {
         loop {
             if let Err(e) = sweep(&state, OffsetDateTime::now_utc()).await {
                 tracing::error!(error = %e, "deadline sweep failed");
+            }
+            if let Err(e) = triage_sweep(&state, OffsetDateTime::now_utc()).await {
+                tracing::error!(error = %e, "triage sweep failed");
             }
             if let Err(e) = state.delivery.flush(&state.store).await {
                 tracing::error!(error = %e, "verdict delivery failed");
@@ -134,6 +167,7 @@ mod tests {
             responded: false,
             disposition: None,
             appeal_deadline: None,
+            appeal_state: "none".into(),
         }
     }
 

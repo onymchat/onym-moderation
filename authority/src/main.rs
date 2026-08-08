@@ -10,15 +10,18 @@
 //! Its whole authority is enumerated in the manifest it publishes, and
 //! reaches only users who signed a mandate naming it.
 
+mod admin;
 mod api;
 mod canonical;
 mod cases;
 mod config;
 mod deadlines;
+mod decisions;
 mod delivery;
 mod error;
 mod state;
 mod store;
+mod triage;
 #[cfg(test)]
 mod testing;
 mod types;
@@ -110,6 +113,52 @@ async fn main() {
              resolve, by the decision-deadline default (dismissal)."
         );
     }
+    // Triage reads the evidence in a case. Where that inference runs
+    // decides whether recipient-disclosed content stays with the
+    // operator the user consented to, so it is checked at boot rather
+    // than left to whoever wrote the compose file.
+    if let Some(triage) = state.config.triage.as_ref() {
+        tracing::info!(
+            mode = ?triage.mode,
+            url = %triage.url,
+            model = %triage.model,
+            ban_threshold = triage.ban_threshold,
+            dismiss_threshold = triage.dismiss_threshold,
+            "triage enabled"
+        );
+        if Config::triage_leaves_this_host(triage) {
+            tracing::error!(
+                url = %triage.url,
+                "the moderation model is NOT on this host: case evidence — content a reporter \
+                 disclosed for adjudication — will be sent to a third party. That is a \
+                 confidentiality change the manifest must declare (§8 obligation 6). Run the \
+                 model locally, or publish a manifest whose confidentiality policy says where \
+                 evidence goes."
+            );
+        }
+        if state.config.manifest.confidentiality.is_none() {
+            tracing::warn!(
+                "triage is enabled but the manifest declares no confidentiality policy; users \
+                 consented without being told their disclosed evidence is machine-classified"
+            );
+        }
+        // Autonomous means nobody reads the file before a mark moves.
+        // The contract permits it; a user is owed the disclosure.
+        if triage.mode == crate::config::TriageMode::Autonomous {
+            tracing::warn!(
+                "triage mode is autonomous: verdicts issue without human review, and a human \
+                 sees a case only if it is appealed"
+            );
+        }
+    }
+
+    if state.config.admin_token.is_none() {
+        tracing::warn!(
+            "AUTHORITY_ADMIN_TOKEN is unset — the moderator panel is closed, so appeals cannot \
+             be reviewed by a human at all"
+        );
+    }
+
     if !state.delivery.configured() {
         tracing::warn!(
             "AUTHORITY_INTERFACE_URL is unset — verdicts are signed and stored but never \
@@ -119,7 +168,9 @@ async fn main() {
 
     deadlines::spawn(state.clone());
 
-    let app = api::router(state).layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024));
+    let app = api::router(state.clone())
+        .merge(admin::router(state))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024));
 
     let addr: SocketAddr = match bind_addr.parse() {
         Ok(a) => a,

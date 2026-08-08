@@ -5,12 +5,15 @@ use ed25519_dalek::SigningKey;
 use crate::config::Config;
 use crate::delivery::Delivery;
 use crate::store::Store;
+use crate::triage::Triage;
 
 pub struct AppState {
     pub config: Config,
     pub store: Store,
     pub delivery: Delivery,
     pub signing_key: SigningKey,
+    /// Present only when a classifier is configured.
+    pub triage: Option<Triage>,
 }
 
 impl AppState {
@@ -21,7 +24,8 @@ impl AppState {
             &config.manifest_raw,
         );
         let signing_key = SigningKey::from_bytes(&config.signing_seed);
-        Self { config, store, delivery, signing_key }
+        let triage = config.triage.as_ref().map(Triage::new);
+        Self { config, store, delivery, signing_key, triage }
     }
 
     #[cfg(test)]
@@ -47,6 +51,8 @@ impl AppState {
             interface_key: Some(crate::testing::interface_key_reference()),
             moderator_token: Some("test-token".into()),
             deadline_sweep_secs: 300,
+            triage: None,
+            admin_token: Some("test-admin".into()),
         };
         Self::new(config, store)
     }

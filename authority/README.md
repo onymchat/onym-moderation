@@ -95,6 +95,89 @@ worth stating:
   open still run to their deadlines: an expiry must not strand someone
   under a case-open mark.
 
+## How a case is decided
+
+Three configurations, chosen with `AUTHORITY_TRIAGE_MODE`:
+
+| Mode | Who decides | Where a human enters |
+|---|---|---|
+| `off` | a moderator, via the API or the panel | every case |
+| `advisory` | a moderator, shown the classifier's recommendation | every case |
+| `autonomous` | the classifier | **on appeal** |
+
+`autonomous` is the shape this was built for: a locally-hosted
+moderation model triages each case, and a person reads the file when
+someone says the machine got it wrong. Appeals are the panel's queue.
+
+Whatever the mode, three things do not change:
+
+- **A ban waits for the response window.** Triage may reach a ban the
+  moment a report lands; the verdict is deferred until the accused's
+  consented window closes (or they answer). A classifier's certainty is
+  not a reason to shorten someone's time to reply, so the guard lives
+  in `decisions.rs` where all three callers inherit it.
+- **A dismissal lands immediately.** It is not a sanction, and making
+  someone wait for one helps nobody.
+- **Undecided is still dismissal.** If the model is down and no human
+  arrives, the case hits its decision deadline and dismisses itself.
+
+## The model runs on this host
+
+`AUTHORITY_TRIAGE_URL` defaults to a sibling container, and the service
+logs an error at boot if it points anywhere else.
+
+Case evidence is content a recipient disclosed *for adjudication*.
+Sending it to a third party's API is a further disclosure — one the
+manifest's confidentiality policy would have to declare (§8 obligation
+6) and that users consented without being told about. Keeping inference
+local means the disclosed content stays with the operator who was
+consented to.
+
+The client speaks the documented moderation shape
+(`POST /v1/moderations` with `{model, input}`), and accepts both
+response forms the API has used — the older `results[].category_scores`
+and the newer `guardrails[].*.categories`. What can serve that shape
+locally depends on your licensing, so the compose file leaves the image
+to the operator rather than pinning one this project cannot verify.
+
+**A response it cannot parse is an error, never a clean result.** The
+tempting failure mode — unrecognised JSON, no categories, score zero,
+dismiss — would turn every outage into an acquittal.
+
+## Category mapping
+
+A model's categories are not violation classes. `sexual` is not an
+offence; `unsolicited-pornography` is, and only the manifest says so.
+`AUTHORITY_TRIAGE_CATEGORY_MAP` is where you assert the correspondence,
+and a class with no mapping is scored as inconclusive rather than given
+an invented number.
+
+Only categories mapped to the case's class count toward its score, so a
+case about one class cannot be decided by a model's opinion about
+conduct nobody consented to have judged.
+
+## The moderator panel
+
+Server-rendered at `/admin`, behind `AUTHORITY_ADMIN_TOKEN` and a
+session cookie (`HttpOnly`, `SameSite=Strict`, `Secure`). Its queue is
+appeals; it also lists recent cases for oversight.
+
+A case page shows the disclosed evidence, the classifier's per-category
+scores and what the class was judged on, the case history, and the
+content address the verdict's reasoning points at. The reporter's
+identity is deliberately absent — it is visible to the authority, never
+to the accused, and a reviewer does not need it to weigh evidence.
+
+Upholding an appeal issues no verdict: the one in force already says
+what it says. Reversing issues a fresh verdict that clears the marks,
+which is the only conforming way to undo one (§12). Either way the
+decision is recorded as `human-assisted`, because the reviewer saw the
+classifier's assessment on the way there.
+
+Everything rendered goes through one escaping function. The evidence
+*is* text a stranger wrote, so that is the boundary between a case file
+and the moderator's session.
+
 ## Endpoints
 
 | Method | Path | |
@@ -107,6 +190,7 @@ worth stating:
 | `GET` | `/v1/cases/:id/status` | query-status, per the confidentiality policy — requires a party credential |
 | `POST` | `/v1/cases/:id/decide` | The moderator's judgment (bearer token) |
 | `POST` | `/v1/verdicts/:ref/requeue` | Requeue a repaired permanent delivery refusal (moderator bearer token) |
+| `GET` | `/admin` | Moderator panel — appeal queue, case files, review |
 | `GET` | `/health` | Signing key, manifest hash, whether it can decide or deliver, and how many verdicts the interface refuses |
 
 `/v1/cases/:id/decide` is the only path from a report to a sanction,
@@ -199,7 +283,6 @@ Reference implementation. Known limits:
   registration operation. Until that lands, jurisdiction has to be
   seeded by hand — which means the end-to-end consent path is not
   closed, across all three repos.
-
 - **The new-holder path cannot be authenticated here.** A new owner is
   by definition not the mandated identity, so their claim cannot be
   signature-checked. It answers every caller identically — filed or
@@ -217,10 +300,16 @@ Reference implementation. Known limits:
   piled-up timeouts remain an accepted operational limitation of this
   reference service.
 
-- **Appeals are recorded, not adjudicated.** Filing an appeal logs it
-  and notifies; a human then decides via `decide` with `reverse`. The
-  manifest's `appellate` is published but this service does not route
-  to an external appellate automatically.
+- **The manifest's `appellate` is published but not routed to.** An
+  appeal is reviewed by this authority's own moderator in the panel; a
+  deployment declaring an external appellate must forward to it by
+  hand. For a class with a `permanent` term the contract *requires* an
+  external appellate, so that gap matters most exactly where the
+  sanction is heaviest.
+- **Triage classifies text.** Evidence that is an image or a video is
+  not scored; those cases come back inconclusive and wait for a human,
+  which is the safe direction but leaves the most serious classes least
+  automated.
 - **Notices are returned to the reporter's call and stored, not pushed
   to the accused.** Serving them is the interface's job (§5.5), and it
   reads them from the gate check.
