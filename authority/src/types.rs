@@ -24,6 +24,16 @@ pub struct ViolationClass {
     pub lawful_reporting: Option<String>,
 }
 
+/// The model profile a manifest declares: which published profile
+/// document, by id and digest.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProfileReference {
+    pub id: String,
+    /// SHA-256 of the published profile document.
+    pub digest: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorityManifest {
@@ -33,6 +43,14 @@ pub struct AuthorityManifest {
     #[serde(rename = "operator")]
     pub operator_key: String,
     pub moderation_profile_id: String,
+    /// The model profile this authority decides under, if it publishes
+    /// one. Which model, prompt, adapter and thresholds decide a case
+    /// is consented policy — the reference policy is explicit that it
+    /// "may not be silently replaced" — so it belongs in the bytes a
+    /// mandate pins, not in the environment of whichever process
+    /// happens to be running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_profile: Option<ModelProfileReference>,
     pub violation_classes: Vec<ViolationClass>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_rules: Option<String>,

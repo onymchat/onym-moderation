@@ -1,0 +1,2010 @@
+//! Automated assessment against a locally-hosted moderation model.
+//!
+//! The model runs on the authority's own host. That is not an
+//! optimisation: the evidence in a case is content a recipient
+//! disclosed for adjudication, and sending it to somebody else's API
+//! would be a further disclosure — one the manifest's confidentiality
+//! policy would have to declare (§8 obligation 6), and one the
+//! reference policy makes a consent-requiring change. Keeping inference
+//! local means the disclosed content never leaves the operator who was
+//! consented to.
+//!
+//! **Which** model is not this module's business. Everything
+//! model-specific — prompt, output format, thresholds, category
+//! mapping, what counts as invalid — lives in the consented
+//! [`ModelProfile`](crate::profiles::ModelProfile). This module builds
+//! the case document, makes one request, hands the output to the
+//! profile, and records what came back. Supporting a seventh model is a
+//! profile, not a patch.
+//!
+//! Two bounds hold whatever the profile says:
+//!
+//! 1. Every decision goes through `decisions::apply`, so it inherits
+//!    the notice rule — a classifier cannot ban before the accused's
+//!    consented response window has elapsed, however certain its score.
+//! 2. Output the profile does not recognise is **no decision**, never a
+//!    verdict. The tempting failure mode — unrecognised response, no
+//!    categories, score zero, dismiss — would turn every outage into an
+//!    acquittal, and its inverse would be far worse.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use time::OffsetDateTime;
+
+use crate::casedoc;
+use crate::config::{TriageConfig, TriageMode};
+use crate::decisions::{self, Decider, Disposition};
+use crate::error::Error;
+use crate::profiles::{Adapter, Assessed, ModelOutput, ModelProfile, Outcome};
+use crate::state::AppState;
+use crate::store::CaseRecord;
+use crate::util;
+
+/// The record of one automated assessment.
+///
+/// Its fields are the ones the reference policy §4.2 requires a signed
+/// verdict to identify: the policy digest, model profile digest, model
+/// revision, class, input-evidence digest, raw final model output,
+/// adapter outcome, and assessment time. Private chain-of-thought is
+/// deliberately absent — it is neither a verdict reason nor evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Assessment {
+    pub profile_id: String,
+    pub profile_digest: String,
+    pub policy_digest: String,
+    pub repository: String,
+    pub revision: String,
+    pub class_id: String,
+    /// SHA-256 of the exact case document the model was shown.
+    pub input_digest: String,
+    /// How much was in that document. An appeal turns on this more
+    /// often than on the score: "did the model see my reply?" has a
+    /// recorded answer rather than an inferred one.
+    pub evidence_items: usize,
+    pub response_items: usize,
+    /// The case revision this reading was taken at. A decision made
+    /// from it is committed only if the case is still there.
+    #[serde(default)]
+    pub case_revision: i64,
+    /// The model's final output, verbatim and bounded. Stored because a
+    /// reviewer on appeal is entitled to see what the machine actually
+    /// said, not a summary of it.
+    pub raw_output: String,
+    /// What the profile's adapter made of that output.
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    /// Why the adapter reached this outcome — in particular, why an
+    /// output was rejected.
+    pub note: String,
+    pub assessed_at: String,
+}
+
+/// Model output beyond this is truncated before storage. A model that
+/// returns a novel is a malfunctioning model, and the case file is not
+/// the place to keep the novel.
+const MAX_STORED_OUTPUT: usize = 8 * 1024;
+
+pub struct Triage {
+    client: reqwest::Client,
+    /// Set once the triage host has been *resolved* to addresses on
+    /// this machine or its private network. `false` means boot could
+    /// not resolve it at all and let it through on the sibling-
+    /// container-not-up-yet reading — so the check is owed, and `infer`
+    /// pays it before the first request that would carry evidence.
+    host_confirmed_local: std::sync::atomic::AtomicBool,
+}
+
+impl Triage {
+    pub fn new(config: &TriageConfig) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(config.timeout_secs))
+                .build()
+                .unwrap_or_default(),
+            host_confirmed_local: std::sync::atomic::AtomicBool::new(
+                crate::config::Config::triage_host_resolves_local(config),
+            ),
+        }
+    }
+
+    /// The off-host check, paid again if boot could not settle it.
+    ///
+    /// Boot accepts a name that does not resolve yet, because refusing
+    /// to start when the model container came up second is its own
+    /// failure. But a typo'd or not-yet-published name that later
+    /// resolves to a public address would then have passed the one
+    /// check standing between disclosed evidence and a stranger — and
+    /// the documentation states that check as unconditional. So it is:
+    /// deferred, never skipped. Once the name resolves locally the
+    /// answer is cached and no lookup happens again.
+    fn confirm_host_is_local(&self, config: &TriageConfig) -> Result<(), Error> {
+        use std::sync::atomic::Ordering;
+        if self.host_confirmed_local.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if crate::config::Config::triage_host_resolves_local(config) {
+            self.host_confirmed_local.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+        Err(Error::Internal(format!(
+            "refusing to send case evidence to {}: the triage host did not resolve at boot and \
+             does not resolve to this host now. Case evidence is content a reporter disclosed \
+             for adjudication; sending it to a third party is a further disclosure the \
+             manifest's confidentiality policy would have to declare (§8 obligation 6).",
+            config.url
+        )))
+    }
+
+    /// Assess one case and store the result.
+    pub async fn assess(
+        &self,
+        state: &AppState,
+        case: &CaseRecord,
+        now: OffsetDateTime,
+    ) -> Result<Assessment, Error> {
+        let config = state
+            .config
+            .triage
+            .as_ref()
+            .ok_or_else(|| Error::Internal("triage is not configured".into()))?;
+        let profile = &config.profile;
+
+        // The profile that decides a case is the one that case's
+        // manifest declares — not whatever this process was started
+        // with. Without this an operator could change an environment
+        // variable and have a live case, or an old mandate, decided by
+        // a different model, prompt or adapter than the accused agreed
+        // to, with the assessment recording the substitution after the
+        // fact as though it had always been the terms.
+        if let Some(declared) = consented_model_profile(state, case)? {
+            if declared.id != profile.id || declared.digest != profile.profile_digest {
+                let document = casedoc::build(&state.store, case)?;
+                return self.record(
+                    state,
+                    case,
+                    profile,
+                    "",
+                    &document,
+                    Assessed {
+                        outcome: Outcome::NoDecision,
+                        score: None,
+                        labels: Vec::new(),
+                        note: format!(
+                            "this case consented to model profile {} ({}), but the service is \
+                             configured with {} ({}); it will not be decided under terms its \
+                             accused never agreed to",
+                            declared.id, declared.digest, profile.id, profile.profile_digest
+                        ),
+                    },
+                    now,
+                );
+            }
+        }
+
+        // A profile that cannot decide this class must not be asked
+        // about it. Its answer could not be attributed to terms the
+        // accused consented to, and a request made anyway would put
+        // disclosed evidence in front of a model for no purpose.
+        if !profile.can_decide(&case.class_id) {
+            let document = casedoc::build(&state.store, case)?;
+            return self.record(
+                state,
+                case,
+                profile,
+                "",
+                &document,
+                Assessed {
+                    outcome: Outcome::NoDecision,
+                    score: None,
+                    labels: Vec::new(),
+                    note: format!(
+                        "profile {} has no rule or native category for class {:?}; it cannot \
+                         decide this case",
+                        profile.id, case.class_id
+                    ),
+                },
+                now,
+            );
+        }
+
+        let document = casedoc::build(&state.store, case)?;
+        if document.evidence_items == 0 {
+            // Recorded, not returned as an error. A case with no
+            // evidence will never acquire any, so retrying it forever
+            // is pure noise; recording a no-decision lets the attempt
+            // counter carry it to its decision deadline, where it is
+            // dismissed.
+            return self.record(
+                state,
+                case,
+                profile,
+                "",
+                &document,
+                Assessed {
+                    outcome: Outcome::NoDecision,
+                    score: None,
+                    labels: Vec::new(),
+                    note: format!(
+                        "case {} has no stored evidence to classify",
+                        case.case_id
+                    ),
+                },
+                now,
+            );
+        }
+
+        let body = profile
+            .request_body(&case.class_id, &document.text)
+            .map_err(Error::Internal)?;
+
+        // A failed round-trip is an *attempt*, and has to be recorded
+        // as one. Returning early here meant no `assessments` row was
+        // written, so the case came back with `attempts = 0` on the
+        // next sweep — and the backoff and the give-up counter, which
+        // exist for exactly this failure, never applied to it. A model
+        // that was down got re-hit for every due case, every tick,
+        // until each case's decision deadline.
+        let output = match self.infer(config, body).await {
+            Ok(output) => output,
+            Err(e) => {
+                let assessment = self.record(
+                    state,
+                    case,
+                    profile,
+                    "",
+                    &document,
+                    Assessed {
+                        outcome: Outcome::NoDecision,
+                        score: None,
+                        labels: Vec::new(),
+                        note: format!("the model could not be consulted: {e}"),
+                    },
+                    now,
+                )?;
+                // Still an error to the caller: nothing was decided,
+                // and the log should say the model failed rather than
+                // that it declined to decide.
+                tracing::warn!(case_id = %case.case_id, error = %e, "inference failed; attempt recorded");
+                let _ = assessment;
+                return Err(e);
+            }
+        };
+        // The case is not frozen while the model reads it, and reading
+        // can take two minutes. A late response, or another report
+        // joining the case, changes the document — and an assessment of
+        // a record that no longer exists must not decide anything: the
+        // response the accused filed in the meantime would have had no
+        // bearing on the decision that banned them.
+        let current = casedoc::build(&state.store, case)?;
+        if current.digest != document.digest {
+            // Deliberately *not* charged to the attempt budget. The
+            // model answered and the case is fine — the record simply
+            // moved underneath the reading. Counting it let the accused
+            // spend the budget for us: a late response is accepted for
+            // as long as the case is open, so landing one during each
+            // inference would exhaust the 24 attempts and run the case
+            // to its decision deadline, where it dismisses by default.
+            // A guard added to stop a decision being made on evidence
+            // nobody had answered would have become a way to guarantee
+            // acquittal.
+            //
+            // The loop is still bounded, by the cap on how many times
+            // the record can change: responses are capped per case, and
+            // reports need a mandate and a signature.
+            return self.record_with(
+                state,
+                case,
+                profile,
+                &output.text,
+                &current,
+                Assessed {
+                    outcome: Outcome::NoDecision,
+                    score: None,
+                    labels: Vec::new(),
+                    note: "the case record changed while the model was reading it; this reading \
+                           is of a document that no longer exists and the case will be \
+                           reassessed"
+                        .into(),
+                },
+                now,
+                false,
+            );
+        }
+
+        let assessed = profile.evaluate(&case.class_id, &output);
+
+        self.record(state, case, profile, &output.text, &document, assessed, now)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &self,
+        state: &AppState,
+        case: &CaseRecord,
+        profile: &ModelProfile,
+        raw_output: &str,
+        document: &casedoc::CaseDocument,
+        assessed: Assessed,
+        now: OffsetDateTime,
+    ) -> Result<Assessment, Error> {
+        self.record_with(state, case, profile, raw_output, document, assessed, now, true)
+    }
+
+    /// As `record`, but able to say the reading should not be charged
+    /// to the case's attempt budget.
+    #[allow(clippy::too_many_arguments)]
+    fn record_with(
+        &self,
+        state: &AppState,
+        case: &CaseRecord,
+        profile: &ModelProfile,
+        raw_output: &str,
+        document: &casedoc::CaseDocument,
+        assessed: Assessed,
+        now: OffsetDateTime,
+        counted: bool,
+    ) -> Result<Assessment, Error> {
+        // The redacted output, computed once: it is both what gets
+        // stored and the yardstick every label is measured against.
+        let visible_output = strip_reasoning(raw_output);
+        let assessment = Assessment {
+            profile_id: profile.id.clone(),
+            profile_digest: profile.profile_digest.clone(),
+            policy_digest: profile.policy_digest.clone(),
+            repository: profile.repository.clone(),
+            revision: profile.revision.clone(),
+            class_id: case.class_id.clone(),
+            input_digest: document.digest.clone(),
+            evidence_items: document.evidence_items,
+            response_items: document.response_items,
+            case_revision: case.revision,
+            // Reasoning is stripped before storage, not after. The
+            // reference policy is explicit that private
+            // chain-of-thought "is neither a verdict reason nor
+            // evidence and need not be retained or disclosed", and a
+            // profile that runs with thinking enabled puts the whole
+            // block inside the final message — so `raw_output` was
+            // storing it verbatim while the comment on this struct
+            // claimed it was absent.
+            //
+            // The adapter still evaluates the *full* output: an
+            // unclosed reasoning block is how it detects a truncated
+            // generation, and it needs to see one to say so.
+            raw_output: truncate(&visible_output, MAX_STORED_OUTPUT),
+            outcome: assessed.outcome.as_str().to_string(),
+            score: assessed.score,
+            // `labels` is the third copy of the model's words, and it
+            // was the one the redaction did not cover. For a taxonomy
+            // read line by line, every line after the first becomes a
+            // label — so a server that inlines its reasoning into
+            // `content` put chain-of-thought straight into a field
+            // that is persisted, rendered in the panel, and returned to
+            // the accused. It was also the one copy no length bound
+            // applied to. Same treatment as the other two.
+            labels: sanitize_labels(assessed.labels, &visible_output),
+            // The adapter's note quotes the output it could not read —
+            // up to 120 characters of it, verbatim — so for a profile
+            // whose server inlines the reasoning block into `content`,
+            // the note carried exactly what stripping `raw_output`
+            // removed. It is stored, rendered in the panel, and
+            // returned to the accused, so it gets the same treatment.
+            note: strip_reasoning(&assessed.note),
+            assessed_at: util::format_timestamp(now),
+        };
+
+        let raw = serde_json::to_vec(&assessment)
+            .map_err(|e| Error::Internal(format!("encode assessment: {e}")))?;
+        state.store.put_assessment(
+            &case.case_id,
+            &raw,
+            &assessment.outcome,
+            &document.text,
+            counted,
+        )?;
+        state.store.append_event_bounded(
+            &case.case_id,
+            &util::format_timestamp(now),
+            "triage_assessed",
+            &format!("{} by {} ({})", assessment.outcome, profile.id, assessment.note),
+            128,
+        )?;
+        Ok(assessment)
+    }
+
+    /// One request to the local inference server, which speaks the
+    /// OpenAI-compatible chat-completions shape that llama.cpp, vLLM,
+    /// Ollama and TGI all serve. The profile decided what is in the
+    /// body; this only sends it and reads the answer out.
+    async fn infer(&self, config: &TriageConfig, body: Value) -> Result<ModelOutput, Error> {
+        // Before the body — which carries the case document — leaves
+        // this process.
+        self.confirm_host_is_local(config)?;
+
+        let mut request = self.client.post(&config.url).json(&body);
+        if let Some(key) = config.api_key.as_deref() {
+            request = request.bearer_auth(key);
+        }
+
+        let response = request.send().await.map_err(|e| {
+            Error::Internal(format!("moderation model unreachable at {}: {e}", config.url))
+        })?;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::Internal(format!(
+                "moderation model returned {status}: {}",
+                truncate(&text, 512)
+            )));
+        }
+
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|e| Error::Internal(format!("moderation response is not JSON: {e}")))?;
+
+        parse_completion(&value).ok_or_else(|| {
+            Error::Internal(format!(
+                "moderation response had no readable completion: {}",
+                truncate(&text, 512)
+            ))
+        })
+    }
+}
+
+/// Read the final output and, when present, the first token's log
+/// probabilities out of a chat-completions response.
+///
+/// A reasoning channel is skipped where the server separates it:
+/// private chain-of-thought is not the answer, and reading it as one
+/// would let a model's musings decide a case its final output declined
+/// to decide.
+fn parse_completion(value: &Value) -> Option<ModelOutput> {
+    let choice = value.get("choices")?.as_array()?.first()?;
+    let message = choice.get("message")?;
+    let text = message
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        // Some servers return `content: null` alongside a reasoning
+        // field. An empty final channel is still a readable response —
+        // the adapter decides what to make of it.
+        .unwrap_or_default();
+
+    let mut first_token_logprobs = Vec::new();
+    if let Some(content) = choice.get("logprobs").and_then(|l| l.get("content")).and_then(Value::as_array) {
+        if let Some(first) = content.first() {
+            // The chosen token, plus the alternatives the server was
+            // asked to report. Both matter: the answer token may not be
+            // the top one.
+            if let (Some(token), Some(logprob)) = (
+                first.get("token").and_then(Value::as_str),
+                first.get("logprob").and_then(Value::as_f64),
+            ) {
+                first_token_logprobs.push((token.to_string(), logprob));
+            }
+            if let Some(top) = first.get("top_logprobs").and_then(Value::as_array) {
+                for entry in top {
+                    if let (Some(token), Some(logprob)) = (
+                        entry.get("token").and_then(Value::as_str),
+                        entry.get("logprob").and_then(Value::as_f64),
+                    ) {
+                        first_token_logprobs.push((token.to_string(), logprob));
+                    }
+                }
+            }
+        }
+    }
+
+    Some(ModelOutput { text, first_token_logprobs })
+}
+
+/// Remove `<think>…</think>` blocks, leaving a visible marker.
+///
+/// An unclosed block is stripped to the end of the output: a
+/// generation cut off mid-reasoning is all reasoning, and keeping the
+/// tail of it would retain exactly what this removes.
+fn strip_reasoning(text: &str) -> String {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        out.push_str("[reasoning withheld]");
+        match rest[start..].find(CLOSE) {
+            Some(end) => rest = &rest[start + end + CLOSE.len()..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The most labels a reading is stored with, and the longest any one
+/// of them may be.
+///
+/// A native category code is a handful of characters; these bounds are
+/// far above any documented taxonomy and far below "the model's entire
+/// output, one line at a time".
+const MAX_STORED_LABELS: usize = 32;
+const MAX_STORED_LABEL: usize = 128;
+
+/// Labels get the same redaction and the same bound as `raw_output`.
+///
+/// The adapter is handed the *full* output on purpose — an unclosed
+/// reasoning block is how it detects a truncated generation — so
+/// anything it hands back can carry reasoning with it. Every label is
+/// a piece cut out of the model's text, which gives an exact rule: a
+/// label is kept only if it can still be quoted from the *redacted*
+/// output. Anything that cannot came out of a reasoning block.
+///
+/// Stripping each label on its own would not do it. The taxonomy
+/// shapes split on commas, so a reasoning block containing one is cut
+/// into fragments, and a fragment holding only the closing tag has no
+/// `<think>` left in it to strip.
+fn sanitize_labels(labels: Vec<String>, visible_output: &str) -> Vec<String> {
+    labels
+        .into_iter()
+        .filter(|label| visible_output.contains(label.trim()))
+        .map(|label| truncate(label.trim(), MAX_STORED_LABEL))
+        .filter(|label| !label.is_empty())
+        .take(MAX_STORED_LABELS)
+        .collect()
+}
+
+fn truncate(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_string();
+    }
+    let mut end = limit;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated]", &value[..end])
+}
+
+/// Assess a case whose response window has closed, and in autonomous
+/// mode act on the result.
+///
+/// Timing is policy, not scheduling convenience: §4.1 says the
+/// authority assesses the *completed* case document after the response
+/// window. Assessing on arrival would ask the model about a case the
+/// accused had not yet had the chance to answer, and then decide it on
+/// that reading.
+pub async fn assess_and_maybe_decide(
+    state: &std::sync::Arc<AppState>,
+    case_id: &str,
+    now: OffsetDateTime,
+) {
+    let Some(triage) = state.triage.as_ref() else { return };
+    let Some(config) = state.config.triage.as_ref() else { return };
+
+    let case = match state.store.case(case_id) {
+        Ok(Some(case)) => case,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::error!(%case_id, error = %e, "triage could not load the case");
+            return;
+        }
+    };
+    if case.stage != "open" {
+        return;
+    }
+    if !response_window_closed(&case, now) {
+        return;
+    }
+
+    let assessment = match triage.assess(state, &case, now).await {
+        Ok(assessment) => assessment,
+        Err(e) => {
+            // The case is untouched and still open. The sweep retries,
+            // and failing that the decision deadline dismisses it — an
+            // authority whose classifier is down does not get to hold
+            // anyone.
+            tracing::error!(%case_id, error = %e, "triage failed; case left open");
+            return;
+        }
+    };
+
+    if config.mode != TriageMode::Autonomous {
+        return;
+    }
+
+    match Outcome::parse(&assessment.outcome) {
+        Outcome::Dismiss => {
+            apply_automated(state, case_id, Disposition::Dismiss, &assessment).await;
+        }
+        Outcome::Ban => {
+            apply_automated(state, case_id, Disposition::Ban, &assessment).await;
+        }
+        Outcome::NoDecision => {
+            tracing::info!(%case_id, note = %assessment.note, "no automated decision; case left open");
+        }
+    }
+}
+
+fn response_window_closed(case: &CaseRecord, now: OffsetDateTime) -> bool {
+    match util::parse_timestamp(&case.response_deadline) {
+        Ok(deadline) => now >= deadline,
+        // An unparseable deadline is a corrupt case, not an open
+        // season. Refuse to assess it and let a human find it.
+        Err(_) => false,
+    }
+}
+
+/// Commit what the model concluded.
+///
+/// The clock is read *here*, not handed in. Every caller reaches this
+/// after awaiting a model — up to two minutes for one case, and up to
+/// twenty-five cases in a sweep that read the clock once before any of
+/// them. Carrying that timestamp in meant the decision deadline was
+/// checked against when the sweep started, so inference finishing after
+/// the deadline still committed the ban, stamped with a `decidedAt`
+/// from before it. The deadline guard and the signed timestamp must
+/// both be the time of the decision.
+async fn apply_automated(
+    state: &std::sync::Arc<AppState>,
+    case_id: &str,
+    disposition: Disposition,
+    assessment: &Assessment,
+) {
+    let now = state.now();
+    // The reasoning is a content address of the stored assessment, so
+    // the accused (and an appellate) can be shown exactly what was
+    // decided on rather than a sentence about it.
+    let reasoning = match state.store.assessment(case_id) {
+        Ok(Some((raw, _))) => format!("sha256:{}", util::sha256_hex(&raw)),
+        _ => format!("automated assessment: {} ({})", assessment.outcome, assessment.note),
+    };
+
+    // Conditioned on the revision the reading was taken at. The
+    // freshness comparison happens before signing and committing, so
+    // without this a response landing in that gap would still be
+    // decided over — and the recovery path below re-applies a stored
+    // decision that could be much older still.
+    match decisions::apply_at_revision(
+        state,
+        case_id,
+        disposition,
+        &reasoning,
+        Decider::Automated,
+        now,
+        assessment.case_revision,
+    )
+    .await
+    {
+        Ok(issued) => {
+            let _ = state.store.mark_assessment_applied(case_id);
+            tracing::info!(%case_id, verdict_ref = %issued.verdict_ref, "automated decision applied");
+        }
+        Err(Error::CaseState(reason)) | Err(Error::WindowClosed(reason)) => {
+            // The guards had the last word, as they should. A refusal
+            // for a moved revision is not permanent: the sweep
+            // reassesses the case as it now stands.
+            tracing::info!(%case_id, %reason, "automated decision refused by the decision guards");
+        }
+        Err(e) => tracing::error!(%case_id, error = %e, "automated decision failed"),
+    }
+}
+
+/// The model profile the case's *consented* manifest declares, if it
+/// declares one. `None` means the manifest is silent — older manifests
+/// are, and the example one is — in which case nothing here can be
+/// bound and the assessment records what actually ran.
+fn consented_model_profile(
+    state: &AppState,
+    case: &CaseRecord,
+) -> Result<Option<crate::types::ModelProfileReference>, Error> {
+    let Some(mandate) = state.store.mandate(&case.mandate_ref)? else {
+        // No mandate on file at all. Nothing can be attributed to
+        // terms this case's accused agreed to, so nothing decides it.
+        return Err(Error::Internal(format!(
+            "case {} names mandate {}, which is not on file; refusing to pick a decider for \
+             terms that cannot be read",
+            case.case_id, case.mandate_ref
+        )));
+    };
+    let Some(raw) = state.store.manifest_bytes(&mandate.manifest_hash)? else {
+        // A legacy mandate with no snapshot. The published bytes stand
+        // in only while they still hash to what the mandate pinned —
+        // the same rule #2 applied to the class terms, and for the same
+        // reason: falling back to whatever is published now is how a
+        // case gets decided under terms its accused never saw.
+        let published = util::sha256_hex(&state.config.manifest_raw);
+        if published == mandate.manifest_hash {
+            return Ok(state.config.manifest.model_profile.clone());
+        }
+        return Err(Error::Internal(format!(
+            "mandate {} pins manifest {}, its snapshot is missing, and the published manifest \
+             hashes to {published}; refusing to choose a decider under unconsented terms",
+            mandate.mandate_ref, mandate.manifest_hash
+        )));
+    };
+    let manifest: crate::types::AuthorityManifest = serde_json::from_slice(&raw)
+        .map_err(|e| Error::Internal(format!("stored consented manifest unparseable: {e}")))?;
+    Ok(manifest.model_profile)
+}
+
+/// Re-attempt a decision the model reached and a guard refused.
+///
+/// No model call: the assessment is on file and still valid, and what
+/// changed is the case, not the reading. The common case is
+/// `require_notice_delivered` — the classifier can decide in seconds
+/// while the opening verdict is still queued for the interface, and
+/// without this the refusal was permanent.
+///
+/// Bounded by the case itself: once the decision deadline passes, the
+/// deadline sweep dismisses it and it stops appearing here. A case
+/// whose guard never comes good therefore ends as "undecided is
+/// dismissal", which is the right ending — the wrong one was ending
+/// there while a valid ban sat unapplied and unseen.
+pub async fn retry_unapplied_decisions(state: &std::sync::Arc<AppState>) {
+    let Some(config) = state.config.triage.as_ref() else { return };
+    if config.mode != TriageMode::Autonomous {
+        // In advisory mode nothing is applied automatically, so an
+        // unapplied assessment is the expected state, not a stuck one.
+        return;
+    }
+
+    let cases = match state.store.cases_with_unapplied_decision() {
+        Ok(cases) => cases,
+        Err(e) => {
+            tracing::error!(error = %e, "could not list unapplied decisions");
+            return;
+        }
+    };
+    for case in cases {
+        let Ok(Some((raw, applied))) = state.store.assessment(&case.case_id) else { continue };
+        if applied {
+            continue;
+        }
+        let Ok(assessment) = serde_json::from_slice::<Assessment>(&raw) else { continue };
+        let disposition = match Outcome::parse(&assessment.outcome) {
+            Outcome::Ban => Disposition::Ban,
+            Outcome::Dismiss => Disposition::Dismiss,
+            Outcome::NoDecision => continue,
+        };
+
+        // The reason this decision is still here is that a guard
+        // refused it — and time has passed since. A response filed in
+        // the meantime changes the document the model read, so
+        // re-applying the old reading would ban someone over a record
+        // that never included their answer. Reassess instead.
+        if assessment.case_revision != case.revision {
+            tracing::info!(
+                case_id = %case.case_id,
+                "the case changed since this decision was reached; discarding it for reassessment"
+            );
+            if let Err(e) = state.store.invalidate_assessment(&case.case_id) {
+                tracing::error!(case_id = %case.case_id, error = %e, "could not discard it");
+            }
+            continue;
+        }
+
+        apply_automated(state, &case.case_id, disposition, &assessment).await;
+    }
+}
+
+/// Whether a profile is safe to run against this manifest, checked at
+/// boot rather than at the first case.
+///
+/// A class the profile cannot decide is not fatal — those cases simply
+/// wait for a human — but it is exactly the kind of misconfiguration
+/// that looks like "the classifier is quiet lately".
+pub fn unmappable_classes(profile: &ModelProfile, manifest: &crate::types::AuthorityManifest) -> Vec<String> {
+    manifest
+        .violation_classes
+        .iter()
+        .filter(|class| !profile.can_decide(&class.class_id))
+        .map(|class| class.class_id.clone())
+        .collect()
+}
+
+/// Whether the profile needs log probabilities from the server, so a
+/// deployment can be told before it discovers it case by case.
+pub fn needs_logprobs(profile: &ModelProfile) -> bool {
+    matches!(profile.adapter, Adapter::FirstTokenScore { .. })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_final_message_out_of_a_chat_completion() {
+        let value: Value = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":"unsafe\nS4"}}]}"#,
+        )
+        .unwrap();
+        let output = parse_completion(&value).unwrap();
+        assert_eq!(output.text, "unsafe\nS4");
+        assert!(output.first_token_logprobs.is_empty());
+    }
+
+    #[test]
+    fn reads_first_token_log_probabilities_including_alternatives() {
+        let value: Value = serde_json::from_str(
+            r#"{"choices":[{"message":{"content":"yes"},"logprobs":{"content":[
+                 {"token":"yes","logprob":-0.1,"top_logprobs":[
+                   {"token":"yes","logprob":-0.1},{"token":"no","logprob":-2.3}]}]}}]}"#,
+        )
+        .unwrap();
+        let output = parse_completion(&value).unwrap();
+        assert!(output.first_token_logprobs.iter().any(|(t, _)| t == "yes"));
+        assert!(
+            output.first_token_logprobs.iter().any(|(t, _)| t == "no"),
+            "the alternative must be read: the answer token is not always the top one"
+        );
+    }
+
+    /// A server that returns only a reasoning channel has not answered.
+    /// Reading the reasoning as the answer would let a model's musings
+    /// decide a case its final output declined to decide.
+    #[test]
+    fn a_reasoning_only_response_yields_an_empty_final_output() {
+        let value: Value = serde_json::from_str(
+            r#"{"choices":[{"message":{"content":null,"reasoning":"the document mentions..."}}]}"#,
+        )
+        .unwrap();
+        let output = parse_completion(&value).unwrap();
+        assert_eq!(output.text, "");
+        assert!(!output.text.contains("document mentions"));
+    }
+
+    #[test]
+    fn a_response_with_no_choices_is_unreadable() {
+        let value: Value = serde_json::from_str(r#"{"error":{"message":"model not loaded"}}"#).unwrap();
+        assert!(parse_completion(&value).is_none());
+    }
+
+    #[test]
+    fn stored_output_is_bounded() {
+        let long = "x".repeat(MAX_STORED_OUTPUT * 2);
+        let stored = truncate(&long, MAX_STORED_OUTPUT);
+        assert!(stored.len() < long.len());
+        assert!(stored.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn truncation_does_not_split_a_character() {
+        let text = "é".repeat(64);
+        let stored = truncate(&text, 7);
+        assert!(stored.starts_with("ééé"));
+    }
+
+    /// The window rule again, at the point where automation would
+    /// otherwise sidestep it: a case is not even assessed until the
+    /// accused's time to answer has run out, because the document the
+    /// model is shown must be the completed one.
+    #[test]
+    fn a_case_inside_its_response_window_is_not_assessed() {
+        let mut case = crate::store::CaseRecord {
+            case_id: "c1".into(),
+            accused: "onym:key:acc".into(),
+            reporter: "onym:key:rep".into(),
+            class_id: "csam".into(),
+            mandate_ref: "m1".into(),
+            device_binding: "d1".into(),
+            stage: "open".into(),
+            opened_at: "2026-08-01T00:00:00Z".into(),
+            response_deadline: "2026-08-04T00:00:00Z".into(),
+            decision_deadline: "2026-08-08T00:00:00Z".into(),
+            responded: false,
+            disposition: None,
+            appeal_deadline: None,
+            appeal_state: "none".into(),
+            new_holder_state: "none".into(),
+            revision: 0,
+            claim_revision: 0,
+        };
+        let inside = util::parse_timestamp("2026-08-02T00:00:00Z").unwrap();
+        let after = util::parse_timestamp("2026-08-05T00:00:00Z").unwrap();
+        assert!(!response_window_closed(&case, inside));
+        assert!(response_window_closed(&case, after));
+
+        // Answering does not bring the assessment forward either.
+        case.responded = true;
+        assert!(!response_window_closed(&case, inside));
+
+        // A corrupt deadline refuses rather than opening the door.
+        case.response_deadline = "not a timestamp".into();
+        assert!(!response_window_closed(&case, after));
+    }
+
+    // ─── End to end, against a stub inference server ─────────────────
+
+    /// Serve one canned chat-completion and record what was asked.
+    async fn stub_model(response: serde_json::Value) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use axum::routing::post;
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let recorder = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let recorder = recorder.clone();
+                let response = response.clone();
+                async move {
+                    recorder.lock().unwrap().push(body);
+                    axum::Json(response)
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/v1/chat/completions"), seen)
+    }
+
+    fn open_case(store: &crate::store::Store, class_id: &str, response_deadline: &str) -> CaseRecord {
+        let case = CaseRecord {
+            case_id: "c1".into(),
+            accused: "onym:key:acc".into(),
+            reporter: "onym:key:rep".into(),
+            class_id: class_id.into(),
+            mandate_ref: "m1".into(),
+            device_binding: "d1".into(),
+            stage: "open".into(),
+            opened_at: "2026-08-01T00:00:00Z".into(),
+            response_deadline: response_deadline.into(),
+            decision_deadline: "2026-08-30T00:00:00Z".into(),
+            responded: false,
+            disposition: None,
+            appeal_deadline: None,
+            appeal_state: "none".into(),
+            new_holder_state: "none".into(),
+            revision: 0,
+            claim_revision: 0,
+        };
+        // The mandate the case names, with the manifest it consented
+        // to. A case whose mandate is not on file is not a real case:
+        // nothing can be attributed to terms its accused agreed to, and
+        // the decider is chosen from those terms.
+        store
+            .put_mandate(
+                &crate::store::MandateRecord {
+                    mandate_ref: "m1".into(),
+                    user_key: "onym:key:acc".into(),
+                    device_binding: "d1".into(),
+                    classes: vec![class_id.to_string()],
+                    manifest_hash: util::sha256_hex(crate::testing::MANIFEST_JSON.as_bytes()),
+                },
+                b"{}",
+                crate::testing::MANIFEST_JSON.as_bytes(),
+                "2026-08-01T00:00:00Z",
+            )
+            .unwrap();
+        store.put_case(&case).unwrap();
+        // Notice served: a ban — automated or not — requires the
+        // opening verdict to have reached the interface.
+        store.put_delivered_open_case_verdict(&case.case_id, "v-open").unwrap();
+        let report = serde_json::json!({
+            "reportVersion": 1, "reportId": "r1", "reporter": "onym:key:rep",
+            "reporterMandate": "m0", "accused": "onym:key:acc", "classId": class_id,
+            "evidence": [{"disclosedContent": "the material", "authenticityProof": "sig"}],
+            "filedAt": "2026-08-02T00:00:00Z",
+        });
+        store
+            .put_report("r1", "onym:key:rep", "onym:key:acc", class_id, Some("c1"), 1.0,
+                        &serde_json::to_vec(&report).unwrap(), "2026-08-02T00:00:00Z")
+            .unwrap();
+        case
+    }
+
+    /// The whole path for a native-taxonomy profile: build the
+    /// document, call the server, read the label, ban.
+    #[tokio::test]
+    async fn a_native_taxonomy_profile_decides_end_to_end() {
+        let (url, seen) = stub_model(serde_json::json!({
+            "choices": [{"message": {"role": "assistant",
+                                     "content": "Safety: Unsafe\nCategories: Violent"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+        let state =
+            std::sync::Arc::new(AppState::for_tests_with_triage(store, "qwen3guard-8b", &url, TriageMode::Autonomous));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let case = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(case.disposition.as_deref(), Some("ban"), "expected an automated ban");
+
+        // The model was sent the case document, and no canonical rule:
+        // this profile applies its own taxonomy.
+        let request = &seen.lock().unwrap()[0];
+        let sent = request["messages"][0]["content"].as_str().unwrap();
+        assert!(sent.contains("CLASS: credible-violence"));
+        assert!(sent.contains("the material"));
+        assert!(!sent.contains("R-VIOLENCE"), "a native-taxonomy profile gets no canonical rule");
+
+        // The verdict's reasoning is the content address of the stored
+        // assessment, and the assessment records what a reviewer needs.
+        let (raw, applied) = state.store.assessment("c1").unwrap().unwrap();
+        assert!(applied);
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(assessment.profile_id, "qwen3guard-8b");
+        assert_eq!(assessment.revision, "4505cb1a6f1864f21f8b27f7daf1b9a1aab6edbb");
+        assert_eq!(assessment.raw_output, "Safety: Unsafe\nCategories: Violent");
+        assert_eq!(assessment.outcome, "ban");
+        assert!(assessment.score.is_none(), "a label profile invents no score");
+        assert_eq!(assessment.input_digest.len(), 64);
+    }
+
+    /// And for a scoring profile, with the rule actually reaching the
+    /// model.
+    #[tokio::test]
+    async fn a_scoring_profile_decides_end_to_end_on_the_canonical_rule() {
+        let (url, seen) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "no"}, "logprobs": {"content": [
+                {"token": "no", "logprob": -0.01, "top_logprobs": [
+                    {"token": "no", "logprob": -0.01}, {"token": "yes", "logprob": -6.0}]}]}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "csam", "2026-08-04T00:00:00Z");
+        let state =
+            std::sync::Arc::new(AppState::for_tests_with_triage(store, "shieldstral-3b", &url, TriageMode::Autonomous));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        assert_eq!(
+            state.store.case("c1").unwrap().unwrap().disposition.as_deref(),
+            Some("dismiss")
+        );
+        let request = &seen.lock().unwrap()[0];
+        assert_eq!(request["logprobs"], true, "a scoring profile must ask for log probabilities");
+        let user = request["messages"][1]["content"].as_str().unwrap();
+        assert!(user.contains("R-CSAM"), "the consented rule must reach the model");
+
+        let (raw, _) = state.store.assessment("c1").unwrap().unwrap();
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert!(assessment.score.unwrap() < 0.2);
+    }
+
+    /// The failure that matters: a server returning something the
+    /// profile cannot read must leave the case open, not dismiss it.
+    #[tokio::test]
+    async fn an_unreadable_model_response_decides_nothing() {
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "I'm not able to help with that request."}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "csam", "2026-08-04T00:00:00Z");
+        let state =
+            std::sync::Arc::new(AppState::for_tests_with_triage(store, "qwen3guard-8b", &url, TriageMode::Autonomous));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let case = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(case.stage, "open", "an unreadable answer is not an acquittal");
+        assert!(case.disposition.is_none());
+        assert!(state.store.undelivered_verdicts().unwrap().is_empty());
+    }
+
+    /// Advisory mode classifies and stops. The recommendation is
+    /// recorded for a moderator; nothing moves on its own.
+    #[tokio::test]
+    async fn advisory_mode_records_but_does_not_decide() {
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Violent"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+        let state =
+            std::sync::Arc::new(AppState::for_tests_with_triage(store, "qwen3guard-8b", &url, TriageMode::Advisory));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        assert_eq!(state.store.case("c1").unwrap().unwrap().stage, "open");
+        let (raw, applied) = state.store.assessment("c1").unwrap().unwrap();
+        assert!(!applied);
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(assessment.outcome, "ban", "the recommendation is recorded either way");
+    }
+
+    /// The accused's reply is in the document the model is shown. This
+    /// is the reason assessment waits for the window at all.
+    #[tokio::test]
+    async fn the_accused_response_reaches_the_model() {
+        let (url, seen) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "Safety: Safe\nCategories: None"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        let mut case = open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+        case.responded = true;
+        let reply = serde_json::json!({"caseId": "c1", "statement": "it is a song lyric"});
+        store
+            .put_response(&crate::store::ResponseFiling { case: &case, raw: &serde_json::to_vec(&reply).unwrap(), late: false, filed_at: "2026-08-03T00:00:00Z", event_kind: "response", event_detail: "it is a song lyric", limit: 32 })
+            .unwrap();
+
+        let state =
+            std::sync::Arc::new(AppState::for_tests_with_triage(store, "qwen3guard-8b", &url, TriageMode::Autonomous));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let sent = seen.lock().unwrap()[0]["messages"][0]["content"].as_str().unwrap().to_string();
+        assert!(sent.contains("it is a song lyric"), "the reply must be in the document");
+        assert!(!sent.contains("ACCUSED RESPONSE:\nNONE"));
+        assert_eq!(
+            state.store.case("c1").unwrap().unwrap().disposition.as_deref(),
+            Some("dismiss")
+        );
+    }
+
+    #[test]
+    fn classes_the_profile_cannot_decide_are_reported_at_boot() {
+        let manifest: crate::types::AuthorityManifest =
+            serde_json::from_str(crate::testing::MANIFEST_JSON).unwrap();
+        let profile = crate::profiles::by_id("qwen3guard-8b").unwrap();
+        // The test manifest declares only classes the reference
+        // profiles map.
+        assert!(unmappable_classes(&profile, &manifest).is_empty());
+
+        let mut narrowed = profile.clone();
+        if let Adapter::NativeTaxonomy { required_code, .. } = &mut narrowed.adapter {
+            required_code.remove("csam");
+        }
+        assert_eq!(unmappable_classes(&narrowed, &manifest), vec!["csam".to_string()]);
+    }
+
+    /// The failure the backoff and the give-up counter were written
+    /// for, and the one they did not cover. A failed round-trip
+    /// returned early without writing an assessment row, so the case
+    /// came back with `attempts = 0` every sweep: no backoff, no cap,
+    /// and a model that was down got re-hit for every due case until
+    /// each case's decision deadline.
+    #[tokio::test]
+    async fn a_failed_inference_records_an_attempt() {
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "csam", "2026-08-04T00:00:00Z");
+        // A port nothing is listening on.
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            "http://127.0.0.1:1/v1/chat/completions",
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let (raw, applied) = state
+            .store
+            .assessment("c1")
+            .unwrap()
+            .expect("a failed attempt is still an attempt, and has to be on file");
+        assert!(!applied);
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(assessment.outcome, "no-decision");
+        assert!(
+            assessment.note.contains("could not be consulted"),
+            "the record must say the model failed, not that it declined: {}",
+            assessment.note
+        );
+
+        // And the case is still open, still due — but now carrying an
+        // attempt, so the sweep can space the next one out.
+        let due = state.store.cases_awaiting_assessment("2026-08-10T00:00:00Z").unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].1, 1, "the attempt was counted");
+        assert!(due[0].2.is_some(), "and timestamped, so backoff has something to measure");
+    }
+
+    /// A case with no evidence will never acquire any, so retrying it
+    /// until its deadline is noise. It is recorded as a no-decision and
+    /// carried to the deadline by the attempt counter.
+    #[tokio::test]
+    async fn a_case_with_no_evidence_is_recorded_not_retried_forever() {
+        let store = crate::store::Store::in_memory().unwrap();
+        let case = CaseRecord {
+            case_id: "c1".into(),
+            accused: "onym:key:acc".into(),
+            reporter: "onym:key:rep".into(),
+            class_id: "csam".into(),
+            mandate_ref: "m1".into(),
+            device_binding: "d1".into(),
+            stage: "open".into(),
+            opened_at: "2026-08-01T00:00:00Z".into(),
+            response_deadline: "2026-08-04T00:00:00Z".into(),
+            decision_deadline: "2026-08-30T00:00:00Z".into(),
+            responded: false,
+            disposition: None,
+            appeal_deadline: None,
+            appeal_state: "none".into(),
+            new_holder_state: "none".into(),
+            revision: 0,
+            claim_revision: 0,
+        };
+        store
+            .put_mandate(
+                &crate::store::MandateRecord {
+                    mandate_ref: "m1".into(),
+                    user_key: "onym:key:acc".into(),
+                    device_binding: "d1".into(),
+                    classes: vec!["csam".into()],
+                    manifest_hash: util::sha256_hex(crate::testing::MANIFEST_JSON.as_bytes()),
+                },
+                b"{}",
+                crate::testing::MANIFEST_JSON.as_bytes(),
+                "2026-08-01T00:00:00Z",
+            )
+            .unwrap();
+        store.put_case(&case).unwrap();
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            "http://127.0.0.1:1/v1/chat/completions",
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let (raw, _) = state.store.assessment("c1").unwrap().expect("recorded");
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(assessment.outcome, "no-decision");
+        assert!(assessment.note.contains("no stored evidence"), "{}", assessment.note);
+        assert_eq!(state.store.case("c1").unwrap().unwrap().stage, "open");
+    }
+
+
+    /// Inference can take two minutes, and the case is not frozen
+    /// while it runs. A late response changes the document, and
+    /// deciding on the old reading would mean the response the accused
+    /// filed had no bearing on the decision that banned them.
+    #[tokio::test]
+    async fn an_assessment_of_a_changed_case_is_not_applied() {
+        // A model that takes its time, so the record can change while
+        // it is reading.
+        let (url, _) = slow_stub_model(
+            serde_json::json!({
+                "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Sexual Content or Sexual Acts"}}]
+            }),
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        let case = open_case(&store, "unsolicited-pornography", "2026-08-04T00:00:00Z");
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        let assessing = {
+            let state = std::sync::Arc::clone(&state);
+            tokio::spawn(async move { assess_and_maybe_decide(&state, "c1", now).await })
+        };
+
+        // Mid-flight, the accused answers.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let reply = serde_json::json!({"caseId": "c1", "statement": "they asked me to"});
+        state
+            .store
+            .put_response(&crate::store::ResponseFiling { case: &case, raw: &serde_json::to_vec(&reply).unwrap(), late: true, filed_at: "2026-08-11T00:00:00Z", event_kind: "response_late", event_detail: "they asked me to", limit: 32 })
+            .unwrap();
+        assessing.await.unwrap();
+
+        let after = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(after.stage, "open", "a reading of a document that changed must not decide");
+        assert!(after.disposition.is_none());
+        let (raw, _) = state.store.assessment("c1").unwrap().unwrap();
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(assessment.outcome, "no-decision");
+        assert!(assessment.note.contains("changed while the model was reading"), "{}", assessment.note);
+    }
+
+    /// A stub that holds the request open, so a test can change the
+    /// record while the "model" is reading it.
+    async fn slow_stub_model(
+        response: serde_json::Value,
+        delay: std::time::Duration,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use axum::routing::post;
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let recorder = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let recorder = recorder.clone();
+                let response = response.clone();
+                async move {
+                    recorder.lock().unwrap().push(body);
+                    tokio::time::sleep(delay).await;
+                    axum::Json(response)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/v1/chat/completions"), seen)
+    }
+
+    /// The profile that decides a case is the one that case's manifest
+    /// declares. Otherwise an operator changes an environment variable
+    /// and a live case is decided by a model its accused never agreed
+    /// to, with the assessment recording the substitution after the
+    /// fact as though it had always been the terms.
+    #[tokio::test]
+    async fn a_case_is_not_decided_under_a_profile_it_did_not_consent_to() {
+        let (url, seen) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Violent"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+
+        // A second mandate, whose manifest names a different model, and
+        // the case pointed at it. Mandates are immutable — the store
+        // ignores a re-insert under the same ref — so this cannot be
+        // done by overwriting the fixture's.
+        let consented = crate::testing::MANIFEST_JSON.replace(
+            "\"moderationProfileId\"",
+            "\"modelProfile\": {\"id\": \"shieldgemma-9b\", \"digest\": \"deadbeef\"},\n  \"moderationProfileId\"",
+        );
+        store
+            .put_mandate(
+                &crate::store::MandateRecord {
+                    mandate_ref: "m2".into(),
+                    user_key: "onym:key:acc".into(),
+                    device_binding: "d1".into(),
+                    classes: vec!["credible-violence".into()],
+                    manifest_hash: util::sha256_hex(consented.as_bytes()),
+                },
+                b"{}",
+                consented.as_bytes(),
+                "2026-08-01T00:00:00Z",
+            )
+            .unwrap();
+        let mut case = store.case("c1").unwrap().unwrap();
+        case.mandate_ref = "m2".into();
+        store.put_case(&case).unwrap();
+
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        assert!(seen.lock().unwrap().is_empty(), "the model must not even be consulted");
+        let case = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(case.stage, "open");
+        let (raw, _) = state.store.assessment("c1").unwrap().unwrap();
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(assessment.outcome, "no-decision");
+        assert!(assessment.note.contains("never agreed to"), "{}", assessment.note);
+    }
+
+    /// The document the model read is kept, not just its digest. An
+    /// appeal reviewer applying the narrower canonical rule cannot do
+    /// it from a hash.
+    #[tokio::test]
+    async fn the_assessed_document_is_kept() {
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "Safety: Safe\nCategories: None"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let document = state.store.assessed_document("c1").unwrap().expect("kept");
+        assert!(document.contains("CLASS: credible-violence"));
+        assert!(document.contains("the material"));
+        let (raw, _) = state.store.assessment("c1").unwrap().unwrap();
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            assessment.input_digest,
+            util::sha256_hex(document.as_bytes()),
+            "the kept document must be the one the digest names"
+        );
+    }
+
+
+    /// The attempt budget exists to stop hammering an unhealthy model.
+    /// Charging a stale reading to it handed the accused a way to spend
+    /// it: a late response is accepted for as long as the case is open,
+    /// so landing one during each inference would exhaust the 24
+    /// attempts and run the case to its decision deadline, where it
+    /// dismisses by default. A guard added to stop a decision being
+    /// made on unanswered evidence would have become a way to
+    /// guarantee acquittal.
+    #[tokio::test]
+    async fn a_stale_reading_does_not_spend_the_attempt_budget() {
+        let (url, _) = slow_stub_model(
+            serde_json::json!({
+                "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Sexual Content or Sexual Acts"}}]
+            }),
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        let case = open_case(&store, "unsolicited-pornography", "2026-08-04T00:00:00Z");
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        // Three readings, each invalidated by a response landing while
+        // the model holds the request.
+        for round in 0..3 {
+            let assessing = {
+                let state = std::sync::Arc::clone(&state);
+                tokio::spawn(async move { assess_and_maybe_decide(&state, "c1", now).await })
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            let reply = serde_json::json!({"caseId": "c1", "statement": format!("round {round}")});
+            state
+                .store
+                .put_response(&crate::store::ResponseFiling { case: &case, raw: &serde_json::to_vec(&reply).unwrap(), late: true, filed_at: "2026-08-11T00:00:00Z", event_kind: "response_late", event_detail: "late", limit: 32 })
+                .unwrap();
+            assessing.await.unwrap();
+        }
+
+        // Still open, still assessable, and the budget untouched.
+        assert_eq!(state.store.case("c1").unwrap().unwrap().stage, "open");
+        let due = state.store.cases_awaiting_assessment("2026-08-12T00:00:00Z").unwrap();
+        assert_eq!(due.len(), 1, "the case must still be in the queue");
+        assert_eq!(
+            due[0].1, 0,
+            "three stale readings, no attempts spent: the model answered every time and the case \
+             was never at fault"
+        );
+    }
+
+    /// The counterpart: a reading the model genuinely failed *is*
+    /// charged, because that is the failure the budget is for.
+    #[tokio::test]
+    async fn a_failed_reading_does_spend_the_budget() {
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "csam", "2026-08-04T00:00:00Z");
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            "http://127.0.0.1:1/v1/chat/completions",
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let due = state.store.cases_awaiting_assessment("2026-08-12T00:00:00Z").unwrap();
+        assert_eq!(due[0].1, 1);
+    }
+
+
+    /// The struct's own comment says private chain-of-thought is
+    /// absent. A profile running with thinking enabled puts the whole
+    /// block inside the final message, so it was being stored verbatim
+    /// — the comment describing a property the code did not hold, for
+    /// the third time in this branch.
+    #[test]
+    fn reasoning_is_stripped_before_storage() {
+        let stored = strip_reasoning(
+            "<think>the reporter says he sent it after she asked him to stop</think>\n\
+             User Safety: unsafe",
+        );
+        assert!(!stored.contains("asked him to stop"), "{stored}");
+        assert!(stored.contains("User Safety: unsafe"), "the answer survives: {stored}");
+        assert!(stored.contains("[reasoning withheld]"), "and the removal is visible");
+    }
+
+    /// A generation cut off mid-reasoning is all reasoning. Keeping the
+    /// tail would retain exactly what stripping removes.
+    #[test]
+    fn an_unclosed_reasoning_block_is_stripped_to_the_end() {
+        let stored = strip_reasoning("<think>weighing whether she consented, she said she");
+        assert!(!stored.contains("consented"), "{stored}");
+        assert_eq!(stored, "[reasoning withheld]");
+    }
+
+    #[test]
+    fn output_without_reasoning_is_untouched() {
+        assert_eq!(strip_reasoning("Safety: Unsafe\nCategories: Violent"), "Safety: Unsafe\nCategories: Violent");
+    }
+
+    /// End to end: the adapter still sees the reasoning (it needs an
+    /// unclosed block to detect a truncated generation), and the store
+    /// does not.
+    #[tokio::test]
+    async fn the_adapter_reads_reasoning_that_the_store_never_keeps() {
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content":
+                "<think>she says he sent it unprompted after she blocked him</think>\n\
+                 User Safety: unsafe"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "csam", "2026-08-04T00:00:00Z");
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "nemotron-3.5-content-safety-4b",
+            &url,
+            TriageMode::Advisory,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let (raw, _) = state.store.assessment("c1").unwrap().unwrap();
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        // The adapter read the label out of the text after the block...
+        assert_eq!(assessment.outcome, "ban");
+        // ...and none of the reasoning was kept.
+        assert!(!assessment.raw_output.contains("blocked him"), "{}", assessment.raw_output);
+        assert!(assessment.raw_output.contains("User Safety: unsafe"));
+    }
+
+
+    /// The notice guard #2 added to `/decide` reaches autonomous triage
+    /// too, because every decider goes through `decisions::apply`.
+    /// This is the caller most likely to hit it: the model can reach a
+    /// verdict while the opening verdict is still queued for delivery,
+    /// and banning then would have run the accused's response window
+    /// against a case nobody told them about.
+    #[tokio::test]
+    async fn triage_will_not_ban_before_the_notice_has_been_delivered() {
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Violent"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        let case = open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+        // Undo the fixture's served notice: the opening verdict exists
+        // but has not reached the interface.
+        store.undeliver_open_case_verdicts(&case.case_id).unwrap();
+
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let after = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(after.stage, "open", "no ban before the accused has been told");
+        assert!(after.disposition.is_none());
+        // The assessment stands — the model did its part; only the
+        // sanction waits.
+        let (raw, applied) = state.store.assessment("c1").unwrap().unwrap();
+        assert!(!applied);
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(assessment.outcome, "ban");
+    }
+
+
+    /// The recovery the refusal test did not cover. A guard can refuse
+    /// an automated ban for a reason that later stops being true — the
+    /// opening verdict still queued for the interface, say — and
+    /// without a path back that refusal was permanent: the assessment
+    /// kept its `ban`, nothing re-attempted it, and the case ran to its
+    /// decision deadline and dismissed. In autonomous mode nobody would
+    /// ever have seen it, because no ban means no appeal means nothing
+    /// in the panel's queue.
+    #[tokio::test]
+    async fn a_ban_refused_for_undelivered_notice_lands_once_the_notice_arrives() {
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Violent"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        let case = open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+        store.undeliver_open_case_verdicts(&case.case_id).unwrap();
+
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        // The model decides; the guard refuses; the case stays open
+        // with the decision on file and unapplied.
+        assess_and_maybe_decide(&state, "c1", now).await;
+        assert_eq!(state.store.case("c1").unwrap().unwrap().stage, "open");
+        let (_, applied) = state.store.assessment("c1").unwrap().unwrap();
+        assert!(!applied);
+        assert_eq!(state.store.cases_with_unapplied_decision().unwrap().len(), 1);
+
+        // The notice reaches the interface, and the next sweep applies
+        // what was already decided — without asking the model again.
+        state.store.put_delivered_open_case_verdict("c1", "v-open").unwrap();
+        retry_unapplied_decisions(&state).await;
+
+        let after = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(after.disposition.as_deref(), Some("ban"), "the ban must not be lost");
+        assert!(state.store.cases_with_unapplied_decision().unwrap().is_empty());
+    }
+
+    /// Advisory mode is the opposite case: an unapplied assessment is
+    /// the expected resting state, not a stuck one, and the retry must
+    /// not decide on a moderator's behalf.
+    #[tokio::test]
+    async fn advisory_assessments_are_not_applied_by_the_retry() {
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Violent"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Advisory,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+        retry_unapplied_decisions(&state).await;
+
+        assert_eq!(state.store.case("c1").unwrap().unwrap().stage, "open");
+        assert!(state.store.case("c1").unwrap().unwrap().disposition.is_none());
+    }
+
+
+    /// The recovery path re-applied a stored decision without checking
+    /// whether the case had moved since. A ban refused while its notice
+    /// was queued, followed by a late response, would later be applied
+    /// from a reading that never saw that response — the accused
+    /// banned over a record that did not include their answer.
+    #[tokio::test]
+    async fn a_stored_decision_is_discarded_when_the_case_has_moved_since() {
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Violent"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        let case = open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+        store.undeliver_open_case_verdicts(&case.case_id).unwrap();
+
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        // Decided, refused for undelivered notice, and left on file.
+        assess_and_maybe_decide(&state, "c1", now).await;
+        assert_eq!(state.store.cases_with_unapplied_decision().unwrap().len(), 1);
+
+        // The accused answers, late — the record the model read moves.
+        let case = state.store.case("c1").unwrap().unwrap();
+        let reply = serde_json::json!({"caseId": "c1", "statement": "it is a song lyric"});
+        state
+            .store
+            .put_response(&crate::store::ResponseFiling {
+                case: &case,
+                raw: &serde_json::to_vec(&reply).unwrap(),
+                late: true,
+                filed_at: "2026-08-11T00:00:00Z",
+                event_kind: "response_late",
+                event_detail: "it is a song lyric",
+                limit: 32,
+            })
+            .unwrap();
+
+        // Notice lands, and the retry runs.
+        state.store.put_delivered_open_case_verdict("c1", "v-open").unwrap();
+        retry_unapplied_decisions(&state).await;
+
+        let after = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(
+            after.stage, "open",
+            "a reading taken before the response must not become the verdict"
+        );
+        assert!(after.disposition.is_none());
+        // And it is queued for reassessment rather than left to rot.
+        assert!(state.store.cases_with_unapplied_decision().unwrap().is_empty());
+        assert_eq!(
+            state.store.cases_awaiting_assessment("2026-08-12T00:00:00Z").unwrap().len(),
+            1
+        );
+    }
+
+    /// The same guard on the normal path: the freshness comparison
+    /// happens before signing and committing, so the commit itself is
+    /// conditioned on the revision that reading was taken at.
+    #[tokio::test]
+    async fn a_decision_is_committed_only_at_the_revision_it_was_read_at() {
+        let store = crate::store::Store::in_memory().unwrap();
+        let case = open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+        let state = std::sync::Arc::new(AppState::for_tests(store));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        let stale = case.revision;
+        let reply = serde_json::json!({"caseId": "c1", "statement": "answered"});
+        state
+            .store
+            .put_response(&crate::store::ResponseFiling {
+                case: &case,
+                raw: &serde_json::to_vec(&reply).unwrap(),
+                late: false,
+                filed_at: "2026-08-05T00:00:00Z",
+                event_kind: "response",
+                event_detail: "answered",
+                limit: 32,
+            })
+            .unwrap();
+        assert_ne!(state.store.case("c1").unwrap().unwrap().revision, stale);
+
+        let result = crate::decisions::apply_at_revision(
+            &state,
+            "c1",
+            crate::decisions::Disposition::Dismiss,
+            "hash:why",
+            crate::decisions::Decider::Automated,
+            now,
+            stale,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(Error::CaseState(_))),
+            "a stale revision must be refused"
+        );
+        assert_eq!(state.store.case("c1").unwrap().unwrap().stage, "open");
+    }
+
+
+    /// The adapter's note quotes the output it could not read. For a
+    /// profile whose server inlines the reasoning block into the final
+    /// message, that note carried exactly what stripping `raw_output`
+    /// had removed — and the note is stored, rendered in the panel,
+    /// and returned to the accused.
+    #[tokio::test]
+    async fn the_adapter_note_carries_no_reasoning_either() {
+        // Output the adapter cannot read, with reasoning inlined: the
+        // note will quote it back.
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content":
+                "<think>she says he sent it after she blocked him</think> maybe?"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "csam", "2026-08-04T00:00:00Z");
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "gpt-oss-safeguard-20b",
+            &url,
+            TriageMode::Advisory,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let (raw, _) = state.store.assessment("c1").unwrap().unwrap();
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(assessment.outcome, "no-decision");
+        assert!(
+            !assessment.note.contains("blocked him"),
+            "the note must not smuggle back what raw_output had stripped: {}",
+            assessment.note
+        );
+        assert!(!assessment.raw_output.contains("blocked him"));
+    }
+
+    /// A joined report changes the document a model reads — the store
+    /// does not dedupe evidence — so it has to move the revision.
+    /// Without that the in-flight digest check and the revision check
+    /// disagreed, and the recovery path applied a stored decision
+    /// taken from a reading of a document that had since changed.
+    #[tokio::test]
+    async fn joining_a_report_moves_the_case_revision() {
+        let store = crate::store::Store::in_memory().unwrap();
+        let case = open_case(&store, "csam", "2026-08-04T00:00:00Z");
+        let before = store.case("c1").unwrap().unwrap().revision;
+
+        // A second report, evidence already noticed, attached without
+        // a new notice.
+        let report = serde_json::json!({
+            "reportVersion": 1, "reportId": "r2", "reporter": "onym:key:rep",
+            "reporterMandate": "m0", "accused": "onym:key:acc", "classId": "csam",
+            "evidence": [{"disclosedContent": "the material", "authenticityProof": "sig"}],
+            "filedAt": "2026-08-03T00:00:00Z",
+        });
+        store
+            .put_report("r2", "onym:key:rep", "onym:key:acc", "csam", None, 1.0,
+                        &serde_json::to_vec(&report).unwrap(), "2026-08-03T00:00:00Z")
+            .unwrap();
+        // The case must already have noticed this evidence for the
+        // attach to be eligible — that is what makes it a join without
+        // a new notice.
+        store
+            .append_event_bounded(
+                &case.case_id,
+                "2026-08-02T00:00:00Z",
+                "notice_evidence",
+                "sha256:already-noticed",
+                8,
+            )
+            .unwrap();
+
+        let attached = store
+            .attach_noticed_report(
+                "onym:key:rep",
+                "r2",
+                &case.case_id,
+                "2026-08-03T00:00:00Z",
+                "sha256:already-noticed",
+                "joined",
+            )
+            .unwrap();
+        assert!(attached, "the join must actually land, or this test proves nothing");
+
+        assert_ne!(
+            store.case("c1").unwrap().unwrap().revision,
+            before,
+            "the document changed, so the revision must move with it"
+        );
+    }
+
+    /// Two reports filed in the same second must not reorder between
+    /// reads: an unstable document digest reads as "the record changed
+    /// while the model was reading it" and throws away a good
+    /// assessment.
+    #[test]
+    fn the_case_document_is_stable_across_reads() {
+        let store = crate::store::Store::in_memory().unwrap();
+        let case = open_case(&store, "csam", "2026-08-04T00:00:00Z");
+        for id in ["r2", "r3", "r4"] {
+            let report = serde_json::json!({
+                "reportVersion": 1, "reportId": id, "reporter": "onym:key:rep",
+                "reporterMandate": "m0", "accused": "onym:key:acc", "classId": "csam",
+                "evidence": [{"disclosedContent": format!("material {id}"),
+                              "authenticityProof": "sig"}],
+                "filedAt": "2026-08-02T00:00:00Z",
+            });
+            store
+                .put_report(id, "onym:key:rep", "onym:key:acc", "csam", Some(&case.case_id), 1.0,
+                            &serde_json::to_vec(&report).unwrap(), "2026-08-02T00:00:00Z")
+                .unwrap();
+        }
+
+        let first = crate::casedoc::build(&store, &case).unwrap().digest;
+        for _ in 0..5 {
+            assert_eq!(crate::casedoc::build(&store, &case).unwrap().digest, first);
+        }
+    }
+
+    /// `raw_output` and `note` were redacted; `labels` was not, and it
+    /// is the field a line-by-line taxonomy fills with *every line
+    /// after the first*. A server that inlines its reasoning into
+    /// `content` therefore stored chain-of-thought in a field that is
+    /// persisted, rendered in the panel, and returned to the accused.
+    ///
+    /// The comma matters: the shape joins the remaining lines and
+    /// splits them again, so a reasoning block containing one arrives
+    /// as fragments, and the fragment carrying the closing tag has no
+    /// `<think>` left in it for a per-label strip to find.
+    #[tokio::test]
+    async fn labels_carry_no_reasoning_either() {
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content":
+                "unsafe\n<think>she blocked him, then he sent it again</think>\nS4"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "csam", "2026-08-04T00:00:00Z");
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "llama-guard-4-12b",
+            &url,
+            TriageMode::Advisory,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let (raw, _) = state.store.assessment("c1").unwrap().unwrap();
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(assessment.outcome, "no-decision", "{}", assessment.note);
+        for label in &assessment.labels {
+            assert!(!label.contains("blocked him"), "reasoning in labels: {label:?}");
+            assert!(!label.contains("sent it again"), "reasoning in labels: {label:?}");
+            assert!(!label.contains("<think>"), "{label:?}");
+        }
+        assert!(!assessment.raw_output.contains("blocked him"));
+        assert!(!assessment.note.contains("blocked him"));
+    }
+
+    /// A label the model genuinely emitted is still kept — the rule is
+    /// "quotable from the redacted output", not "discard everything".
+    #[test]
+    fn labels_the_model_actually_emitted_survive() {
+        let visible = "unsafe\nS4";
+        assert_eq!(
+            sanitize_labels(vec!["S4".into()], visible),
+            vec!["S4".to_string()]
+        );
+        // And the bound applies, which it did not before.
+        let long = "x".repeat(MAX_STORED_LABEL * 2);
+        let stored = sanitize_labels(vec![long.clone()], &long);
+        assert!(stored[0].len() < long.len());
+        assert_eq!(sanitize_labels(vec!["S4".into(); 100], visible).len(), MAX_STORED_LABELS);
+    }
+
+    /// The sweep reads the clock once and then awaits a model that can
+    /// take two minutes a case, for up to twenty-five cases. Carrying
+    /// that timestamp into the decision meant the deadline guard was
+    /// asked about when the sweep *started*: inference finishing after
+    /// the decision deadline still committed the ban, stamped with a
+    /// `decidedAt` from before it. The case is dismissed by default at
+    /// that point (§3.5), and a ban is the one thing it cannot become.
+    #[tokio::test]
+    async fn a_deadline_that_passes_during_inference_refuses_the_ban() {
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Violent"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        let mut case = open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+        // A deadline between when the sweep started and when the model
+        // answered.
+        case.decision_deadline = "2026-08-09T23:30:00Z".into();
+        store.put_case(&case).unwrap();
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        // What the sweep read before the model calls began.
+        let swept_at = util::parse_timestamp("2026-08-09T23:00:00Z").unwrap();
+        // Where the clock actually is by the time the answer arrives —
+        // the fixture's pinned default, after the deadline.
+        assert!(state.now() > util::parse_timestamp("2026-08-09T23:30:00Z").unwrap());
+
+        assess_and_maybe_decide(&state, "c1", swept_at).await;
+
+        let after = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(after.stage, "open", "an overdue case is not banned; it is dismissed by default");
+        assert_eq!(after.disposition, None);
+        // The reading itself is on file — it is the decision that was
+        // refused, not the assessment.
+        let (_, applied) = state.store.assessment("c1").unwrap().unwrap();
+        assert!(!applied);
+
+        // And the control: with the clock still inside the window, the
+        // same reading commits. Without this the test would pass on any
+        // refusal at all.
+        state.clock.set(util::parse_timestamp("2026-08-09T23:15:00Z").unwrap());
+        retry_unapplied_decisions(&state).await;
+        assert_eq!(state.store.case("c1").unwrap().unwrap().disposition.as_deref(), Some("ban"));
+    }
+}

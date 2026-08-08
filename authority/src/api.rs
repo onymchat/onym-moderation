@@ -21,6 +21,7 @@ use time::OffsetDateTime;
 
 use crate::canonical;
 use crate::cases;
+use crate::decisions;
 use crate::error::Error;
 use crate::state::AppState;
 use crate::store::CaseRecord;
@@ -486,22 +487,6 @@ fn require_manifest_current(state: &AppState, action: &str) -> Result<(), Error>
     Ok(())
 }
 
-/// Push the delivery backlog without making the caller wait for it.
-///
-/// `flush` drains the *whole* queue at fifteen seconds a verdict, so
-/// running it inline meant filing a report took time proportional to
-/// the backlog whenever the interface was down — and every request
-/// re-attempted every stuck verdict, inflating their counts. The sweep
-/// flushes on its own schedule; this only makes a fresh verdict leave
-/// promptly when the interface is healthy.
-fn flush_soon(state: &Arc<AppState>) {
-    let state = Arc::clone(state);
-    tokio::spawn(async move {
-        if let Err(e) = state.delivery.flush(&state.store).await {
-            tracing::warn!(error = %e, "background verdict delivery failed; the sweep will retry");
-        }
-    });
-}
 
 fn report_evidence_summary(report: &Report) -> Result<String, Error> {
     let evidence = serde_json::to_vec(&report.evidence)
@@ -641,7 +626,7 @@ fn join_case(
                 .into(),
         ));
     }
-    flush_soon(state);
+    crate::delivery::flush_soon(state);
     Ok(revised)
 }
 
@@ -677,6 +662,10 @@ async fn open_case(
         responded: false,
         disposition: None,
         appeal_deadline: None,
+        appeal_state: "none".into(),
+        new_holder_state: "none".into(),
+        revision: 0,
+        claim_revision: 0,
     };
     let issued = cases::open_case_verdict(
         &case,
@@ -709,7 +698,7 @@ async fn open_case(
         return Ok(None);
     }
 
-    flush_soon(state);
+    crate::delivery::flush_soon(state);
     tracing::info!(case_id = %case.case_id, "case opened");
     Ok(Some(case))
 }
@@ -868,13 +857,15 @@ async fn appeal(
         let actionable = case.as_ref().and_then(|c| c.disposition.as_deref()) == Some("ban");
         if actionable {
             let stamp = util::format_timestamp(OffsetDateTime::now_utc());
-            // Count and insert share one store lock. This endpoint is
-            // unauthenticated, so a check followed by a separate write
-            // would let a concurrent burst overrun the advertised cap.
-            let _ = state.store.append_event_bounded(
+            // Bounded, logged, and queued in one write. The count and
+            // the insert share a lock because this endpoint is
+            // unauthenticated and a concurrent burst would otherwise
+            // overrun the cap; the queue state is its own field
+            // because a claim is not an appeal, and writing the
+            // appeal's would let a stranger swallow the accused's.
+            let _ = state.store.record_new_holder_claim(
                 &case_id,
                 &stamp,
-                "new_holder_claim",
                 &submission.statement,
                 MAX_NEW_HOLDER_CLAIMS,
             )?;
@@ -918,19 +909,66 @@ async fn appeal(
         }
     }
 
+    // This is where a human enters. Triage decides in the first
+    // instance; an appeal puts the file in the moderator panel's
+    // queue. (New-holder claims returned above — they are tracked in
+    // their own field, because they are not appeals.)
+    //
+    // Two rules, from two different findings, and they compose:
+    //
+    // - A *decided* review is not re-opened by filing again. Resetting
+    //   `appeal_state` to `pending` let an accused flip an `upheld` —
+    //   or even a `reversed` — back into the queue, erasing the record
+    //   of a review that did happen.
+    // - A *pending* one may be supplemented. The accused may find more
+    //   to say while waiting, and refusing that would make the first
+    //   filing their only chance; the count is bounded so the case log
+    //   cannot be used as storage.
     let stamp = util::format_timestamp(OffsetDateTime::now_utc());
-    let filed = state.store.append_event_bounded(
-        &case_id,
-        &stamp,
-        "appeal_filed",
-        &submission.statement,
-        MAX_APPEALS_PER_CASE,
-    )?;
-    if !filed {
-        return Err(Error::CaseState(format!(
-            "this case already holds {MAX_APPEALS_PER_CASE} appeals; further material belongs \
-             in one of them rather than in another filing"
-        )));
+    match case.appeal_state.as_str() {
+        "none" => {
+            // Conditioned on `none`: the case read and this write are
+            // separate lock acquisitions, so concurrent first filings
+            // could each take this unbounded arm and overrun the cap
+            // the "pending" arm enforces. Only one can win now; the
+            // rest fall through to the bounded path on retry.
+            state.store.set_appeal_state(
+                &case_id,
+                "pending",
+                Some("none"),
+                // A filing is not a review, so it pins no revision — it
+                // moves one.
+                None,
+                &stamp,
+                "appeal_filed",
+                &submission.statement,
+            )?;
+        }
+        "pending" => {
+            // Through the claim-aware path: a supplement leaves the
+            // appeal `pending` and the case document untouched, so
+            // moving the claim revision is the only thing that tells a
+            // review rendered before it that it is now out of date.
+            let filed = state.store.append_claim_event_bounded(
+                &case_id,
+                &stamp,
+                "appeal_filed",
+                &submission.statement,
+                MAX_APPEALS_PER_CASE,
+            )?;
+            if !filed {
+                return Err(Error::CaseState(format!(
+                    "this case already holds {MAX_APPEALS_PER_CASE} appeal filings; further \
+                     material belongs in one of them rather than in another"
+                )));
+            }
+        }
+        decided => {
+            return Err(Error::CaseState(format!(
+                "this case's appeal was already reviewed ({decided}); a decided review is not \
+                 re-opened by filing again"
+            )))
+        }
     }
 
     tracing::info!(%case_id, kind = %submission.kind, "appeal filed");
@@ -965,6 +1003,12 @@ async fn query_status(
     // confidentiality policy withholds. A party proves who they are by
     // signing the case id with the key that made them a party.
     authorize_case_party(&state, &case, &case_id, &headers)?;
+    let moderator = authorize_moderator(&state, &headers).is_ok();
+    let is_accused = headers
+        .get("x-onym-key")
+        .and_then(|value| value.to_str().ok())
+        == Some(case.accused.as_str())
+        || moderator;
 
     let events: Vec<Value> = state
         .store
@@ -972,6 +1016,78 @@ async fn query_status(
         .into_iter()
         .map(|(at, kind, _detail)| json!({ "at": at, "kind": kind }))
         .collect();
+
+    // The accused is entitled to the record their case was decided on;
+    // a reporter is not — it contains the accused's own response.
+    //
+    // And the accused's copy is *redacted*: the document carries the
+    // reporter's own account of the material, which is the reporter
+    // writing in their own words, and the identity behind those words
+    // is the one thing this endpoint has always withheld. A moderator
+    // reading the same case in the panel sees the whole of it, because
+    // the authority is allowed to.
+    let assessment = if is_accused {
+        match state.store.assessment(&case_id)? {
+            Some((raw, _)) => {
+                let mut value: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+                if let Some(object) = value.as_object_mut() {
+                    if let Ok(Some(document)) = state.store.assessed_document(&case_id) {
+                        let visible = if moderator {
+                            document
+                        } else {
+                            crate::casedoc::redact_report_context(&document)
+                        };
+                        object.insert("document".into(), Value::String(visible));
+                    }
+                    // The model's own words can quote what it was
+                    // shown. Withholding the reporter's account from
+                    // the document and then handing it back inside
+                    // `rawOutput` would close one channel and leave the
+                    // one beside it open.
+                    if !moderator {
+                        let contexts = state.store.report_context_for_case(&case_id)?;
+                        if let Some(raw) = object.get("rawOutput").and_then(Value::as_str) {
+                            let cleaned =
+                                crate::casedoc::withhold_quoted_context(raw, &contexts);
+                            object.insert("rawOutput".into(), Value::String(cleaned));
+                        }
+                        // The adapter's own note is generated here, but
+                        // it can echo an unreadable output back for
+                        // diagnosis, so it gets the same treatment.
+                        if let Some(note) = object.get("note").and_then(Value::as_str) {
+                            let cleaned =
+                                crate::casedoc::withhold_quoted_context(note, &contexts);
+                            object.insert("note".into(), Value::String(cleaned));
+                        }
+                        // And the labels. For a taxonomy read line by
+                        // line, *every line after the first* becomes a
+                        // label — and on the unknown-code path the
+                        // whole unreadable list is kept — so a model
+                        // emitting `unsafe` followed by the reporter's
+                        // account put it straight into the accused's
+                        // copy, through the one field the redaction
+                        // did not cover.
+                        if let Some(labels) = object.get("labels").and_then(Value::as_array) {
+                            let cleaned: Vec<Value> = labels
+                                .iter()
+                                .map(|label| match label.as_str() {
+                                    Some(text) => Value::String(
+                                        crate::casedoc::withhold_quoted_context(text, &contexts),
+                                    ),
+                                    None => label.clone(),
+                                })
+                                .collect();
+                            object.insert("labels".into(), Value::Array(cleaned));
+                        }
+                    }
+                }
+                value
+            }
+            None => Value::Null,
+        }
+    } else {
+        Value::Null
+    };
 
     Ok(Json(json!({
         "caseId": case.case_id,
@@ -987,6 +1103,20 @@ async fn query_status(
         "responsesOnFile": state.store.responses(&case_id)?.len(),
         "disposition": case.disposition,
         "appealDeadline": case.appeal_deadline,
+        "appealState": case.appeal_state,
+        "newHolderState": case.new_holder_state,
+        // The token a reviewer posts back with their decision. It moves
+        // whenever either claim is filed, supplemented, or answered, so
+        // `decide` can refuse a review of a file that has changed since
+        // it was read. Nothing about the case is disclosed by it — it
+        // counts events the reader can already see in `events`.
+        "claimRevision": case.claim_revision,
+        // What decided the case, resolved rather than hashed. The
+        // verdict's `reasoning` is a content address of exactly this,
+        // and without a route that resolves it the promise that a
+        // verdict identifies the model, its revision, what it was
+        // shown and what it said is a promise nobody can check.
+        "assessment": assessment,
         "events": events,
     })))
 }
@@ -1002,6 +1132,26 @@ struct Decision {
     /// definition. Mandatory: an unexplained ban is nonconforming even
     /// where confidentiality keeps it private.
     reasoning: String,
+    /// Which claim this decision answers, when it is a reversal:
+    /// `appeal` or `new-holder`. Omitted, a reversal still clears the
+    /// marks and anything pending becomes moot — but no review is
+    /// recorded against a claim nobody said they read.
+    #[serde(default)]
+    reviewed: Option<String>,
+    /// Whether the decider actually saw the classifier's assessment.
+    /// Recorded on the case, so "a human decided this" and "a human
+    /// signed off what a model concluded" stay distinguishable. It is
+    /// an assertion by the caller, which is the only party that knows.
+    #[serde(default)]
+    reviewed_assessment: bool,
+    /// The case's `claimRevision` when the caller read the claim it is
+    /// answering, from `query-status`. Optional, because an API caller
+    /// may be acting on a claim it has just been handed — but supplying
+    /// it is what makes the decision refuse to commit if the claim
+    /// gained a supplementary filing, or was answered by someone else,
+    /// in between. The panel always supplies it.
+    #[serde(default)]
+    claim_revision: Option<i64>,
 }
 
 /// The moderator's decision. This is the one place human judgment
@@ -1015,172 +1165,68 @@ async fn decide(
 ) -> Result<Json<Value>, Error> {
     authorize_moderator(&state, &headers)?;
 
-    let mut case = state
-        .store
-        .case(&case_id)?
-        .ok_or_else(|| Error::NotFound(format!("case {case_id}")))?;
-
-    if decision.reasoning.trim().is_empty() {
-        return Err(Error::BadRequest("reasoning is required on every disposition".into()));
-    }
-
-    let now = OffsetDateTime::now_utc();
-    let stamp = util::format_timestamp(now);
-
-    // Every reporter on the case, not just whoever filed first. A case
-    // three people reported was upheld or dismissed for all three.
-    let reporters = {
-        let mut reporters = state.store.case_reporters(&case_id)?;
-        if !reporters.contains(&case.reporter) {
-            reporters.push(case.reporter.clone());
-        }
-        reporters
+    let disposition = decisions::Disposition::parse(&decision.disposition)?;
+    // Unassisted, unless the caller says otherwise. The field exists to
+    // tell a user what kind of judgment they got, so it has to record
+    // what was actually put in front of the decider — and an API caller
+    // may never have seen the assessment at all. Inferring it from the
+    // mere existence of an assessment row made the distinction noise:
+    // it would have marked a decision "assisted" by an assessment that
+    // reached no decision and therefore recommended nothing.
+    //
+    // The panel sets this, because the panel renders the assessment on
+    // the page the moderator decided from.
+    let decider = if decision.reviewed_assessment {
+        decisions::Decider::HumanAssisted
+    } else {
+        decisions::Decider::Human
     };
 
-    let issued = match decision.disposition.as_str() {
-        "dismiss" => {
-            if case.stage != "open" {
-                return Err(Error::CaseState("case is already decided".into()));
-            }
-            // Notice must precede sanction, but a dismissal is not a
-            // sanction — it can land any time before the deadline.
-            cases::dismissal_verdict(
-                &case,
-                &state.config.manifest.component_id,
+    let issued = match decision.reviewed.as_deref() {
+        Some("appeal") => {
+            decisions::apply_reviewing(
+                &state,
+                &case_id,
+                disposition,
                 &decision.reasoning,
-                now,
-                &state.signing_key,
-            )?
+                decider,
+                OffsetDateTime::now_utc(),
+                decisions::Claim::Appeal,
+                decision.claim_revision,
+            )
+            .await?
         }
-        "ban" => {
-            if case.stage != "open" {
-                return Err(Error::CaseState("case is already decided".into()));
-            }
-            if !state.store.open_case_verdict_delivered(&case_id)? {
-                return Err(Error::CaseState(
-                    "the opening verdict has not reached the interface; banning before notice \
-                     would run the response window silently"
-                        .into(),
-                ));
-            }
-            // The decision deadline is not advisory: once it passes the
-            // case is dismissed by default, whether or not the sweep
-            // has run yet (§3.5). Without this check a moderator could
-            // ban a case that the contract had already ended in the
-            // accused's favour — and the sweep would simply lose the
-            // race. "Undecided is dismissal" has to hold at the moment
-            // of decision, not at the moment a background task notices.
-            let decision_deadline = util::parse_timestamp(&case.decision_deadline)
-                .map_err(|e| Error::Internal(format!("stored decisionDeadline: {e}")))?;
-            if now > decision_deadline {
-                return Err(Error::WindowClosed(format!(
-                    "the decision deadline passed at {}; this case is dismissed by default and \
-                     cannot be banned",
-                    case.decision_deadline
-                )));
-            }
-            // The response window must have *elapsed* before any ban
-            // verdict: §8 obligation 4 says hold it, and §11.4 says the
-            // banned mark is set "only after the response window a
-            // consented class declared". Neither admits an exception
-            // for a case that has already been answered.
-            //
-            // An earlier version banned as soon as any response
-            // existed. That reads the window as a formality to be
-            // discharged rather than as time the accused was promised:
-            // they may answer on day one and keep gathering
-            // counter-evidence until day three, and a ban on day one
-            // takes the other two days away. The case-open mark is the
-            // only pre-verdict effect this authority may have.
-            let response_deadline = util::parse_timestamp(&case.response_deadline)
-                .map_err(|e| Error::Internal(format!("stored responseDeadline: {e}")))?;
-            if now < response_deadline {
-                return Err(Error::CaseState(format!(
-                    "the response window runs until {}; a ban before it closes is nonconforming",
-                    case.response_deadline
-                )));
-            }
-            let mandate = state.store.mandate(&case.mandate_ref)?.ok_or_else(|| {
-                Error::Internal(format!(
-                    "case {} references missing mandate {}; refusing to judge under published \
-                     terms the accused may not have consented to",
-                    case.case_id, case.mandate_ref
-                ))
-            })?;
-            let consented = consented_manifest(&state, &mandate)?;
-            let class = consented
-                .violation_class(&case.class_id)
-                .ok_or_else(|| Error::ClassOutsideMandate(case.class_id.clone()))?;
-            cases::ban_verdict(
-                &case,
-                class,
-                &state.config.manifest.component_id,
+        Some("new-holder") => {
+            decisions::apply_reviewing(
+                &state,
+                &case_id,
+                disposition,
                 &decision.reasoning,
-                now,
-                &state.signing_key,
-            )?
+                decider,
+                OffsetDateTime::now_utc(),
+                decisions::Claim::NewHolder,
+                decision.claim_revision,
+            )
+            .await?
         }
-        "reverse" => {
-            // A reversal is a new verdict that clears marks — the only
-            // conforming way to correct one, since verdicts are
-            // immutable and corrections never travel as edits (§12).
-            if case.disposition.as_deref() != Some("ban") {
-                return Err(Error::CaseState("only a ban can be reversed".into()));
-            }
-            cases::reversal_verdict(
-                &case,
-                &state.config.manifest.component_id,
-                &decision.reasoning,
-                now,
-                &state.signing_key,
-            )?
-        }
-        other => {
+        Some(other) => {
             return Err(Error::BadRequest(format!(
-                "unknown disposition {other:?} (expected dismiss | ban | reverse)"
+                "unknown reviewed claim {other:?} (expected appeal | new-holder)"
             )))
         }
+        None => {
+            decisions::apply(
+                &state,
+                &case_id,
+                disposition,
+                &decision.reasoning,
+                decider,
+                OffsetDateTime::now_utc(),
+            )
+            .await?
+        }
     };
 
-    // A reversal ends the sanction; the case stays decided either way.
-    case.stage = "decided".into();
-    case.disposition = Some(if decision.disposition == "reverse" {
-        "reversed".into()
-    } else {
-        decision.disposition.clone()
-    });
-    if decision.disposition == "ban" {
-        let v: Value = serde_json::from_slice(&issued.raw)
-            .map_err(|e| Error::Internal(format!("re-read verdict: {e}")))?;
-        case.appeal_deadline = v["appealDeadline"].as_str().map(str::to_string);
-    }
-
-    // Verdict, case stage, event, and reporter track records commit
-    // together — and only after the verdict was successfully built and
-    // signed. Crediting reporters first meant a decision that failed to
-    // sign still moved their standing.
-    //
-    // A reversal is not a dismissal of the report: it corrects this
-    // authority's own error, so nobody's record moves for it.
-    let credited: &[String] = if decision.disposition == "reverse" { &[] } else { &reporters };
-    state.store.commit_decision(&crate::store::Decision {
-        case: &case,
-        verdict_ref: &issued.verdict_ref,
-        disposition: &issued.disposition,
-        raw: &issued.raw,
-        at: &stamp,
-        event_kind: "decided",
-        event_detail: &decision.disposition,
-        credited_reporters: credited,
-        // What the guards above checked. A reversal was found decided
-        // and banned; everything else was found open.
-        expect_stage: if decision.disposition == "reverse" { "decided" } else { "open" },
-        expect_disposition: if decision.disposition == "reverse" { Some("ban") } else { None },
-    })?;
-
-    flush_soon(&state);
-
-    tracing::info!(%case_id, verdict_ref = %issued.verdict_ref, disposition = %issued.disposition, "case decided");
     Ok(Json(json!({
         "caseId": case_id,
         "verdictRef": issued.verdict_ref,
@@ -1190,8 +1236,13 @@ async fn decide(
         // vocabulary is open-case | dismiss | ban. Reporting the
         // verdict's word here made a reversal read as a dismissal in
         // the one place a caller looks to confirm what it just did.
-        "disposition": case.disposition.clone().unwrap_or_else(|| issued.disposition.clone()),
+        "disposition": if disposition == decisions::Disposition::Reverse {
+            "reversed"
+        } else {
+            issued.disposition.as_str()
+        },
         "verdictDisposition": issued.disposition,
+        "decidedBy": decider.as_str(),
     })))
 }
 
@@ -1211,7 +1262,7 @@ async fn requeue_verdict(
         )));
     }
     tracing::warn!(%verdict_ref, "operator requeued an undeliverable verdict");
-    flush_soon(&state);
+    crate::delivery::flush_soon(&state);
     Ok(Json(json!({ "verdictRef": verdict_ref, "requeued": true })))
 }
 
@@ -1371,6 +1422,17 @@ mod tests {
             )
             .await
         }
+    }
+
+    fn party_status_request(case_id: &str, seed: [u8; 32]) -> Request<Body> {
+        let timestamp = util::format_timestamp(OffsetDateTime::now_utc());
+        let message = format!("query-status:{case_id}:{timestamp}");
+        Request::get(format!("/v1/cases/{case_id}/status"))
+            .header("x-onym-key", testing::key_reference(seed))
+            .header("x-onym-timestamp", timestamp)
+            .header("x-onym-signature", testing::sign(seed, message.as_bytes()))
+            .body(Body::empty())
+            .unwrap()
     }
 
     /// Serialize, sign the canonical bytes, and put the signature back
@@ -2332,6 +2394,10 @@ mod tests {
             responded: false,
             disposition: None,
             appeal_deadline: None,
+            appeal_state: "none".into(),
+            new_holder_state: "none".into(),
+            revision: 0,
+            claim_revision: 0,
         };
         for report_id in ["r1", "r2", "r3"] {
             store
@@ -2774,6 +2840,602 @@ mod tests {
         // Serve it, and only then is the case fully noticed.
         harness.state.store.mark_delivered(&opening_ref).unwrap();
         assert!(harness.state.store.open_case_verdict_delivered(&case_id).unwrap());
+    }
+    /// Re-filing a valid signed appeal used to reset `appeal_state` to
+    /// `pending`, so an accused could flip a completed review — even a
+    /// reversal — back into the queue by POSTing the same object
+    /// again. That erases the record of a review that did happen, in
+    /// the place the panel reads it from.
+    #[tokio::test]
+    async fn an_appeal_cannot_be_refiled_to_reopen_a_completed_review() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+
+        // Ban it, so there is something to appeal.
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        let appeal = || {
+            signed(
+                json!({"caseId": case_id, "kind": "appeal", "statement": "it was a quotation"}),
+                "signature",
+                &[ACCUSED_SEED],
+            )
+        };
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(harness.state.store.case(&case_id).unwrap().unwrap().appeal_state, "pending");
+
+        // A moderator reviews it.
+        harness
+            .state
+            .store
+            .set_appeal_state(&case_id, "upheld", None, None, "2026-08-09T00:00:00Z", "appeal_upheld", "hash:r")
+            .unwrap();
+
+        // Re-filing must not put it back in the queue.
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            harness.state.store.case(&case_id).unwrap().unwrap().appeal_state,
+            "upheld",
+            "the completed review stands"
+        );
+    }
+
+    /// The accused may supplement a pending appeal, and doing so
+    /// changes neither `appealState` nor the case revision — a
+    /// supplement is not a new claim and does not touch the document a
+    /// model would read. `claimRevision` is the only thing that moves,
+    /// which is why a decision may pin it: a review submitted against
+    /// the earlier value is a review of a shorter file than the one it
+    /// would decide.
+    #[tokio::test]
+    async fn a_decision_pinned_to_a_stale_claim_revision_is_refused() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        let appeal = |statement: &str| {
+            signed(
+                json!({"caseId": case_id, "kind": "appeal", "statement": statement}),
+                "signature",
+                &[ACCUSED_SEED],
+            )
+        };
+        let (status, _) =
+            harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal("it was a quotation")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // What a reviewer would read now.
+        let read_at = harness.state.store.case(&case_id).unwrap().unwrap().claim_revision;
+
+        // …and then more material arrives.
+        let (status, _) =
+            harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal("and here is the thread")).await;
+        assert_eq!(status, StatusCode::OK);
+        let case = harness.state.store.case(&case_id).unwrap().unwrap();
+        assert_eq!(case.appeal_state, "pending", "a supplement does not move the state");
+        assert!(case.claim_revision > read_at, "it moves the claim revision");
+
+        let stale = json!({
+            "disposition": "reverse",
+            "reasoning": "hash:r",
+            "reviewed": "appeal",
+            "claimRevision": read_at,
+        });
+        let (status, _) = harness.decide(&case_id, stale).await;
+        assert_eq!(status, StatusCode::CONFLICT, "a review of a file that has grown must not commit");
+        assert_eq!(
+            harness.state.store.case(&case_id).unwrap().unwrap().disposition.as_deref(),
+            Some("ban")
+        );
+
+        // Reading the whole file and deciding against *that* works.
+        let current = harness.state.store.case(&case_id).unwrap().unwrap().claim_revision;
+        let (status, _) = harness
+            .decide(
+                &case_id,
+                json!({
+                    "disposition": "reverse",
+                    "reasoning": "hash:r",
+                    "reviewed": "appeal",
+                    "claimRevision": current,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let case = harness.state.store.case(&case_id).unwrap().unwrap();
+        assert_eq!(case.disposition.as_deref(), Some("reversed"));
+        assert_eq!(case.appeal_state, "reversed");
+    }
+
+    /// A device-changed-hands claim is not an appeal against the
+    /// verdict, and must not be queued as one — the panel's uphold
+    /// branch would otherwise write "appeal upheld" into the log of a
+    /// case nobody appealed.
+    #[tokio::test]
+    async fn a_new_holder_claim_is_queued_as_itself() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        let claim = serde_json::to_vec(&json!({
+            "caseId": case_id,
+            "kind": "new-holder-claim",
+            "statement": "I bought this device secondhand",
+        }))
+        .unwrap();
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), claim).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let case = harness.state.store.case(&case_id).unwrap().unwrap();
+        assert_eq!(case.new_holder_state, "pending");
+        assert_eq!(case.appeal_state, "none", "it is not an appeal, and must not occupy one");
+        // It still reaches a human: both kinds are in the queue.
+        assert_eq!(harness.state.store.cases_awaiting_appeal_review().unwrap().len(), 1);
+    }
+
+
+    /// A new-holder claim and an appeal are different claims, by
+    /// different people, about different questions. Sharing one field
+    /// let a claim swallow a pending appeal — and since the claim path
+    /// is unauthenticated, let anyone knowing a case id lock the
+    /// accused out of appealing at all.
+    #[tokio::test]
+    async fn a_new_holder_claim_neither_swallows_nor_blocks_an_appeal() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        // The accused appeals.
+        let appeal = signed(
+            json!({"caseId": case_id, "kind": "appeal", "statement": "it was a quotation"}),
+            "signature",
+            &[ACCUSED_SEED],
+        );
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A stranger files a new-holder claim on the same case.
+        let claim = serde_json::to_vec(&json!({
+            "caseId": case_id,
+            "kind": "new-holder-claim",
+            "statement": "I bought this device secondhand",
+        }))
+        .unwrap();
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), claim).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let case = harness.state.store.case(&case_id).unwrap().unwrap();
+        assert_eq!(case.appeal_state, "pending", "the appeal must survive the claim");
+        assert_eq!(case.new_holder_state, "pending", "and the claim is queued too");
+    }
+
+    /// The order that mattered more: a claim filed *first* must not
+    /// stop the accused appealing.
+    #[tokio::test]
+    async fn a_claim_filed_first_does_not_lock_out_the_appeal() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        let claim = serde_json::to_vec(&json!({
+            "caseId": case_id,
+            "kind": "new-holder-claim",
+            "statement": "I bought this device secondhand",
+        }))
+        .unwrap();
+        harness.post(&format!("/v1/cases/{case_id}/appeal"), claim).await;
+
+        let appeal = signed(
+            json!({"caseId": case_id, "kind": "appeal", "statement": "it was a quotation"}),
+            "signature",
+            &[ACCUSED_SEED],
+        );
+        let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal).await;
+        assert_eq!(status, StatusCode::OK, "§12 relief must not be blockable by a stranger");
+        assert_eq!(
+            harness.state.store.case(&case_id).unwrap().unwrap().appeal_state,
+            "pending"
+        );
+    }
+
+    /// A reversal through the JSON API answers the appeal too — it left
+    /// the case in the panel's queue, where a moderator could then
+    /// "uphold" a verdict that had already been reversed.
+    #[tokio::test]
+    async fn a_reversal_through_the_api_resolves_the_appeal() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        let appeal = signed(
+            json!({"caseId": case_id, "kind": "appeal", "statement": "it was a quotation"}),
+            "signature",
+            &[ACCUSED_SEED],
+        );
+        harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal).await;
+
+        let (status, _) = harness
+            .decide(
+                &case_id,
+                json!({"disposition": "reverse", "reasoning": "hash:r", "reviewed": "appeal"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert_eq!(harness.state.store.case(&case_id).unwrap().unwrap().appeal_state, "reversed");
+        assert!(
+            harness.state.store.cases_awaiting_appeal_review().unwrap().is_empty(),
+            "an answered appeal leaves the queue whichever door the answer came through"
+        );
+    }
+
+    /// Reversing a ban nobody appealed is the authority correcting
+    /// itself, not an appeal outcome. Recording it as one puts a review
+    /// that never happened into the case log.
+    #[tokio::test]
+    async fn reversing_without_an_appeal_is_not_recorded_as_an_appeal_outcome() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        let (status, _) =
+            harness.decide(&case_id, json!({"disposition": "reverse", "reasoning": "hash:r"})).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let case = harness.state.store.case(&case_id).unwrap().unwrap();
+        assert_eq!(case.disposition.as_deref(), Some("reversed"));
+        assert_eq!(case.appeal_state, "none", "nobody appealed");
+        assert!(
+            !harness
+                .state
+                .store
+                .events(&case_id)
+                .unwrap()
+                .iter()
+                .any(|(_, kind, _)| kind == "appeal_reversed"),
+            "the log must not claim an appeal was reversed"
+        );
+    }
+
+
+    /// End to end on the disclosure: the accused resolving their
+    /// verdict's `reasoning` gets the record, and does not get the
+    /// reporter's own account of it. A moderator does.
+    #[tokio::test]
+    async fn the_accused_can_resolve_their_case_without_learning_who_reported_it() {
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+
+        // A report whose context is the reporter writing about it.
+        let mut report = report_json(&reporter_mandate, "r-1");
+        report["evidence"][0]["context"] =
+            json!("he sent it after I asked him to stop, on our group chat");
+        let body = signed(report, "signature", &[REPORTER_SEED]);
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let case_id = response["caseId"].as_str().unwrap().to_string();
+
+        // An assessment on file, as triage would leave one.
+        let case = harness.state.store.case(&case_id).unwrap().unwrap();
+        let document = crate::casedoc::build(&harness.state.store, &case).unwrap();
+        harness
+            .state
+            .store
+            .put_assessment(&case_id, br#"{"outcome":"no-decision"}"#, "no-decision", &document.text, true)
+            .unwrap();
+
+        let (status, accused_view) = harness.send(party_status_request(&case_id, ACCUSED_SEED)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let seen = accused_view["assessment"]["document"].as_str().expect("the record is served");
+        // The evidence itself, by the words the report actually
+        // carried — not by a phrase that also appears in the
+        // withholding notice, which is how this assertion first passed
+        // while testing nothing.
+        assert!(seen.contains("prohibited thing"), "they get the evidence against them: {seen}");
+        assert!(
+            !seen.contains("I asked him to stop"),
+            "and not the reporter's own words: {seen}"
+        );
+        assert!(seen.contains("[withheld"), "the gap is visible, so it can be asked about");
+        // Nothing anywhere in the answer names the reporter.
+        assert!(!accused_view.to_string().contains(&testing::key_reference(REPORTER_SEED)));
+
+        // A moderator reviewing the same case sees all of it.
+        let (_, moderator_view) = harness
+            .send(
+                Request::get(format!("/v1/cases/{case_id}/status"))
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert!(moderator_view["assessment"]["document"]
+            .as_str()
+            .unwrap()
+            .contains("I asked him to stop"));
+    }
+
+    /// A reporter on the case is a party — they can read the status —
+    /// but the record the case was decided on includes the accused's
+    /// own response, which is not theirs to read.
+    #[tokio::test]
+    async fn a_reporter_does_not_get_the_assessed_record() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let case = harness.state.store.case(&case_id).unwrap().unwrap();
+        let document = crate::casedoc::build(&harness.state.store, &case).unwrap();
+        harness
+            .state
+            .store
+            .put_assessment(&case_id, br#"{"outcome":"ban"}"#, "ban", &document.text, true)
+            .unwrap();
+
+        let (status, view) = harness.send(party_status_request(&case_id, REPORTER_SEED)).await;
+        assert_eq!(status, StatusCode::OK, "a reporter is still a party");
+        assert!(view["assessment"].is_null(), "but the record is not theirs");
+    }
+
+
+    /// The two appeal rules compose: a pending appeal may be
+    /// supplemented — the accused may find more to say while waiting,
+    /// and the first filing should not be their only chance — while a
+    /// *decided* one is never re-opened by filing again. Supplementing
+    /// must also not queue the case twice for the moderator.
+    #[tokio::test]
+    async fn a_pending_appeal_can_be_supplemented_but_a_decided_one_cannot() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        let appeal = |statement: &str| {
+            signed(
+                json!({"caseId": case_id, "kind": "appeal", "statement": statement}),
+                "signature",
+                &[ACCUSED_SEED],
+            )
+        };
+
+        let (status, _) =
+            harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal("it was a quotation")).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = harness
+            .post(&format!("/v1/cases/{case_id}/appeal"), appeal("and here is the context"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "a pending appeal may be supplemented");
+
+        assert_eq!(
+            harness.state.store.case(&case_id).unwrap().unwrap().appeal_state,
+            "pending"
+        );
+        assert_eq!(
+            harness.state.store.cases_awaiting_appeal_review().unwrap().len(),
+            1,
+            "supplementing must not queue the case twice"
+        );
+
+        // Once reviewed, further filings are refused — otherwise the
+        // record of the review that happened is erased.
+        harness
+            .state
+            .store
+            .set_appeal_state(&case_id, "upheld", None, None, "2026-08-09T00:00:00Z", "appeal_upheld", "hash:r")
+            .unwrap();
+        let (status, _) =
+            harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal("let me try again")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            harness.state.store.case(&case_id).unwrap().unwrap().appeal_state,
+            "upheld",
+            "the completed review stands"
+        );
+    }
+
+
+    /// Redacting the document and then serving the model's prose beside
+    /// it closes one channel and leaves the adjacent one open. Two
+    /// published profiles ask the model to reason in the open, so its
+    /// output can quote the field the document redaction just removed.
+    #[tokio::test]
+    async fn the_models_own_words_cannot_quote_the_reporter_back_to_the_accused() {
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+
+        let account = "he sent it right after I asked him to stop";
+        let mut report = report_json(&reporter_mandate, "r-1");
+        report["evidence"][0]["context"] = json!(account);
+        let (status, response) =
+            harness.post("/v1/reports", signed(report, "signature", &[REPORTER_SEED])).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let case_id = response["caseId"].as_str().unwrap().to_string();
+
+        // A model that reasons in the open, quoting what it was shown.
+        let case = harness.state.store.case(&case_id).unwrap().unwrap();
+        let document = crate::casedoc::build(&harness.state.store, &case).unwrap();
+        let assessment = json!({
+            "outcome": "no-decision",
+            "rawOutput": format!("No. The report context says \"{account}\", which does not \
+                                  establish the required elements."),
+            "note": "score 0.1100 at or below the profile's dismissal threshold 0.2",
+        });
+        harness
+            .state
+            .store
+            .put_assessment(
+                &case_id,
+                &serde_json::to_vec(&assessment).unwrap(),
+                "no-decision",
+                &document.text,
+                true,
+            )
+            .unwrap();
+
+        let (status, view) = harness.send(party_status_request(&case_id, ACCUSED_SEED)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Nowhere in the answer — not the document, not the model's
+        // words about it.
+        assert!(
+            !view.to_string().contains("asked him to stop"),
+            "the reporter's account leaked: {view}"
+        );
+        let raw = view["assessment"]["rawOutput"].as_str().unwrap();
+        assert!(raw.contains("[withheld"), "and the withholding is visible: {raw}");
+        assert!(
+            raw.contains("does not establish the required elements"),
+            "the rest of the model's reasoning still reaches them: {raw}"
+        );
+
+        // The moderator reviewing the appeal sees all of it.
+        let (_, panel) = harness
+            .send(
+                Request::get(format!("/v1/cases/{case_id}/status"))
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert!(panel["assessment"]["rawOutput"].as_str().unwrap().contains("asked him to stop"));
+    }
+
+
+    /// `labels` was the one field the redaction did not cover. For a
+    /// taxonomy read line by line every line after the first becomes a
+    /// label — and on the unknown-code path the whole unreadable list
+    /// is kept — so a model emitting `unsafe` followed by the
+    /// reporter's account put it straight into the accused's copy.
+    #[tokio::test]
+    async fn labels_cannot_carry_the_reporters_account_to_the_accused() {
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let reporter_mandate = register_mandate(&harness, REPORTER_SEED).await;
+
+        let account = "he sent it right after I asked him to stop";
+        let mut report = report_json(&reporter_mandate, "r-1");
+        report["evidence"][0]["context"] = json!(account);
+        let (status, response) =
+            harness.post("/v1/reports", signed(report, "signature", &[REPORTER_SEED])).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let case_id = response["caseId"].as_str().unwrap().to_string();
+
+        let case = harness.state.store.case(&case_id).unwrap().unwrap();
+        let document = crate::casedoc::build(&harness.state.store, &case).unwrap();
+        let assessment = json!({
+            "outcome": "no-decision",
+            "rawOutput": "unsafe",
+            "note": "an output containing a code nobody can interpret is not an answer",
+            "labels": [account, "S4"],
+        });
+        harness
+            .state
+            .store
+            .put_assessment(
+                &case_id,
+                &serde_json::to_vec(&assessment).unwrap(),
+                "no-decision",
+                &document.text,
+                true,
+            )
+            .unwrap();
+
+        let (status, view) =
+            harness.send(party_status_request(&case_id, ACCUSED_SEED)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !view.to_string().contains("asked him to stop"),
+            "the account leaked through labels: {view}"
+        );
+        let labels = view["assessment"]["labels"].as_array().unwrap();
+        assert!(labels.iter().any(|l| l.as_str() == Some("S4")), "real codes survive: {labels:?}");
+
+        // The moderator reviewing the appeal still sees all of it.
+        let (_, panel) = harness
+            .send(
+                Request::get(format!("/v1/cases/{case_id}/status"))
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert!(panel["assessment"]["labels"].to_string().contains("asked him to stop"));
+    }
+
+    /// The read and the write are separate lock acquisitions, so
+    /// concurrent first filings could each take the unbounded arm and
+    /// overrun the cap the "pending" arm enforces. The state move is
+    /// conditioned on `none`, so only one can win.
+    #[tokio::test]
+    async fn concurrent_first_appeals_cannot_overrun_the_cap() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+
+        let appeal = |n: usize| {
+            signed(
+                json!({"caseId": case_id, "kind": "appeal", "statement": format!("filing {n}")}),
+                "signature",
+                &[ACCUSED_SEED],
+            )
+        };
+        let path = format!("/v1/cases/{case_id}/appeal");
+        let (a, b, c) = tokio::join!(
+            harness.post(&path, appeal(1)),
+            harness.post(&path, appeal(2)),
+            harness.post(&path, appeal(3)),
+        );
+        for (status, body) in [a, b, c] {
+            assert!(
+                status == StatusCode::OK || status == StatusCode::CONFLICT,
+                "unexpected {status}: {body}"
+            );
+        }
+
+        let filings = harness
+            .state
+            .store
+            .events(&case_id)
+            .unwrap()
+            .iter()
+            .filter(|(_, kind, _)| kind == "appeal_filed")
+            .count();
+        assert!(filings <= MAX_APPEALS_PER_CASE, "{filings} filings exceeded the cap");
+        assert_eq!(
+            harness.state.store.case(&case_id).unwrap().unwrap().appeal_state,
+            "pending"
+        );
     }
 
 }

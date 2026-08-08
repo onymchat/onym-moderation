@@ -69,6 +69,11 @@ async fn sweep_overdue(
             // meantime, theirs stands and this one does not land.
             expect_stage: "open",
             expect_disposition: None,
+            expect_revision: None,
+            expect_claim_revision: None,
+            appeal_state: None,
+            new_holder_state: None,
+            extra_event: None,
         });
         match committed {
             Ok(()) => {}
@@ -97,17 +102,116 @@ async fn sweep_overdue(
     Ok(dismissed)
 }
 
-/// Background loop: sweep deadlines, then push any undelivered
-/// verdicts. Both are idempotent, so a missed tick costs nothing.
+/// Assess every case whose response window has closed and that has no
+/// decision from the model yet.
+///
+/// The timing is the point. The reference policy has the authority
+/// assess the *completed* case document — the one that includes
+/// whatever the accused chose to file — so a case is not shown to a
+/// model until the window they were promised has run out. There is no
+/// "classify on arrival, apply later" path any more: an assessment made
+/// before the response exists is an assessment of a different document,
+/// and deciding on it would make the response window decorative.
+///
+/// A case whose last assessment reached no decision is retried, which
+/// is the "valid retry" the policy allows. If none ever lands, the
+/// decision deadline dismisses the case — and because the dismissal
+/// sweep runs first, an overdue case is dismissed rather than decided.
+const MAX_ASSESSMENTS_PER_SWEEP: usize = 25;
+
+/// How many times one case is put to the model before the sweep stops
+/// trying. Generous, because a model can be down for maintenance and a
+/// response window is days long — but not unbounded: a case the model
+/// will never read should end at its decision deadline, dismissed, not
+/// be retried until then.
+const MAX_ASSESSMENT_ATTEMPTS: i64 = 24;
+
+/// Retry spacing. A model that could not read a case a moment ago is
+/// unlikely to read it thirty seconds later, so each failed attempt
+/// pushes the next one further out, to a ceiling of six hours.
+fn retry_due(attempts: i64, last_attempt: Option<&str>, now: OffsetDateTime) -> bool {
+    let Some(last) = last_attempt else { return true };
+    let Ok(last) = util::parse_timestamp(last) else { return true };
+    // Clamped at 7 shifts, so the doubling actually reaches the stated
+    // ceiling: `5 << 6` is 320, which `min(360)` never touched.
+    let minutes = (5i64 << attempts.min(7)).min(360);
+    now >= last + time::Duration::minutes(minutes)
+}
+
+pub async fn triage_sweep(
+    state: &std::sync::Arc<AppState>,
+    now: OffsetDateTime,
+) -> Result<(), Error> {
+    if state.triage.is_none() {
+        return Ok(());
+    }
+
+    // Bounded per tick. Each case is awaited in turn against a model
+    // that may take two minutes, so an unbounded backlog would make a
+    // single tick run for hours and starve the next deadline sweep.
+    // What is left over is picked up on the following tick, and a case
+    // that waits is a case that stays open — never one that gets
+    // decided by default early.
+    let due: Vec<_> = state
+        .store
+        .cases_awaiting_assessment(&util::format_timestamp(now))?
+        .into_iter()
+        .filter(|(_, attempts, last)| {
+            *attempts < MAX_ASSESSMENT_ATTEMPTS && retry_due(*attempts, last.as_deref(), now)
+        })
+        .collect();
+    let total = due.len();
+    for (case, _, _) in due.into_iter().take(MAX_ASSESSMENTS_PER_SWEEP) {
+        crate::triage::assess_and_maybe_decide(state, &case.case_id, now).await;
+    }
+    // Decisions the model reached and a guard refused. Cheap — no
+    // model call — and the reason it runs every tick: the guard that
+    // refused is usually a delivery that has since completed.
+    crate::triage::retry_unapplied_decisions(state).await;
+
+    if total > MAX_ASSESSMENTS_PER_SWEEP {
+        tracing::info!(
+            assessed = MAX_ASSESSMENTS_PER_SWEEP,
+            waiting = total - MAX_ASSESSMENTS_PER_SWEEP,
+            "assessment backlog exceeds one sweep; the rest wait for the next tick"
+        );
+    }
+
+    Ok(())
+}
+
+/// Background loop: sweep deadlines, run triage, then push any
+/// undelivered verdicts. All three are idempotent, so a missed tick
+/// costs nothing.
 pub fn spawn(state: Arc<AppState>) {
     let interval = std::time::Duration::from_secs(state.config.deadline_sweep_secs);
+
+    // Deadlines and delivery run in their own task, on their own
+    // clock. Sharing a loop with assessment meant a slow model delayed
+    // them: 25 cases awaited in turn at a two-minute timeout is a
+    // worst-case tick far longer than the interval, and "undecided is
+    // dismissal" is the invariant that must not wait behind an
+    // unrelated inference. Nothing here calls the model.
+    let deadlines = state.clone();
     tokio::spawn(async move {
         loop {
-            if let Err(e) = sweep(&state, OffsetDateTime::now_utc()).await {
+            if let Err(e) = sweep(&deadlines, OffsetDateTime::now_utc()).await {
                 tracing::error!(error = %e, "deadline sweep failed");
             }
-            if let Err(e) = state.delivery.flush(&state.store).await {
+            if let Err(e) = deadlines.delivery.flush(&deadlines.store).await {
                 tracing::error!(error = %e, "verdict delivery failed");
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+
+    if state.triage.is_none() {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            if let Err(e) = triage_sweep(&state, OffsetDateTime::now_utc()).await {
+                tracing::error!(error = %e, "triage sweep failed");
             }
             tokio::time::sleep(interval).await;
         }
@@ -134,6 +238,10 @@ mod tests {
             responded: false,
             disposition: None,
             appeal_deadline: None,
+            appeal_state: "none".into(),
+            new_holder_state: "none".into(),
+            revision: 0,
+            claim_revision: 0,
         }
     }
 
@@ -168,6 +276,31 @@ mod tests {
         let now = util::parse_timestamp("2026-08-09T00:00:00Z").unwrap();
         assert_eq!(sweep(&state, now).await.unwrap(), 0);
         assert_eq!(state.store.case("c1").unwrap().unwrap().stage, "open");
+    }
+
+    /// A model that could not read a case a moment ago is unlikely to
+    /// read it thirty seconds later, so retries space out — and stop.
+    #[test]
+    fn assessment_retries_back_off_and_are_capped() {
+        let now = util::parse_timestamp("2026-08-09T12:00:00Z").unwrap();
+
+        // Never attempted: due immediately.
+        assert!(retry_due(0, None, now));
+        // Just attempted: not due again yet.
+        assert!(!retry_due(1, Some("2026-08-09T11:58:00Z"), now));
+        // Ten minutes on, a second attempt is due.
+        assert!(retry_due(1, Some("2026-08-09T11:45:00Z"), now));
+        // The wait grows, and stops growing at six hours.
+        assert!(!retry_due(6, Some("2026-08-09T08:00:00Z"), now));
+        assert!(retry_due(6, Some("2026-08-09T05:00:00Z"), now));
+        // The documented ceiling is six hours, and the shift now
+        // actually reaches it: `5 << 6` is 320 minutes, so the clamp at
+        // 6 made `min(360)` dead code and the real ceiling 5h20m.
+        assert!(!retry_due(9, Some("2026-08-09T06:30:00Z"), now), "5h30m is inside six hours");
+        assert!(retry_due(9, Some("2026-08-09T05:30:00Z"), now), "6h30m is past it");
+
+        // An unreadable timestamp does not wedge the case: it retries.
+        assert!(retry_due(3, Some("not a timestamp"), now));
     }
 
     /// Sweeping twice must not issue a second dismissal — the case is
@@ -223,6 +356,11 @@ mod tests {
                 credited_reporters: &[],
                 expect_stage: "open",
                 expect_disposition: None,
+                expect_revision: None,
+                expect_claim_revision: None,
+                appeal_state: None,
+                new_holder_state: None,
+                extra_event: None,
             })
             .unwrap();
 

@@ -11,6 +11,12 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
+/// How many columns `CASE_COLUMNS` selects. Any query that appends its
+/// own columns indexes from here, so adding a case field cannot quietly
+/// shift a later read onto the wrong one — which is exactly what
+/// `claim_revision` did to `cases_awaiting_assessment`.
+const CASE_COLUMN_COUNT: usize = 17;
+
 #[derive(Debug, Clone)]
 /// Everything one decision writes. Grouped so that issuing a verdict,
 /// moving the case, recording the event, and adjusting reporters'
@@ -19,6 +25,22 @@ pub struct Store {
 /// One filed response: the material, when it arrived, and how many the
 /// case will hold. Grouped so the storage bound travels with the thing
 /// it bounds rather than as a trailing argument.
+/// One move of a case's claim state, and the log line that records
+/// why. `expect` is the state the caller read before deciding to make
+/// it — asserted by the write, because the read that justified the
+/// move happened under a different lock.
+pub struct CaseStateMove<'a> {
+    pub case_id: &'a str,
+    pub value: &'a str,
+    pub expect: Option<&'a str>,
+    /// The claim revision the caller rendered its page from, when it
+    /// has one. `None` on the filing paths, which are not reviews.
+    pub expect_claim_revision: Option<i64>,
+    pub at: &'a str,
+    pub event_kind: &'a str,
+    pub event_detail: &'a str,
+}
+
 pub struct ResponseFiling<'a> {
     pub case: &'a CaseRecord,
     pub raw: &'a [u8],
@@ -51,6 +73,32 @@ pub struct Decision<'a> {
     /// verdicts for one case and credit its reporters twice.
     pub expect_stage: &'a str,
     pub expect_disposition: Option<&'a str>,
+    /// An appeal state to move in the same transaction, when this
+    /// decision *is* the answer to an appeal. Left `None` when the
+    /// decision says nothing about one.
+    pub appeal_state: Option<&'a str>,
+    /// The case revision the decider read. Re-asserted inside the
+    /// transaction: comparing the case document before signing and
+    /// committing left a window in which a response could land, and
+    /// the recovery path re-applied a stored decision without
+    /// comparing at all. A reading of a record that has since moved
+    /// must not become a verdict.
+    pub expect_revision: Option<i64>,
+    /// The claim revision the *reviewer* read, when this decision
+    /// answers a human remedy. `expect_revision` does not cover it: a
+    /// supplementary appeal filing leaves the case document a model
+    /// would read untouched, so the case revision is unmoved while the
+    /// file the moderator is deciding has grown. Nor does the state
+    /// alone, since a supplement leaves it `pending`.
+    pub expect_claim_revision: Option<i64>,
+    /// Likewise for a new-holder claim, which is a separate field
+    /// because it is a separate claim.
+    pub new_holder_state: Option<&'a str>,
+    /// One further event to record in the same transaction — the
+    /// review that produced this decision. Committed here rather than
+    /// appended afterwards, so the case log cannot end up describing a
+    /// review whose outcome never landed, or the reverse.
+    pub extra_event: Option<(&'a str, &'a str)>,
 }
 
 /// A verdict awaiting delivery, carrying the manifest bytes the case
@@ -94,6 +142,20 @@ pub struct CaseRecord {
     pub responded: bool,
     pub disposition: Option<String>,
     pub appeal_deadline: Option<String>,
+    /// none | pending | upheld | reversed
+    pub appeal_state: String,
+    /// Bumped whenever the case document changes. See the schema.
+    pub revision: i64,
+    /// none | pending | refused | granted. Independent of
+    /// `appeal_state`: a new-holder claim is a different claim, by a
+    /// different person, about a different question.
+    pub new_holder_state: String,
+    /// Bumped whenever either human-remedy claim changes — filed,
+    /// supplemented, or decided. A review is submitted against the
+    /// value it was rendered from, so a supplement or another
+    /// moderator's decision arriving in between refuses the commit
+    /// rather than being silently reviewed past.
+    pub claim_revision: i64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -200,7 +262,37 @@ impl Store {
                 decision_deadline TEXT NOT NULL,
                 responded         INTEGER NOT NULL DEFAULT 0,
                 disposition       TEXT,
-                appeal_deadline   TEXT
+                appeal_deadline   TEXT,
+                -- none | pending | upheld | reversed. `pending` is the
+                -- moderator panel's queue: an appeal filed against a
+                -- verdict and not yet reviewed by a human.
+                appeal_state      TEXT NOT NULL DEFAULT 'none',
+                -- Bumped by anything that changes the document a model
+                -- would read: a response filed, evidence joined. An
+                -- assessment records the revision it read, and a
+                -- decision is conditioned on it, so a reading of a
+                -- record that has since moved cannot become a verdict.
+                revision          INTEGER NOT NULL DEFAULT 0,
+                -- none | pending | refused | granted. Tracked
+                -- separately from the appeal, because the two are
+                -- different claims by different people: the accused
+                -- says the verdict was wrong, a new holder says the
+                -- device changed hands. Sharing one slot let a claim
+                -- swallow a pending appeal — and let anyone who knows a
+                -- case id file a claim and lock the accused out of
+                -- appealing at all.
+                new_holder_state  TEXT NOT NULL DEFAULT 'none',
+                -- Bumped by anything that changes what a reviewer of a
+                -- human remedy is looking at: an appeal filed or
+                -- supplemented, a new-holder claim filed, either claim
+                -- decided. `revision` does not cover it — a
+                -- supplementary appeal filing leaves the case document
+                -- a model would read untouched — so a review page
+                -- rendered before the supplement would commit as
+                -- though it had been read, and a reversal read from a
+                -- `pending` page could still commit after another
+                -- moderator had upheld the same claim.
+                claim_revision    INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS cases_by_stage ON cases (stage);
             -- At most one open case per (accused, class). Intake checks
@@ -232,6 +324,36 @@ impl Store {
                 at         TEXT NOT NULL,
                 kind       TEXT NOT NULL,
                 detail     TEXT NOT NULL
+            );
+
+            -- What the classifier concluded, kept whole so an appeal
+            -- reviewer sees what was decided on rather than a summary.
+            CREATE TABLE IF NOT EXISTS assessments (
+                case_id        TEXT PRIMARY KEY,
+                raw            BLOB NOT NULL,
+                recommendation TEXT NOT NULL,
+                applied        INTEGER NOT NULL DEFAULT 0,
+                assessed_at    TEXT NOT NULL,
+                -- The exact case document the model was shown. The
+                -- digest alone let the record say *that* something was
+                -- judged without letting anyone see *what* — and an
+                -- appeal reviewer applying the narrower canonical rule
+                -- needs the material, not a hash of it.
+                document       BLOB,
+                -- How many times this case has been put to the model.
+                -- A no-decision is retried, but not forever and not
+                -- every tick: a model that cannot read a case now is
+                -- unlikely to read it thirty seconds later.
+                attempts       INTEGER NOT NULL DEFAULT 0
+            );
+
+            -- Moderator panel sessions. Short-lived and revocable; the
+            -- panel displays disclosed evidence, so a leaked cookie is
+            -- a disclosure.
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+                token      TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS verdicts (
@@ -285,6 +407,13 @@ impl Store {
             ("verdicts", "refusals", "INTEGER NOT NULL DEFAULT 0"),
             ("verdicts", "last_error", "TEXT"),
             ("verdicts", "undeliverable", "INTEGER NOT NULL DEFAULT 0"),
+            // The moderator panel's appeal queue.
+            ("cases", "appeal_state", "TEXT NOT NULL DEFAULT 'none'"),
+            ("cases", "new_holder_state", "TEXT NOT NULL DEFAULT 'none'"),
+            ("cases", "revision", "INTEGER NOT NULL DEFAULT 0"),
+            ("cases", "claim_revision", "INTEGER NOT NULL DEFAULT 0"),
+            ("assessments", "attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("assessments", "document", "BLOB"),
         ] {
             Self::add_column(&conn, table, column, definition)?;
         }
@@ -606,7 +735,8 @@ impl Store {
         // default, clearing a ban already in force and taking the
         // appeal deadline the accused was owed with it.
         let responded = tx.execute(
-            "UPDATE cases SET responded = 1 WHERE case_id = ?1 AND stage = 'open'",
+            "UPDATE cases SET responded = 1, revision = revision + 1
+              WHERE case_id = ?1 AND stage = 'open'",
             params![case.case_id],
         )?;
         if responded == 0 {
@@ -642,6 +772,28 @@ impl Store {
 
     // ─── Cases ───────────────────────────────────────────────────────
 
+    /// Test-only: record an opening verdict for a case that already
+    /// exists, and mark it delivered. In the service the two happen
+    /// together in `open_case_atomically` and the delivery sweep; a
+    /// fixture that builds a case row directly still needs a served
+    /// notice, because a ban now requires one.
+    #[cfg(test)]
+    pub fn put_delivered_open_case_verdict(
+        &self,
+        case_id: &str,
+        verdict_ref: &str,
+    ) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO verdicts
+             (verdict_ref, case_id, disposition, raw, issued_at, delivered)
+             VALUES (?1, ?2, 'open-case', ?3, '2026-08-01T00:00:00Z', 1)",
+            params![verdict_ref, case_id, b"{}".as_slice()],
+        )?;
+        Ok(())
+    }
+
+
     /// Test-only, and deliberately so. In the service every case-row
     /// change is a conditional `UPDATE` of the columns that change:
     /// writing a whole row back from a record read before the lock is
@@ -651,8 +803,9 @@ impl Store {
         conn.execute(
             "INSERT OR REPLACE INTO cases
              (case_id, accused, reporter, class_id, mandate_ref, device_binding, stage,
-              opened_at, response_deadline, decision_deadline, responded, disposition, appeal_deadline)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              opened_at, response_deadline, decision_deadline, responded, disposition,
+              appeal_deadline, appeal_state, new_holder_state, claim_revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 case.case_id,
                 case.accused,
@@ -667,14 +820,156 @@ impl Store {
                 case.responded as i32,
                 case.disposition,
                 case.appeal_deadline,
+                case.appeal_state,
+                case.new_holder_state,
+                case.claim_revision,
             ],
         )?;
         Ok(())
     }
 
+    /// Move a case's appeal state and log why, in one write. This is
+    /// the one case-row change that is not itself a decision: an appeal
+    /// arriving or being reviewed changes what the panel shows without
+    /// issuing a verdict. A reversal still goes through
+    /// `commit_decision`; this only records the appeal's own progress.
+    /// Move a new-holder claim's state. Separate from the appeal's,
+    /// so neither can overwrite the other: they are different claims,
+    /// by different people, about different questions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_new_holder_state(
+        &self,
+        case_id: &str,
+        value: &str,
+        expect: Option<&str>,
+        expect_claim_revision: Option<i64>,
+        at: &str,
+        event_kind: &str,
+        event_detail: &str,
+    ) -> Result<(), Error> {
+        self.set_case_field(
+            "new_holder_state",
+            CaseStateMove {
+                case_id,
+                value,
+                expect,
+                expect_claim_revision,
+                at,
+                event_kind,
+                event_detail,
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_appeal_state(
+        &self,
+        case_id: &str,
+        appeal_state: &str,
+        expect: Option<&str>,
+        expect_claim_revision: Option<i64>,
+        at: &str,
+        event_kind: &str,
+        event_detail: &str,
+    ) -> Result<(), Error> {
+        self.set_case_field(
+            "appeal_state",
+            CaseStateMove {
+                case_id,
+                value: appeal_state,
+                expect,
+                expect_claim_revision,
+                at,
+                event_kind,
+                event_detail,
+            },
+        )
+    }
+
+    /// Note new material on a claim that does not move its state: a
+    /// supplementary appeal filing. Bounded like any case event, and it
+    /// moves `claim_revision`, because a review rendered before it read
+    /// a shorter file than the one it is about to decide.
+    pub fn append_claim_event_bounded(
+        &self,
+        case_id: &str,
+        at: &str,
+        kind: &str,
+        detail: &str,
+        limit: usize,
+    ) -> Result<bool, Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM case_events WHERE case_id = ?1 AND kind = ?2",
+            params![case_id, kind],
+            |row| row.get(0),
+        )?;
+        if count >= limit as i64 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
+            params![case_id, at, kind, detail],
+        )?;
+        tx.execute(
+            "UPDATE cases SET claim_revision = claim_revision + 1 WHERE case_id = ?1",
+            params![case_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// `expect` is the state the caller read before deciding to make
+    /// this move. The read and the write are separate lock
+    /// acquisitions, so without it two moderators could both pass the
+    /// "is it pending?" check and both record a review of the same
+    /// claim — and, on the filing path, concurrent appeals could each
+    /// take the unbounded first-filing arm.
+    ///
+    /// `expect_claim_revision` is the rest of that answer. The state
+    /// alone does not distinguish a claim that gained a supplementary
+    /// filing while the reviewer read the page, because a supplement
+    /// leaves it `pending`; the revision does.
+    fn set_case_field(&self, column: &str, move_: CaseStateMove<'_>) -> Result<(), Error> {
+        let CaseStateMove {
+            case_id,
+            value,
+            expect,
+            expect_claim_revision,
+            at,
+            event_kind,
+            event_detail,
+        } = move_;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            &format!(
+                "UPDATE cases SET {column} = ?2, claim_revision = claim_revision + 1
+                  WHERE case_id = ?1
+                    AND (?3 IS NULL OR {column} = ?3)
+                    AND (?4 IS NULL OR claim_revision = ?4)"
+            ),
+            params![case_id, value, expect, expect_claim_revision],
+        )?;
+        if changed == 0 {
+            return Err(Error::CaseState(format!(
+                "case {case_id} is not in the state this change was decided against; someone \
+                 else moved it first, or the claim gained material this review did not read"
+            )));
+        }
+        tx.execute(
+            "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
+            params![case_id, at, event_kind, event_detail],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Test-only. In the service a case row moves only inside a
     /// transaction that also writes the verdict justifying the move —
-    /// see `open_case_atomically` and `commit_decision`.
+    /// see `open_case_atomically`, `commit_decision`, and
+    /// `set_appeal_state`.
     #[cfg(test)]
     pub fn put_case(&self, case: &CaseRecord) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
@@ -710,8 +1005,8 @@ impl Store {
             "INSERT INTO cases
              (case_id, accused, reporter, class_id, mandate_ref, device_binding, stage,
               opened_at, response_deadline, decision_deadline, responded, disposition,
-              appeal_deadline)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              appeal_deadline, appeal_state, new_holder_state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 case.case_id,
                 case.accused,
@@ -726,6 +1021,8 @@ impl Store {
                 case.responded as i32,
                 case.disposition,
                 case.appeal_deadline,
+                case.appeal_state,
+                case.new_holder_state,
             ],
         ) {
             Ok(_) => {}
@@ -812,7 +1109,7 @@ impl Store {
         // intake instead.
         let revised = tx.execute(
             "UPDATE cases
-                SET response_deadline = ?2, decision_deadline = ?3
+                SET response_deadline = ?2, decision_deadline = ?3, revision = revision + 1
               WHERE case_id = ?1 AND stage = 'open' AND decision_deadline > ?4",
             params![case.case_id, case.response_deadline, case.decision_deadline, at],
         )?;
@@ -864,12 +1161,23 @@ impl Store {
             responded: row.get::<_, i32>(10)? != 0,
             disposition: row.get(11)?,
             appeal_deadline: row.get(12)?,
+            appeal_state: row.get(13)?,
+            new_holder_state: row.get(14)?,
+            revision: row.get(15)?,
+            claim_revision: row.get(CASE_COLUMN_COUNT - 1)?,
         })
     }
 
     const CASE_COLUMNS: &'static str = "case_id, accused, reporter, class_id, mandate_ref, \
          device_binding, stage, opened_at, response_deadline, decision_deadline, responded, \
-         disposition, appeal_deadline";
+         disposition, appeal_deadline, appeal_state, new_holder_state, revision, claim_revision";
+
+    /// The same list, qualified — `assessments` also has a `case_id`,
+    /// so an unqualified join is ambiguous.
+    const CASE_COLUMNS_C: &'static str = "c.case_id, c.accused, c.reporter, c.class_id, \
+         c.mandate_ref, c.device_binding, c.stage, c.opened_at, c.response_deadline, \
+         c.decision_deadline, c.responded, c.disposition, c.appeal_deadline, c.appeal_state, \
+         c.new_holder_state, c.revision, c.claim_revision";
 
     pub fn case(&self, case_id: &str) -> Result<Option<CaseRecord>, Error> {
         let conn = self.conn.lock().unwrap();
@@ -924,6 +1232,69 @@ impl Store {
     /// kind exist for the case. The count and insert share the store
     /// lock, so concurrent requests cannot all observe the same free
     /// slot and overflow the bound.
+    /// Record a new-holder claim: bound it, log it, and queue the case
+    /// for a human — all under one lock.
+    ///
+    /// Two findings meet here. The endpoint is unauthenticated, so a
+    /// count followed by a separate write lets a concurrent burst
+    /// overrun the cap. And the claim must be queued under its *own*
+    /// state: writing the appeal's would swallow a pending appeal, and
+    /// since anyone knowing a case id can file a claim, it would also
+    /// let a stranger lock the accused out of appealing at all.
+    ///
+    /// A claim filed while one is already queued is logged against the
+    /// queued case rather than re-queueing it, so a reviewer sees all
+    /// of them without the queue flapping. A claim filed after one was
+    /// *refused* does re-queue: the endpoint is unauthenticated, so a
+    /// stranger filing first and a moderator refusing it would
+    /// otherwise consume the genuine holder's §5.7 remedy permanently
+    /// — the same failure moving off the shared `appeal_state` field
+    /// was meant to close. `MAX_NEW_HOLDER_CLAIMS` still bounds it, so
+    /// re-queueing is not an unbounded way to demand review.
+    ///
+    /// `granted` does not re-queue: the marks are already cleared, so
+    /// there is no remedy left to ask for.
+    pub fn record_new_holder_claim(
+        &self,
+        case_id: &str,
+        at: &str,
+        detail: &str,
+        limit: usize,
+    ) -> Result<bool, Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM case_events WHERE case_id = ?1 AND kind = 'new_holder_claim'",
+            params![case_id],
+            |row| row.get(0),
+        )?;
+        if count >= limit as i64 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO case_events (case_id, at, kind, detail)
+             VALUES (?1, ?2, 'new_holder_claim', ?3)",
+            params![case_id, at, detail],
+        )?;
+        // The claim revision moves for *every* claim, including one
+        // filed against an already-queued case: it is material a
+        // reviewer has not seen, and a review submitted from a page
+        // rendered before it must not commit as though it had been.
+        tx.execute(
+            "UPDATE cases
+                SET new_holder_state = CASE
+                        WHEN new_holder_state IN ('none', 'refused') THEN 'pending'
+                        ELSE new_holder_state
+                    END,
+                    claim_revision = claim_revision + 1
+              WHERE case_id = ?1",
+            params![case_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+
     pub fn append_event_bounded(
         &self,
         case_id: &str,
@@ -962,6 +1333,280 @@ impl Store {
         Ok(out)
     }
 
+    /// The disclosed content of every report joined to a case — what
+    /// the classifier reads and what a reviewer is shown.
+    pub fn evidence_for_case(&self, case_id: &str) -> Result<Vec<String>, Error> {
+        let conn = self.conn.lock().unwrap();
+        // `report_id` breaks ties: two reports filed in the same second
+        // would otherwise order arbitrarily between reads, changing the
+        // document's digest with nothing in the case having changed —
+        // which reads as "the record moved while the model was reading
+        // it" and discards a perfectly good assessment.
+        let mut statement = conn
+            .prepare("SELECT raw FROM reports WHERE case_id = ?1 ORDER BY filed_at, report_id")?;
+        let rows = statement.query_map(params![case_id], |row| row.get::<_, Vec<u8>>(0))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let raw = row?;
+            let Ok(report) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            let Some(items) = report.get("evidence").and_then(|e| e.as_array()) else {
+                continue;
+            };
+            for item in items {
+                if let Some(content) = item.get("disclosedContent").and_then(|c| c.as_str()) {
+                    out.push(content.to_string());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Cases with an appeal awaiting human review — the moderator
+    /// panel's queue.
+    pub fn cases_awaiting_appeal_review(&self) -> Result<Vec<CaseRecord>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {} FROM cases
+              WHERE appeal_state = 'pending' OR new_holder_state = 'pending'
+              ORDER BY opened_at",
+            Self::CASE_COLUMNS
+        ))?;
+        let rows = statement.query_map([], Self::case_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn recent_cases(&self, limit: i64) -> Result<Vec<CaseRecord>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {} FROM cases ORDER BY opened_at DESC LIMIT ?1",
+            Self::CASE_COLUMNS
+        ))?;
+        let rows = statement.query_map(params![limit], Self::case_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Open cases with no assessment yet — retried by the sweep, since
+    /// a classifier outage must not strand a case.
+    /// The reporters' own explanations attached to evidence items —
+    /// untrusted text, and labelled as such by the caller. Kept
+    /// separate from the material itself because they are an assertion
+    /// *about* the evidence rather than evidence of authorship.
+    pub fn report_context_for_case(&self, case_id: &str) -> Result<Vec<String>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn
+            .prepare("SELECT raw FROM reports WHERE case_id = ?1 ORDER BY filed_at, report_id")?;
+        let rows = statement.query_map(params![case_id], |row| row.get::<_, Vec<u8>>(0))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let raw = row?;
+            let Ok(report) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            let Some(items) = report.get("evidence").and_then(|e| e.as_array()) else {
+                continue;
+            };
+            for item in items {
+                if let Some(context) = item.get("context").and_then(|c| c.as_str()) {
+                    if !context.trim().is_empty() {
+                        out.push(context.to_string());
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Open cases ready for automated assessment: the accused's
+    /// response window has closed, and either nothing has assessed them
+    /// yet or the last attempt reached no decision.
+    ///
+    /// The window condition is policy, not scheduling — §4.1 has the
+    /// authority assess the *completed* case document. Retrying a
+    /// no-decision is the "valid retry" §4.2 allows: a model that
+    /// returned garbage once may answer on the next pass, and if it
+    /// never does, the decision deadline dismisses the case.
+    /// Each case comes back with how many times it has already been
+    /// put to the model, and when it last was, so the caller can space
+    /// retries out instead of hammering an unhealthy model every tick.
+    /// Open cases carrying a decision the model reached but that was
+    /// never applied.
+    ///
+    /// A guard can refuse an automated decision for a reason that later
+    /// stops being true — most obviously `require_notice_delivered`,
+    /// which refuses while the opening verdict is still queued for the
+    /// interface. Without a path back, that refusal was permanent: the
+    /// assessment row kept its `ban`, nothing re-attempted it, and the
+    /// case ran to its decision deadline and dismissed. In autonomous
+    /// mode no human would ever have seen it, because no ban means no
+    /// appeal means nothing in the panel's queue.
+    pub fn cases_with_unapplied_decision(&self) -> Result<Vec<CaseRecord>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {} FROM cases c
+               JOIN assessments a ON a.case_id = c.case_id
+              WHERE c.stage = 'open'
+                AND a.applied = 0
+                AND a.recommendation IN ('ban', 'dismiss')
+              ORDER BY c.opened_at",
+            Self::CASE_COLUMNS_C
+        ))?;
+        let rows = statement.query_map([], Self::case_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn cases_awaiting_assessment(
+        &self,
+        now: &str,
+    ) -> Result<Vec<(CaseRecord, i64, Option<String>)>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {}, COALESCE(a.attempts, 0), a.assessed_at
+               FROM cases c
+               LEFT JOIN assessments a ON a.case_id = c.case_id
+              WHERE c.stage = 'open'
+                AND c.response_deadline <= ?1
+                AND (a.case_id IS NULL OR a.recommendation = 'no-decision')
+              ORDER BY c.opened_at",
+            Self::CASE_COLUMNS_C
+        ))?;
+        let rows = statement.query_map(params![now], |row| {
+            // Indexed past the case columns, so adding one to
+            // `CASE_COLUMNS_C` does not silently start reading a case
+            // field as an attempt count.
+            Ok((Self::case_from_row(row)?, row.get(CASE_COLUMN_COUNT)?, row.get(CASE_COLUMN_COUNT + 1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Store an assessment. `counted` is false for a reading that was
+    /// discarded through no fault of the model or the case — the
+    /// attempt budget exists to stop hammering an unhealthy model, and
+    /// spending it on something neither of them did wrong turns a
+    /// safeguard into a way to run a case out the clock.
+    pub fn put_assessment(
+        &self,
+        case_id: &str,
+        raw: &[u8],
+        recommendation: &str,
+        document: &str,
+        counted: bool,
+    ) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO assessments
+             (case_id, raw, recommendation, applied, assessed_at, attempts, document)
+             VALUES (?1, ?2, ?3,
+                     COALESCE((SELECT applied FROM assessments WHERE case_id = ?1), 0),
+                     ?4,
+                     COALESCE((SELECT attempts FROM assessments WHERE case_id = ?1), 0) + ?6,
+                     ?5)",
+            params![case_id, raw, recommendation, crate::util::format_timestamp(
+                time::OffsetDateTime::now_utc()
+            ), document, counted as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Discard a stored decision so the sweep reassesses the case as
+    /// it now stands. Not a deletion: the reading stays on file as a
+    /// no-decision, with its attempt already counted, so the record
+    /// still says a model looked and what it saw.
+    pub fn invalidate_assessment(&self, case_id: &str) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE assessments SET recommendation = 'no-decision' WHERE case_id = ?1",
+            params![case_id],
+        )?;
+        Ok(())
+    }
+
+    /// The exact document the model was shown for this case, if one is
+    /// on file. What an appeal is actually about.
+    pub fn assessed_document(&self, case_id: &str) -> Result<Option<String>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let raw = conn
+            .query_row(
+                "SELECT document FROM assessments WHERE case_id = ?1",
+                params![case_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(raw)
+    }
+
+    /// The stored assessment and whether it has been acted on.
+    pub fn assessment(&self, case_id: &str) -> Result<Option<(Vec<u8>, bool)>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT raw, applied FROM assessments WHERE case_id = ?1",
+                params![case_id],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i32>(1)? != 0)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn mark_assessment_applied(&self, case_id: &str) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE assessments SET applied = 1 WHERE case_id = ?1",
+            params![case_id],
+        )?;
+        Ok(())
+    }
+
+    // ─── Admin sessions ──────────────────────────────────────────────
+
+    pub fn create_admin_session(&self, token: &str, now: &str, expires_at: &str) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM admin_sessions WHERE expires_at < ?1", params![now])?;
+        conn.execute(
+            "INSERT OR REPLACE INTO admin_sessions (token, created_at, expires_at) VALUES (?1, ?2, ?3)",
+            params![token, now, expires_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn admin_session_valid(&self, token: &str, now: &str) -> Result<bool, Error> {
+        let conn = self.conn.lock().unwrap();
+        let valid: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM admin_sessions WHERE token = ?1 AND expires_at > ?2",
+                params![token, now],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(valid.is_some())
+    }
+
+    pub fn destroy_admin_session(&self, token: &str) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM admin_sessions WHERE token = ?1", params![token])?;
+        Ok(())
+    }
+
     // ─── Verdicts ────────────────────────────────────────────────────
 
     /// Record a decision as one unit: the verdict, the case's new
@@ -981,6 +1626,11 @@ impl Store {
             credited_reporters,
             expect_stage,
             expect_disposition,
+            expect_revision,
+            expect_claim_revision,
+            appeal_state,
+            new_holder_state,
+            extra_event,
         } = decision;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -997,7 +1647,9 @@ impl Store {
                 SET stage = ?2, disposition = ?3, appeal_deadline = ?4
               WHERE case_id = ?1
                 AND stage = ?5
-                AND (?6 IS NULL OR disposition IS ?6)",
+                AND (?6 IS NULL OR disposition IS ?6)
+                AND (?7 IS NULL OR revision = ?7)
+                AND (?8 IS NULL OR claim_revision = ?8)",
             params![
                 case.case_id,
                 case.stage,
@@ -1005,12 +1657,15 @@ impl Store {
                 case.appeal_deadline,
                 expect_stage,
                 expect_disposition,
+                expect_revision,
+                expect_claim_revision,
             ],
         )?;
         if moved == 0 {
             return Err(Error::CaseState(format!(
-                "case {} is no longer {expect_stage}; it was decided by someone else while this \
-                 decision was being made",
+                "case {} is no longer {expect_stage} at the revision this decision was made \
+                 against; it was decided, its record changed, or the claim under review gained \
+                 material this review did not read, while the decision was being made",
                 case.case_id
             )));
         }
@@ -1026,6 +1681,32 @@ impl Store {
         )?;
         for reporter in *credited_reporters {
             Self::credit_reporter(&tx, reporter, *disposition == "ban")?;
+        }
+        // Same transaction: a reversal that committed while its appeal
+        // stayed `pending` would leave the case reversed and still in
+        // the panel's queue, with the review it answers unrecorded.
+        // Each claim move takes the claim revision with it, so a second
+        // reviewer holding a page rendered before this one commits is
+        // refused rather than deciding a claim that has been answered.
+        if let Some(appeal_state) = appeal_state {
+            tx.execute(
+                "UPDATE cases SET appeal_state = ?2, claim_revision = claim_revision + 1
+                  WHERE case_id = ?1",
+                params![case.case_id, appeal_state],
+            )?;
+        }
+        if let Some(new_holder_state) = new_holder_state {
+            tx.execute(
+                "UPDATE cases SET new_holder_state = ?2, claim_revision = claim_revision + 1
+                  WHERE case_id = ?1",
+                params![case.case_id, new_holder_state],
+            )?;
+        }
+        if let Some((kind, detail)) = extra_event {
+            tx.execute(
+                "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
+                params![case.case_id, at, kind, detail],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -1106,6 +1787,17 @@ impl Store {
                 "joined report {report_id:?} was not available to attach to case {case_id:?}"
             )));
         }
+        // The document a model reads is built from the case's reports,
+        // and it does not dedupe — so even a report whose evidence is
+        // already noticed adds to it. Without this bump the schema's
+        // own promise ("bumped by … evidence joined") was false, the
+        // in-flight digest check and the revision check disagreed, and
+        // the recovery path would apply a stored decision taken from a
+        // reading of a document that had since changed.
+        tx.execute(
+            "UPDATE cases SET revision = revision + 1 WHERE case_id = ?1",
+            params![case_id],
+        )?;
         tx.execute(
             "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
             params![case_id, at, "report_joined", detail],
@@ -1294,6 +1986,10 @@ mod tests {
             responded: false,
             disposition: None,
             appeal_deadline: None,
+            appeal_state: "none".into(),
+            new_holder_state: "none".into(),
+            revision: 0,
+            claim_revision: 0,
         }
     }
 
@@ -1317,6 +2013,11 @@ mod tests {
                 credited_reporters: &credited,
                 expect_stage: "open",
                 expect_disposition: None,
+                expect_revision: None,
+                expect_claim_revision: None,
+                appeal_state: None,
+                new_holder_state: None,
+                extra_event: None,
             })
             .unwrap();
     }
@@ -1480,6 +2181,10 @@ mod tests {
             responded: false,
             disposition: None,
             appeal_deadline: None,
+            appeal_state: "none".into(),
+            new_holder_state: "none".into(),
+            revision: 0,
+            claim_revision: 0,
         };
         store.put_case(&case).unwrap();
 
@@ -1528,8 +2233,25 @@ mod tests {
                     issued_at   TEXT NOT NULL,
                     delivered   INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE cases (
+                    case_id           TEXT PRIMARY KEY,
+                    accused           TEXT NOT NULL,
+                    reporter          TEXT NOT NULL,
+                    class_id          TEXT NOT NULL,
+                    mandate_ref       TEXT NOT NULL,
+                    device_binding    TEXT NOT NULL,
+                    stage             TEXT NOT NULL,
+                    opened_at         TEXT NOT NULL,
+                    response_deadline TEXT NOT NULL,
+                    decision_deadline TEXT NOT NULL,
+                    responded         INTEGER NOT NULL DEFAULT 0,
+                    disposition       TEXT,
+                    appeal_deadline   TEXT
+                );
                 INSERT INTO mandates VALUES ('m1', 'onym:key:u', 'd1', 'csam', X'7b7d', 't0');
                 INSERT INTO verdicts VALUES ('v1', 'c1', 'dismiss', X'7b7d', 't0', 0);
+                INSERT INTO cases VALUES ('c1', 'onym:key:a', 'onym:key:r', 'csam', 'm1', 'd1',
+                                          'open', 't0', 't1', 't2', 0, NULL, NULL);
                 "#,
             )
             .unwrap();
@@ -1545,6 +2267,14 @@ mod tests {
         assert_eq!(mandate.manifest_hash, "", "no snapshot was kept for it, and that is the truth");
         assert_eq!(store.undelivered_verdicts().unwrap().len(), 1);
         assert!(store.undeliverable_verdicts().unwrap().is_empty());
+
+        // The case read is the one that would have taken the service
+        // down: `CASE_COLUMNS` selects `appeal_state`, which an old
+        // `cases` table does not have.
+        let case = store.case("c1").unwrap().expect("the old case survives");
+        assert_eq!(case.stage, "open");
+        assert_eq!(case.appeal_state, "none", "an old case has never been appealed");
+        assert_eq!(store.cases_overdue("t9").unwrap().len(), 1);
 
         // Migrating twice is not an error.
         drop(store);
@@ -1579,6 +2309,11 @@ mod tests {
             credited_reporters: &["onym:key:aa".to_string()],
             expect_stage: "open",
             expect_disposition: None,
+            expect_revision: None,
+            expect_claim_revision: None,
+            appeal_state: None,
+            new_holder_state: None,
+            extra_event: None,
         });
 
         assert!(matches!(second, Err(Error::CaseState(_))), "{second:?}");
@@ -1610,8 +2345,136 @@ mod tests {
             credited_reporters: &[],
             expect_stage: "decided",
             expect_disposition: Some("ban"),
+            expect_revision: None,
+            expect_claim_revision: None,
+            appeal_state: None,
+            new_holder_state: None,
+            extra_event: None,
         });
         assert!(matches!(result, Err(Error::CaseState(_))), "a dismissal is not a ban to reverse");
     }
 
+
+    /// The handler reads the case, decides the claim is pending, and
+    /// then writes — two lock acquisitions. Two moderators can both
+    /// pass that read, so the write itself has to assert the state it
+    /// was decided against.
+    #[test]
+    fn a_state_move_is_refused_when_the_state_already_moved() {
+        let store = Store::in_memory().unwrap();
+        let mut case = sample_case("c1");
+        case.appeal_state = "pending".into();
+        store.put_case(&case).unwrap();
+
+        store
+            .set_appeal_state("c1", "upheld", Some("pending"), None, "t1", "appeal_upheld", "hash:a")
+            .unwrap();
+
+        // A second reviewer, holding the same read.
+        let second =
+            store.set_appeal_state("c1", "reversed", Some("pending"), None, "t2", "appeal_reversed", "hash:b");
+        assert!(matches!(second, Err(Error::CaseState(_))), "{second:?}");
+
+        assert_eq!(store.case("c1").unwrap().unwrap().appeal_state, "upheld");
+        assert_eq!(
+            store
+                .events("c1")
+                .unwrap()
+                .iter()
+                .filter(|(_, kind, _)| kind.starts_with("appeal_"))
+                .count(),
+            1,
+            "one review, one record — the losing one leaves no trace"
+        );
+    }
+
+    /// `CASE_COLUMNS` is selected by two queries that then append their
+    /// own columns and read them by index. Adding a case field without
+    /// moving those indexes silently reads a case field as an attempt
+    /// count — which is what `claim_revision` did until this pinned it.
+    #[test]
+    fn the_case_column_count_matches_the_column_list() {
+        assert_eq!(Store::CASE_COLUMNS.split(',').count(), CASE_COLUMN_COUNT);
+        assert_eq!(Store::CASE_COLUMNS_C.split(',').count(), CASE_COLUMN_COUNT);
+    }
+
+    /// Anyone who knows a case id can file a new-holder claim. If a
+    /// refusal closed the door, a stranger filing first and a moderator
+    /// refusing it would permanently consume the §5.7 remedy of the
+    /// person the device actually belongs to now — the same failure
+    /// that moving off the shared `appeal_state` field was meant to
+    /// close, arrived at from the other side.
+    #[test]
+    fn a_refused_claim_does_not_consume_the_next_holders_remedy() {
+        let store = Store::in_memory().unwrap();
+        let mut case = sample_case("c1");
+        case.disposition = Some("ban".into());
+        store.put_case(&case).unwrap();
+
+        assert!(store.record_new_holder_claim("c1", "t1", "it is mine now", 3).unwrap());
+        assert_eq!(store.case("c1").unwrap().unwrap().new_holder_state, "pending");
+
+        store
+            .set_new_holder_state("c1", "refused", Some("pending"), None, "t2",
+                                  "new_holder_claim_refused", "hash:a")
+            .unwrap();
+
+        // The genuine holder files. The case must go back in the queue.
+        assert!(store.record_new_holder_claim("c1", "t3", "here is the receipt", 3).unwrap());
+        assert_eq!(
+            store.case("c1").unwrap().unwrap().new_holder_state,
+            "pending",
+            "a refusal of someone else's claim is not an answer to this one"
+        );
+
+        // Still bounded: the cap counts filings, not queue entries.
+        assert!(store.record_new_holder_claim("c1", "t4", "third", 3).unwrap());
+        assert!(!store.record_new_holder_claim("c1", "t5", "fourth", 3).unwrap());
+    }
+
+    /// A granted claim has already cleared the marks. There is no
+    /// remedy left to ask for, so a later filing is logged without
+    /// re-queueing the case.
+    #[test]
+    fn a_granted_claim_is_not_re_queued() {
+        let store = Store::in_memory().unwrap();
+        let mut case = sample_case("c1");
+        case.new_holder_state = "granted".into();
+        store.put_case(&case).unwrap();
+
+        assert!(store.record_new_holder_claim("c1", "t1", "mine too", 3).unwrap());
+        assert_eq!(store.case("c1").unwrap().unwrap().new_holder_state, "granted");
+    }
+
+    /// Every claim moves the claim revision, including one filed
+    /// against an already-queued case and a supplementary appeal
+    /// filing. Neither changes a state or the case document, so the
+    /// revision is the only thing that can tell a review page it is
+    /// looking at a shorter file than the one it is about to decide.
+    #[test]
+    fn material_a_reviewer_has_not_seen_moves_the_claim_revision() {
+        let store = Store::in_memory().unwrap();
+        let mut case = sample_case("c1");
+        case.appeal_state = "pending".into();
+        store.put_case(&case).unwrap();
+        let start = store.case("c1").unwrap().unwrap().claim_revision;
+
+        store.append_claim_event_bounded("c1", "t1", "appeal_filed", "and also", 8).unwrap();
+        let after_supplement = store.case("c1").unwrap().unwrap().claim_revision;
+        assert!(after_supplement > start, "a supplement is material a reviewer has not read");
+
+        store.record_new_holder_claim("c1", "t2", "mine now", 3).unwrap();
+        let after_claim = store.case("c1").unwrap().unwrap().claim_revision;
+        assert!(after_claim > after_supplement);
+
+        store.record_new_holder_claim("c1", "t3", "still mine", 3).unwrap();
+        assert!(
+            store.case("c1").unwrap().unwrap().claim_revision > after_claim,
+            "a second claim against an already-queued case is new material too"
+        );
+
+        // The case document a model would read is untouched by all of
+        // it, which is exactly why `revision` cannot stand in.
+        assert_eq!(store.case("c1").unwrap().unwrap().revision, case.revision);
+    }
 }

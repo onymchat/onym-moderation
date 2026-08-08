@@ -10,15 +10,21 @@
 //! Its whole authority is enumerated in the manifest it publishes, and
 //! reaches only users who signed a mandate naming it.
 
+mod admin;
 mod api;
 mod canonical;
+mod casedoc;
 mod cases;
 mod config;
 mod deadlines;
+mod decisions;
 mod delivery;
 mod error;
+mod policy;
+mod profiles;
 mod state;
 mod store;
+mod triage;
 #[cfg(test)]
 mod testing;
 mod types;
@@ -110,6 +116,163 @@ async fn main() {
              resolve, by the decision-deadline default (dismissal)."
         );
     }
+    // Triage reads the evidence in a case. Where that inference runs
+    // decides whether recipient-disclosed content stays with the
+    // operator the user consented to, so it is checked at boot rather
+    // than left to whoever wrote the compose file.
+    if let Some(triage) = state.config.triage.as_ref() {
+        tracing::info!(
+            mode = ?triage.mode,
+            url = %triage.url,
+            profile = %triage.profile.id,
+            repository = %triage.profile.repository,
+            revision = %triage.profile.revision,
+            served_model = %triage.profile.served_model,
+            profile_digest = %triage.profile.profile_digest,
+            policy_digest = %triage.profile.policy_digest,
+            native_taxonomy = triage.profile.native_taxonomy,
+            "triage enabled"
+        );
+
+        // The published manifest is what users consent to. If it names
+        // a model profile, running a different one means deciding
+        // cases under terms nobody agreed to — so refuse to start
+        // rather than discover it in a case record.
+        match state.config.manifest.model_profile.as_ref() {
+            Some(declared)
+                if declared.id != triage.profile.id
+                    || declared.digest != triage.profile.profile_digest =>
+            {
+                eprintln!(
+                    "Configuration error: the manifest declares model profile {} ({}), but \
+                     AUTHORITY_TRIAGE_PROFILE selects {} ({}).\n\nWhich model decides a case is \
+                     consented policy and may not be replaced by a deployment. Run the profile \
+                     the manifest names, or publish a new manifest and take fresh mandates \
+                     against it.",
+                    declared.id,
+                    declared.digest,
+                    triage.profile.id,
+                    triage.profile.profile_digest
+                );
+                std::process::exit(1);
+            }
+            Some(_) => {}
+            None if triage.mode == crate::config::TriageMode::Autonomous => {
+                // Autonomous means this profile decides cases with no
+                // human in the loop. With nothing in the manifest
+                // naming it, the terms users consented to say nothing
+                // about which model that is — so there is no answer to
+                // "was I judged under what I agreed to?", and the honest
+                // response is to refuse rather than to warn and decide
+                // anyway.
+                eprintln!(
+                    "Configuration error: AUTHORITY_TRIAGE_MODE is autonomous but the published \
+                     manifest declares no `modelProfile`.\n\nNothing then binds the classifier \
+                     that decides cases to the terms users consented to. Declare it — the \
+                     profile's id and the SHA-256 of its published document — or run in \
+                     advisory mode, where a human decides."
+                );
+                std::process::exit(1);
+            }
+            None => tracing::warn!(
+                profile = %triage.profile.id,
+                "the published manifest declares no `modelProfile`, so nothing binds this \
+                 deployment's classifier to the terms users consented to. Add one — id and the \
+                 SHA-256 of the published profile document — and cases become checkable."
+            ),
+        }
+
+        // A native taxonomy decides by the model's own categories, and
+        // the published profiles say plainly that those categories do
+        // not establish the elements of the narrower rule — Qwen's
+        // `Sexual Content or Sexual Acts` does not establish that
+        // anyone is under 18. That mismatch is meant to be caught by a
+        // human on appeal. Wire it to a class whose ban is permanent,
+        // in autonomous mode, and the first human to look at the case
+        // is looking at a permanent ban that was issued on a category
+        // admittedly unable to prove the offence.
+        if triage.profile.native_taxonomy && triage.mode == crate::config::TriageMode::Autonomous {
+            let permanent: Vec<&str> = state
+                .config
+                .manifest
+                .violation_classes
+                .iter()
+                .filter(|class| class.ban_term == "permanent")
+                .map(|class| class.class_id.as_str())
+                .collect();
+            if !permanent.is_empty() {
+                tracing::error!(
+                    profile = %triage.profile.id,
+                    classes = %permanent.join(", "),
+                    "this profile decides by the model's own categories, which its published \
+                     terms say do not establish the narrower rule's elements — and these classes \
+                     carry a permanent ban with no human before the verdict. Prefer a profile \
+                     that applies the canonical rule for permanent-term classes, or run in \
+                     advisory mode."
+                );
+            }
+        }
+
+        // A class the profile cannot decide is not fatal — those cases
+        // wait for a human and dismiss at their deadline — but the
+        // symptom is "the classifier has gone quiet", which is a bad
+        // thing to have to diagnose from case records.
+        let unmappable = crate::triage::unmappable_classes(&triage.profile, &state.config.manifest);
+        if !unmappable.is_empty() {
+            tracing::warn!(
+                classes = %unmappable.join(", "),
+                profile = %triage.profile.id,
+                "this profile has no rule or native category for these manifest classes; cases \
+                 in them will never be decided automatically"
+            );
+        }
+        if crate::triage::needs_logprobs(&triage.profile) {
+            tracing::info!(
+                "this profile scores from first-token log probabilities; the inference server \
+                 must support `logprobs` and `top_logprobs` or every case will reach no decision"
+            );
+        }
+        if Config::triage_leaves_this_host(triage) {
+            // Fatal, not logged. Everything else consent-critical here
+            // refuses to start — no default profile, no mode without a
+            // profile — and this is the one that puts recipient-
+            // disclosed evidence in front of a third party. A log line
+            // is exactly what an operator misses, and by the time they
+            // read it the disclosure has already happened.
+            eprintln!(
+                "Configuration error: AUTHORITY_TRIAGE_URL is {}, which is not on this host.\n\n\
+                 Case evidence is content a reporter disclosed for adjudication. Sending it to \
+                 a third party is a further disclosure — one the manifest's confidentiality \
+                 policy must declare (§8 obligation 6), and one the reference policy makes a \
+                 change requiring fresh consent.\n\n\
+                 Run the model on this host, or set AUTHORITY_TRIAGE_MODE=off.",
+                triage.url
+            );
+            std::process::exit(1);
+        }
+        if state.config.manifest.confidentiality.is_none() {
+            tracing::warn!(
+                "triage is enabled but the manifest declares no confidentiality policy; users \
+                 consented without being told their disclosed evidence is machine-classified"
+            );
+        }
+        // Autonomous means nobody reads the file before a mark moves.
+        // The contract permits it; a user is owed the disclosure.
+        if triage.mode == crate::config::TriageMode::Autonomous {
+            tracing::warn!(
+                "triage mode is autonomous: verdicts issue without human review, and a human \
+                 sees a case only if it is appealed"
+            );
+        }
+    }
+
+    if state.config.admin_token.is_none() {
+        tracing::warn!(
+            "AUTHORITY_ADMIN_TOKEN is unset — the moderator panel is closed, so appeals cannot \
+             be reviewed by a human at all"
+        );
+    }
+
     if !state.delivery.configured() {
         tracing::warn!(
             "AUTHORITY_INTERFACE_URL is unset — verdicts are signed and stored but never \
@@ -119,7 +282,9 @@ async fn main() {
 
     deadlines::spawn(state.clone());
 
-    let app = api::router(state).layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024));
+    let app = api::router(state.clone())
+        .merge(admin::router(state))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024));
 
     let addr: SocketAddr = match bind_addr.parse() {
         Ok(a) => a,

@@ -21,6 +21,15 @@ pub const MANIFEST_JSON: &str = r#"{
       "appealEffect": "non-suspensive"
     },
     {
+      "classId": "credible-violence",
+      "definition": "hash:violence",
+      "responseWindow": "P7D",
+      "decisionDeadline": "P14D",
+      "banTerm": "P365D",
+      "appealWindow": "P30D",
+      "appealEffect": "non-suspensive"
+    },
+    {
       "classId": "unsolicited-pornography",
       "definition": "hash:up",
       "responseWindow": "P7D",

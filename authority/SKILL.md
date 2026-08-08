@@ -74,6 +74,64 @@ expect. If the process exited at boot, read stderr: a manifest whose
 `validUntil`, both stop the service deliberately. `interfaceConfigured: false` means verdicts are signed and
 stored but never delivered — no mark will ever move.
 
+## Triage and the panel
+
+Three settings change who decides. All default to the cautious value.
+
+- `AUTHORITY_TRIAGE_MODE` — `off` (no classifier), `advisory` (it
+  recommends, a human decides), `autonomous` (it decides; a human sees
+  a case only on appeal).
+- `AUTHORITY_TRIAGE_PROFILE` — **which model**, and with it the prompt,
+  output parsing, thresholds and category mapping. One of
+  `shieldstral-3b`, `gpt-oss-safeguard-20b`, `qwen3guard-8b`,
+  `nemotron-3.5-content-safety-4b`, `llama-guard-4-12b`,
+  `shieldgemma-9b` — or `AUTHORITY_TRIAGE_PROFILE_PATH` pointing at a
+  profile of your own. There is no default, and the service refuses to
+  start without one: which model decides a case is a term users
+  consent to.
+- `AUTHORITY_ADMIN_TOKEN` — opens the moderator panel at `/admin`,
+  where appeals are reviewed. Unset, no human can review an appeal at
+  all.
+
+**Do not pick a profile for a user.** Each corresponds to a published
+document in `../authorities/` that names the model, its revision, its
+exact prompt, and — for the native-taxonomy profiles — the disclosed
+mismatch between the model's categories and the authority's rules.
+Users agreed to one of those documents. Running a different profile
+than the one they were shown decides their case under terms they never
+saw, and no amount of it being "a better model" fixes that.
+
+For autonomous triage you also need the model **on the same host**:
+uncomment the `moderation-model` service in `docker-compose.yml`, set
+`AUTHORITY_TRIAGE_IMAGE`, and leave `AUTHORITY_TRIAGE_URL` pointing at
+that container. It must serve OpenAI-compatible chat completions; the
+two score-based profiles additionally need `logprobs` and
+`top_logprobs` support, or every case will reach no decision. Verify
+after deploying:
+
+```bash
+ssh root@$DROPLET_IP 'cd /opt/onym-moderation-authority && \
+  docker compose logs authority | grep "triage enabled"'
+```
+
+The line reports the profile, model repository, revision and digests
+actually in force — check them against the profile document users were
+shown.
+
+If the service exits with `AUTHORITY_TRIAGE_URL is ... not on this
+host`, that is deliberate: case evidence would be sent to a third
+party. Run the model locally or turn triage off; do not work around it.
+
+A name that does not resolve at boot is allowed through — the model
+container may have started second — and the check is paid instead
+before the first request that would carry evidence. So a typo'd
+`AUTHORITY_TRIAGE_URL` shows up as `refusing to send case evidence
+to ...` in the logs and every case reaching no decision, rather than as
+a failure to start. Same cause, same fix. If they carry `this
+profile has no rule or native category for these manifest classes`,
+cases in those classes will never be decided automatically; they wait
+for a human and dismiss at their deadline.
+
 ## Refuse to deploy if
 
 - **The manifest's `operator` does not match the signing key.** The
@@ -93,6 +151,26 @@ stored but never delivered — no mark will ever move.
 - **Someone asks you to change a device's marks.** Wrong service
   entirely — and the enforcement backend will only act on a signed
   verdict, which is the point.
+- **`AUTHORITY_TRIAGE_URL` points off this host.** Case evidence is
+  content a reporter disclosed for adjudication; sending it to a
+  third-party API is a disclosure the manifest's confidentiality policy
+  must declare. Run the model locally, or get the manifest changed
+  first — and remember a changed manifest does not bind anyone who
+  already consented.
+- **Triage is autonomous and the manifest declares no confidentiality
+  policy.** Users consented without being told their disclosed evidence
+  is machine-classified.
+- **Triage is autonomous and `AUTHORITY_ADMIN_TOKEN` is unset.** Every
+  verdict would then be issued by a classifier with no route to a human
+  at all, not even on appeal.
+- **Someone asks you to change a threshold, a prompt, or a category
+  mapping.** There is no environment variable for any of them, by
+  design: they are published in the profile before consent. Changing
+  them means publishing a new profile document and taking fresh
+  mandates against it — not editing a deployment.
+- **Someone asks you to swap the profile on a running authority.**
+  Live cases were opened under the profile users consented to.
+  A new profile is for new mandates.
 
 ## Operating notes
 

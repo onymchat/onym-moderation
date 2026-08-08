@@ -200,6 +200,10 @@ mod tests {
             responded: false,
             disposition: None,
             appeal_deadline: None,
+            appeal_state: "none".into(),
+            new_holder_state: "none".into(),
+            revision: 0,
+            claim_revision: 0,
         }
     }
 

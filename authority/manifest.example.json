@@ -4,6 +4,10 @@
   "seat": "moderation",
   "operator": "onym:key:0000000000000000000000000000000000000000000000000000000000000000",
   "moderationProfileId": "onym:moderation-profile:consent-bound-v1",
+  "modelProfile": {
+    "id": "gpt-oss-safeguard-20b",
+    "digest": "6e21fa551713739f61f30a17259ca6048a8967396005fdccd67b4dc497330fe1"
+  },
   "violationClasses": [
     {
       "classId": "csam",

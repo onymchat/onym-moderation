@@ -11,6 +11,23 @@ use crate::store::Store;
 use crate::types::VerdictSubmission;
 use crate::util;
 
+/// Push the delivery backlog without making the caller wait for it.
+///
+/// `flush` drains the *whole* queue at fifteen seconds a verdict, so
+/// running it inline made a request take time proportional to the
+/// backlog whenever the interface was down — and every request
+/// re-attempted every stuck verdict, inflating their counts. The sweep
+/// remains the reliable path; this only lets a fresh verdict leave
+/// promptly when the interface is healthy.
+pub fn flush_soon(state: &std::sync::Arc<crate::state::AppState>) {
+    let state = std::sync::Arc::clone(state);
+    tokio::spawn(async move {
+        if let Err(e) = state.delivery.flush(&state.store).await {
+            tracing::warn!(error = %e, "background verdict delivery failed; the sweep will retry");
+        }
+    });
+}
+
 #[derive(serde::Deserialize)]
 struct InterfaceErrorBody {
     error: String,
@@ -232,6 +249,10 @@ mod tests {
             responded: false,
             disposition: None,
             appeal_deadline: None,
+            appeal_state: "none".into(),
+            new_holder_state: "none".into(),
+            revision: 0,
+            claim_revision: 0,
         };
         store.put_case(&case).unwrap();
         let mut decided = case.clone();
@@ -249,6 +270,11 @@ mod tests {
                 credited_reporters: &[],
                 expect_stage: "open",
                 expect_disposition: None,
+                expect_revision: None,
+                expect_claim_revision: None,
+                appeal_state: None,
+                new_holder_state: None,
+                extra_event: None,
             })
             .unwrap();
     }
