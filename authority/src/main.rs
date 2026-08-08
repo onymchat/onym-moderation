@@ -157,6 +157,23 @@ async fn main() {
                 std::process::exit(1);
             }
             Some(_) => {}
+            None if triage.mode == crate::config::TriageMode::Autonomous => {
+                // Autonomous means this profile decides cases with no
+                // human in the loop. With nothing in the manifest
+                // naming it, the terms users consented to say nothing
+                // about which model that is — so there is no answer to
+                // "was I judged under what I agreed to?", and the honest
+                // response is to refuse rather than to warn and decide
+                // anyway.
+                eprintln!(
+                    "Configuration error: AUTHORITY_TRIAGE_MODE is autonomous but the published \
+                     manifest declares no `modelProfile`.\n\nNothing then binds the classifier \
+                     that decides cases to the terms users consented to. Declare it — the \
+                     profile's id and the SHA-256 of its published document — or run in \
+                     advisory mode, where a human decides."
+                );
+                std::process::exit(1);
+            }
             None => tracing::warn!(
                 profile = %triage.profile.id,
                 "the published manifest declares no `modelProfile`, so nothing binds this \

@@ -680,6 +680,7 @@ async fn open_case(
         appeal_deadline: None,
         appeal_state: "none".into(),
         new_holder_state: "none".into(),
+        revision: 0,
     };
     let issued = cases::open_case_verdict(
         &case,
@@ -1107,6 +1108,12 @@ struct Decision {
     /// definition. Mandatory: an unexplained ban is nonconforming even
     /// where confidentiality keeps it private.
     reasoning: String,
+    /// Which claim this decision answers, when it is a reversal:
+    /// `appeal` or `new-holder`. Omitted, a reversal still clears the
+    /// marks and anything pending becomes moot — but no review is
+    /// recorded against a claim nobody said they read.
+    #[serde(default)]
+    reviewed: Option<String>,
     /// Whether the decider actually saw the classifier's assessment.
     /// Recorded on the case, so "a human decided this" and "a human
     /// signed off what a model concluded" stay distinguishable. It is
@@ -1143,15 +1150,48 @@ async fn decide(
         decisions::Decider::Human
     };
 
-    let issued = decisions::apply(
-        &state,
-        &case_id,
-        disposition,
-        &decision.reasoning,
-        decider,
-        OffsetDateTime::now_utc(),
-    )
-    .await?;
+    let issued = match decision.reviewed.as_deref() {
+        Some("appeal") => {
+            decisions::apply_reviewing(
+                &state,
+                &case_id,
+                disposition,
+                &decision.reasoning,
+                decider,
+                OffsetDateTime::now_utc(),
+                decisions::Claim::Appeal,
+            )
+            .await?
+        }
+        Some("new-holder") => {
+            decisions::apply_reviewing(
+                &state,
+                &case_id,
+                disposition,
+                &decision.reasoning,
+                decider,
+                OffsetDateTime::now_utc(),
+                decisions::Claim::NewHolder,
+            )
+            .await?
+        }
+        Some(other) => {
+            return Err(Error::BadRequest(format!(
+                "unknown reviewed claim {other:?} (expected appeal | new-holder)"
+            )))
+        }
+        None => {
+            decisions::apply(
+                &state,
+                &case_id,
+                disposition,
+                &decision.reasoning,
+                decider,
+                OffsetDateTime::now_utc(),
+            )
+            .await?
+        }
+    };
 
     Ok(Json(json!({
         "caseId": case_id,
@@ -2322,6 +2362,7 @@ mod tests {
             appeal_deadline: None,
             appeal_state: "none".into(),
             new_holder_state: "none".into(),
+            revision: 0,
         };
         for report_id in ["r1", "r2", "r3"] {
             store
@@ -2929,8 +2970,12 @@ mod tests {
         );
         harness.post(&format!("/v1/cases/{case_id}/appeal"), appeal).await;
 
-        let (status, _) =
-            harness.decide(&case_id, json!({"disposition": "reverse", "reasoning": "hash:r"})).await;
+        let (status, _) = harness
+            .decide(
+                &case_id,
+                json!({"disposition": "reverse", "reasoning": "hash:r", "reviewed": "appeal"}),
+            )
+            .await;
         assert_eq!(status, StatusCode::OK);
 
         assert_eq!(harness.state.store.case(&case_id).unwrap().unwrap().appeal_state, "reversed");

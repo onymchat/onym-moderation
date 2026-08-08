@@ -240,6 +240,7 @@ mod tests {
             appeal_deadline: None,
             appeal_state: "none".into(),
             new_holder_state: "none".into(),
+            revision: 0,
         }
     }
 
@@ -395,15 +396,15 @@ mod tests {
         let case = case();
         let response = serde_json::json!({"caseId": "c1", "statement": "it was a quotation"});
         store
-            .put_response(
-                &case,
-                &serde_json::to_vec(&response).unwrap(),
-                false,
-                "2026-08-03T00:00:00Z",
-                "response",
-                "it was a quotation",
-                32,
-            )
+            .put_response(&crate::store::ResponseFiling {
+                case: &case,
+                raw: &serde_json::to_vec(&response).unwrap(),
+                late: false,
+                filed_at: "2026-08-03T00:00:00Z",
+                event_kind: "response",
+                event_detail: "it was a quotation",
+                limit: 32,
+            })
             .unwrap();
 
         let full = build(&store, &case).unwrap().text;

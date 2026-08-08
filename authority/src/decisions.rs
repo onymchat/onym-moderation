@@ -70,6 +70,15 @@ impl Decider {
 /// Apply a decision to a case: check it is allowed, issue the signed
 /// verdict, update the case, adjust the reporter's record, and hand the
 /// verdict to the interface.
+/// Which claim a reviewer answered. A reversal clears the marks either
+/// way, but only the claim actually read gets an outcome recorded
+/// against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim {
+    Appeal,
+    NewHolder,
+}
+
 pub async fn apply(
     state: &std::sync::Arc<AppState>,
     case_id: &str,
@@ -78,7 +87,67 @@ pub async fn apply(
     decider: Decider,
     now: OffsetDateTime,
 ) -> Result<Issued, Error> {
-    apply_inner(state, case_id, disposition, reasoning, decider, now).await
+    apply_inner(state, case_id, disposition, reasoning, decider, now, Context::default()).await
+}
+
+/// As `apply`, naming the claim the reviewer answered.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_reviewing(
+    state: &std::sync::Arc<AppState>,
+    case_id: &str,
+    disposition: Disposition,
+    reasoning: &str,
+    decider: Decider,
+    now: OffsetDateTime,
+    reviewed: Claim,
+) -> Result<Issued, Error> {
+    apply_inner(
+        state,
+        case_id,
+        disposition,
+        reasoning,
+        decider,
+        now,
+        Context { reviewed: Some(reviewed), ..Context::default() },
+    )
+    .await
+}
+
+/// As `apply`, but refusing if the case has changed since the reading
+/// this decision was made from. Automated deciders read the case
+/// document, wait on a model, and only then commit; without this the
+/// gap between the freshness check and the commit was a window in
+/// which a response could land, and the recovery path skipped the
+/// check entirely.
+pub async fn apply_at_revision(
+    state: &std::sync::Arc<AppState>,
+    case_id: &str,
+    disposition: Disposition,
+    reasoning: &str,
+    decider: Decider,
+    now: OffsetDateTime,
+    revision: i64,
+) -> Result<Issued, Error> {
+    apply_inner(
+        state,
+        case_id,
+        disposition,
+        reasoning,
+        decider,
+        now,
+        Context { expect_revision: Some(revision), ..Context::default() },
+    )
+    .await
+}
+
+/// The parts of a decision beyond who and what: the revision it was
+/// read at, and which claim the decider answered. Both are `None` for
+/// the plain path — a moderator deciding from the page in front of
+/// them, with nothing pending.
+#[derive(Default, Clone, Copy)]
+struct Context {
+    expect_revision: Option<i64>,
+    reviewed: Option<Claim>,
 }
 
 async fn apply_inner(
@@ -88,7 +157,9 @@ async fn apply_inner(
     reasoning: &str,
     decider: Decider,
     now: OffsetDateTime,
+    context: Context,
 ) -> Result<Issued, Error> {
+    let Context { expect_revision, reviewed } = context;
     let mut case = state
         .store
         .case(case_id)?
@@ -192,16 +263,35 @@ async fn apply_inner(
     // a verdict that had already been reversed. And a reversal of a
     // ban nobody appealed was recorded as an appeal outcome, which is a
     // review that did not happen.
+    // A reversal resolves the claim that was *reviewed*, and only that
+    // one. Resolving both marked a claim nobody had read as decided:
+    // granting the unauthenticated new-holder claim also recorded the
+    // accused's appeal as reversed, and vice versa. The other claim is
+    // marked moot — the marks are cleared, so its remedy has arrived —
+    // which is true without inventing a review that did not happen.
     let (appeal_state, new_holder_state, extra_event) = if disposition == Disposition::Reverse {
-        let appeal = (case.appeal_state == "pending").then_some("reversed");
-        let claim = (case.new_holder_state == "pending").then_some("granted");
-        let event = match (appeal, claim) {
-            (Some(_), _) => Some(("appeal_reversed", reasoning)),
-            (None, Some(_)) => Some(("new_holder_claim_granted", reasoning)),
-            // Reversing on the authority's own initiative, with nothing
-            // pending. Correcting an error is allowed; calling it an
-            // appeal outcome is not.
-            (None, None) => None,
+        let appeal_pending = case.appeal_state == "pending";
+        let claim_pending = case.new_holder_state == "pending";
+        let (appeal, claim, event) = match reviewed {
+            Some(Claim::Appeal) if appeal_pending => (
+                Some("reversed"),
+                claim_pending.then_some("moot"),
+                Some(("appeal_reversed", reasoning)),
+            ),
+            Some(Claim::NewHolder) if claim_pending => (
+                appeal_pending.then_some("moot"),
+                Some("granted"),
+                Some(("new_holder_claim_granted", reasoning)),
+            ),
+            // Reversing with nothing reviewed, or with the named claim
+            // not pending: the authority correcting its own error.
+            // Anything pending becomes moot, because the marks are
+            // gone — but no review is recorded for it.
+            _ => (
+                appeal_pending.then_some("moot"),
+                claim_pending.then_some("moot"),
+                None,
+            ),
         };
         (appeal, claim, event)
     } else {
@@ -222,6 +312,11 @@ async fn apply_inner(
         // here, one of them a background sweep.
         expect_stage: if disposition == Disposition::Reverse { "decided" } else { "open" },
         expect_disposition: if disposition == Disposition::Reverse { Some("ban") } else { None },
+        // Only automated decisions carry one: they are made from a
+        // reading of the case document taken up to two minutes
+        // earlier, and are the ones that can go stale. A moderator
+        // decides from the page in front of them.
+        expect_revision,
         appeal_state,
         new_holder_state,
         extra_event,
@@ -399,6 +494,7 @@ mod tests {
             appeal_deadline: None,
             appeal_state: "none".into(),
             new_holder_state: "none".into(),
+            revision: 0,
         }
     }
 

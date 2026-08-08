@@ -69,6 +69,7 @@ async fn sweep_overdue(
             // meantime, theirs stands and this one does not land.
             expect_stage: "open",
             expect_disposition: None,
+            expect_revision: None,
             appeal_state: None,
             new_holder_state: None,
             extra_event: None,
@@ -238,6 +239,7 @@ mod tests {
             appeal_deadline: None,
             appeal_state: "none".into(),
             new_holder_state: "none".into(),
+            revision: 0,
         }
     }
 

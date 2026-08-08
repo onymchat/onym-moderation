@@ -108,8 +108,28 @@ impl TriageConfig {
             (None, Some(path)) => {
                 let raw = std::fs::read(&path)
                     .map_err(|e| format!("AUTHORITY_TRIAGE_PROFILE_PATH {path}: {e}"))?;
-                serde_json::from_slice::<ModelProfile>(&raw)
-                    .map_err(|e| format!("{path} is not a valid model profile: {e}"))?
+                let mut profile = serde_json::from_slice::<ModelProfile>(&raw)
+                    .map_err(|e| format!("{path} is not a valid model profile: {e}"))?;
+
+                // The digest is computed over the document actually
+                // loaded, not read out of it. Trusting the file's own
+                // `profileDigest` made the binding a self-assertion: a
+                // prompt, adapter, threshold or revision could be
+                // rewritten while the field stayed put, and boot would
+                // then match that unchanged string against the
+                // manifest and judge an old mandate under replacement
+                // terms.
+                let computed = crate::util::sha256_hex(&raw);
+                if !profile.profile_digest.is_empty() && profile.profile_digest != computed {
+                    return Err(format!(
+                        "{path} declares profileDigest {} but its bytes hash to {computed}. The \
+                         digest names the document a mandate consents to; it cannot be asserted \
+                         separately from the document it names.",
+                        profile.profile_digest
+                    ));
+                }
+                profile.profile_digest = computed;
+                profile
             }
             (None, None) => {
                 return Err(format!(

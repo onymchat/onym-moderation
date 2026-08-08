@@ -63,6 +63,10 @@ pub struct Assessment {
     /// recorded answer rather than an inferred one.
     pub evidence_items: usize,
     pub response_items: usize,
+    /// The case revision this reading was taken at. A decision made
+    /// from it is committed only if the case is still there.
+    #[serde(default)]
+    pub case_revision: i64,
     /// The model's final output, verbatim and bounded. Stored because a
     /// reviewer on appeal is entitled to see what the machine actually
     /// said, not a summary of it.
@@ -317,6 +321,7 @@ impl Triage {
             input_digest: document.digest.clone(),
             evidence_items: document.evidence_items,
             response_items: document.response_items,
+            case_revision: case.revision,
             // Reasoning is stripped before storage, not after. The
             // reference policy is explicit that private
             // chain-of-thought "is neither a verdict reason nor
@@ -555,14 +560,30 @@ async fn apply_automated(
         _ => format!("automated assessment: {} ({})", assessment.outcome, assessment.note),
     };
 
-    match decisions::apply(state, case_id, disposition, &reasoning, Decider::Automated, now).await {
+    // Conditioned on the revision the reading was taken at. The
+    // freshness comparison happens before signing and committing, so
+    // without this a response landing in that gap would still be
+    // decided over — and the recovery path below re-applies a stored
+    // decision that could be much older still.
+    match decisions::apply_at_revision(
+        state,
+        case_id,
+        disposition,
+        &reasoning,
+        Decider::Automated,
+        now,
+        assessment.case_revision,
+    )
+    .await
+    {
         Ok(issued) => {
             let _ = state.store.mark_assessment_applied(case_id);
             tracing::info!(%case_id, verdict_ref = %issued.verdict_ref, "automated decision applied");
         }
         Err(Error::CaseState(reason)) | Err(Error::WindowClosed(reason)) => {
-            // The guards in `decisions.rs` had the last word, as they
-            // should. Nothing to retry.
+            // The guards had the last word, as they should. A refusal
+            // for a moved revision is not permanent: the sweep
+            // reassesses the case as it now stands.
             tracing::info!(%case_id, %reason, "automated decision refused by the decision guards");
         }
         Err(e) => tracing::error!(%case_id, error = %e, "automated decision failed"),
@@ -646,6 +667,23 @@ pub async fn retry_unapplied_decisions(state: &std::sync::Arc<AppState>, now: Of
             Outcome::Dismiss => Disposition::Dismiss,
             Outcome::NoDecision => continue,
         };
+
+        // The reason this decision is still here is that a guard
+        // refused it — and time has passed since. A response filed in
+        // the meantime changes the document the model read, so
+        // re-applying the old reading would ban someone over a record
+        // that never included their answer. Reassess instead.
+        if assessment.case_revision != case.revision {
+            tracing::info!(
+                case_id = %case.case_id,
+                "the case changed since this decision was reached; discarding it for reassessment"
+            );
+            if let Err(e) = state.store.invalidate_assessment(&case.case_id) {
+                tracing::error!(case_id = %case.case_id, error = %e, "could not discard it");
+            }
+            continue;
+        }
+
         apply_automated(state, &case.case_id, disposition, &assessment, now).await;
     }
 }
@@ -759,6 +797,7 @@ mod tests {
             appeal_deadline: None,
             appeal_state: "none".into(),
             new_holder_state: "none".into(),
+            revision: 0,
         };
         let inside = util::parse_timestamp("2026-08-02T00:00:00Z").unwrap();
         let after = util::parse_timestamp("2026-08-05T00:00:00Z").unwrap();
@@ -819,6 +858,7 @@ mod tests {
             appeal_deadline: None,
             appeal_state: "none".into(),
             new_holder_state: "none".into(),
+            revision: 0,
         };
         // The mandate the case names, with the manifest it consented
         // to. A case whose mandate is not on file is not a real case:
@@ -1084,6 +1124,7 @@ mod tests {
             appeal_deadline: None,
             appeal_state: "none".into(),
             new_holder_state: "none".into(),
+            revision: 0,
         };
         store
             .put_mandate(
@@ -1531,6 +1572,111 @@ mod tests {
 
         assert_eq!(state.store.case("c1").unwrap().unwrap().stage, "open");
         assert!(state.store.case("c1").unwrap().unwrap().disposition.is_none());
+    }
+
+
+    /// The recovery path re-applied a stored decision without checking
+    /// whether the case had moved since. A ban refused while its notice
+    /// was queued, followed by a late response, would later be applied
+    /// from a reading that never saw that response — the accused
+    /// banned over a record that did not include their answer.
+    #[tokio::test]
+    async fn a_stored_decision_is_discarded_when_the_case_has_moved_since() {
+        let (url, _) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Violent"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        let case = open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+        store.undeliver_open_case_verdicts(&case.case_id).unwrap();
+
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        // Decided, refused for undelivered notice, and left on file.
+        assess_and_maybe_decide(&state, "c1", now).await;
+        assert_eq!(state.store.cases_with_unapplied_decision().unwrap().len(), 1);
+
+        // The accused answers, late — the record the model read moves.
+        let case = state.store.case("c1").unwrap().unwrap();
+        let reply = serde_json::json!({"caseId": "c1", "statement": "it is a song lyric"});
+        state
+            .store
+            .put_response(&crate::store::ResponseFiling {
+                case: &case,
+                raw: &serde_json::to_vec(&reply).unwrap(),
+                late: true,
+                filed_at: "2026-08-11T00:00:00Z",
+                event_kind: "response_late",
+                event_detail: "it is a song lyric",
+                limit: 32,
+            })
+            .unwrap();
+
+        // Notice lands, and the retry runs.
+        state.store.put_delivered_open_case_verdict("c1", "v-open").unwrap();
+        retry_unapplied_decisions(&state, now).await;
+
+        let after = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(
+            after.stage, "open",
+            "a reading taken before the response must not become the verdict"
+        );
+        assert!(after.disposition.is_none());
+        // And it is queued for reassessment rather than left to rot.
+        assert!(state.store.cases_with_unapplied_decision().unwrap().is_empty());
+        assert_eq!(
+            state.store.cases_awaiting_assessment("2026-08-12T00:00:00Z").unwrap().len(),
+            1
+        );
+    }
+
+    /// The same guard on the normal path: the freshness comparison
+    /// happens before signing and committing, so the commit itself is
+    /// conditioned on the revision that reading was taken at.
+    #[tokio::test]
+    async fn a_decision_is_committed_only_at_the_revision_it_was_read_at() {
+        let store = crate::store::Store::in_memory().unwrap();
+        let case = open_case(&store, "credible-violence", "2026-08-04T00:00:00Z");
+        let state = std::sync::Arc::new(AppState::for_tests(store));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        let stale = case.revision;
+        let reply = serde_json::json!({"caseId": "c1", "statement": "answered"});
+        state
+            .store
+            .put_response(&crate::store::ResponseFiling {
+                case: &case,
+                raw: &serde_json::to_vec(&reply).unwrap(),
+                late: false,
+                filed_at: "2026-08-05T00:00:00Z",
+                event_kind: "response",
+                event_detail: "answered",
+                limit: 32,
+            })
+            .unwrap();
+        assert_ne!(state.store.case("c1").unwrap().unwrap().revision, stale);
+
+        let result = crate::decisions::apply_at_revision(
+            &state,
+            "c1",
+            crate::decisions::Disposition::Dismiss,
+            "hash:why",
+            crate::decisions::Decider::Automated,
+            now,
+            stale,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(Error::CaseState(_))),
+            "a stale revision must be refused"
+        );
+        assert_eq!(state.store.case("c1").unwrap().unwrap().stage, "open");
     }
 
 }

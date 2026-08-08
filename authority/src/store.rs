@@ -55,6 +55,13 @@ pub struct Decision<'a> {
     /// decision *is* the answer to an appeal. Left `None` when the
     /// decision says nothing about one.
     pub appeal_state: Option<&'a str>,
+    /// The case revision the decider read. Re-asserted inside the
+    /// transaction: comparing the case document before signing and
+    /// committing left a window in which a response could land, and
+    /// the recovery path re-applied a stored decision without
+    /// comparing at all. A reading of a record that has since moved
+    /// must not become a verdict.
+    pub expect_revision: Option<i64>,
     /// Likewise for a new-holder claim, which is a separate field
     /// because it is a separate claim.
     pub new_holder_state: Option<&'a str>,
@@ -108,6 +115,8 @@ pub struct CaseRecord {
     pub appeal_deadline: Option<String>,
     /// none | pending | upheld | reversed
     pub appeal_state: String,
+    /// Bumped whenever the case document changes. See the schema.
+    pub revision: i64,
     /// none | pending | refused | granted. Independent of
     /// `appeal_state`: a new-holder claim is a different claim, by a
     /// different person, about a different question.
@@ -223,6 +232,12 @@ impl Store {
                 -- moderator panel's queue: an appeal filed against a
                 -- verdict and not yet reviewed by a human.
                 appeal_state      TEXT NOT NULL DEFAULT 'none',
+                -- Bumped by anything that changes the document a model
+                -- would read: a response filed, evidence joined. An
+                -- assessment records the revision it read, and a
+                -- decision is conditioned on it, so a reading of a
+                -- record that has since moved cannot become a verdict.
+                revision          INTEGER NOT NULL DEFAULT 0,
                 -- none | pending | refused | granted. Tracked
                 -- separately from the appeal, because the two are
                 -- different claims by different people: the accused
@@ -349,6 +364,7 @@ impl Store {
             // The moderator panel's appeal queue.
             ("cases", "appeal_state", "TEXT NOT NULL DEFAULT 'none'"),
             ("cases", "new_holder_state", "TEXT NOT NULL DEFAULT 'none'"),
+            ("cases", "revision", "INTEGER NOT NULL DEFAULT 0"),
             ("assessments", "attempts", "INTEGER NOT NULL DEFAULT 0"),
             ("assessments", "document", "BLOB"),
         ] {
@@ -672,7 +688,8 @@ impl Store {
         // default, clearing a ban already in force and taking the
         // appeal deadline the accused was owed with it.
         let responded = tx.execute(
-            "UPDATE cases SET responded = 1 WHERE case_id = ?1 AND stage = 'open'",
+            "UPDATE cases SET responded = 1, revision = revision + 1
+              WHERE case_id = ?1 AND stage = 'open'",
             params![case.case_id],
         )?;
         if responded == 0 {
@@ -973,7 +990,7 @@ impl Store {
         // intake instead.
         let revised = tx.execute(
             "UPDATE cases
-                SET response_deadline = ?2, decision_deadline = ?3
+                SET response_deadline = ?2, decision_deadline = ?3, revision = revision + 1
               WHERE case_id = ?1 AND stage = 'open' AND decision_deadline > ?4",
             params![case.case_id, case.response_deadline, case.decision_deadline, at],
         )?;
@@ -1027,19 +1044,20 @@ impl Store {
             appeal_deadline: row.get(12)?,
             appeal_state: row.get(13)?,
             new_holder_state: row.get(14)?,
+            revision: row.get(15)?,
         })
     }
 
     const CASE_COLUMNS: &'static str = "case_id, accused, reporter, class_id, mandate_ref, \
          device_binding, stage, opened_at, response_deadline, decision_deadline, responded, \
-         disposition, appeal_deadline, appeal_state, new_holder_state";
+         disposition, appeal_deadline, appeal_state, new_holder_state, revision";
 
     /// The same list, qualified — `assessments` also has a `case_id`,
     /// so an unqualified join is ambiguous.
     const CASE_COLUMNS_C: &'static str = "c.case_id, c.accused, c.reporter, c.class_id, \
          c.mandate_ref, c.device_binding, c.stage, c.opened_at, c.response_deadline, \
          c.decision_deadline, c.responded, c.disposition, c.appeal_deadline, c.appeal_state, \
-         c.new_holder_state";
+         c.new_holder_state, c.revision";
 
     pub fn case(&self, case_id: &str) -> Result<Option<CaseRecord>, Error> {
         let conn = self.conn.lock().unwrap();
@@ -1138,20 +1156,6 @@ impl Store {
         Ok(true)
     }
 
-    pub fn append_event(
-        &self,
-        case_id: &str,
-        at: &str,
-        kind: &str,
-        detail: &str,
-    ) -> Result<(), Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
-            params![case_id, at, kind, detail],
-        )?;
-        Ok(())
-    }
 
     pub fn append_event_bounded(
         &self,
@@ -1338,7 +1342,7 @@ impl Store {
             Self::CASE_COLUMNS_C
         ))?;
         let rows = statement.query_map(params![now], |row| {
-            Ok((Self::case_from_row(row)?, row.get(15)?, row.get(16)?))
+            Ok((Self::case_from_row(row)?, row.get(16)?, row.get(17)?))
         })?;
         let mut out = Vec::new();
         for row in rows {
@@ -1372,6 +1376,19 @@ impl Store {
             params![case_id, raw, recommendation, crate::util::format_timestamp(
                 time::OffsetDateTime::now_utc()
             ), document, counted as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Discard a stored decision so the sweep reassesses the case as
+    /// it now stands. Not a deletion: the reading stays on file as a
+    /// no-decision, with its attempt already counted, so the record
+    /// still says a model looked and what it saw.
+    pub fn invalidate_assessment(&self, case_id: &str) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE assessments SET recommendation = 'no-decision' WHERE case_id = ?1",
+            params![case_id],
         )?;
         Ok(())
     }
@@ -1462,6 +1479,7 @@ impl Store {
             credited_reporters,
             expect_stage,
             expect_disposition,
+            expect_revision,
             appeal_state,
             new_holder_state,
             extra_event,
@@ -1481,7 +1499,8 @@ impl Store {
                 SET stage = ?2, disposition = ?3, appeal_deadline = ?4
               WHERE case_id = ?1
                 AND stage = ?5
-                AND (?6 IS NULL OR disposition IS ?6)",
+                AND (?6 IS NULL OR disposition IS ?6)
+                AND (?7 IS NULL OR revision = ?7)",
             params![
                 case.case_id,
                 case.stage,
@@ -1489,12 +1508,14 @@ impl Store {
                 case.appeal_deadline,
                 expect_stage,
                 expect_disposition,
+                expect_revision,
             ],
         )?;
         if moved == 0 {
             return Err(Error::CaseState(format!(
-                "case {} is no longer {expect_stage}; it was decided by someone else while this \
-                 decision was being made",
+                "case {} is no longer {expect_stage} at the revision this decision was made \
+                 against; it was decided, or its record changed, while the decision was being \
+                 made",
                 case.case_id
             )));
         }
@@ -1801,6 +1822,7 @@ mod tests {
             appeal_deadline: None,
             appeal_state: "none".into(),
             new_holder_state: "none".into(),
+            revision: 0,
         }
     }
 
@@ -1824,6 +1846,7 @@ mod tests {
                 credited_reporters: &credited,
                 expect_stage: "open",
                 expect_disposition: None,
+                expect_revision: None,
                 appeal_state: None,
                 new_holder_state: None,
                 extra_event: None,
@@ -1992,6 +2015,7 @@ mod tests {
             appeal_deadline: None,
             appeal_state: "none".into(),
             new_holder_state: "none".into(),
+            revision: 0,
         };
         store.put_case(&case).unwrap();
 
@@ -2116,6 +2140,7 @@ mod tests {
             credited_reporters: &["onym:key:aa".to_string()],
             expect_stage: "open",
             expect_disposition: None,
+            expect_revision: None,
             appeal_state: None,
             new_holder_state: None,
             extra_event: None,
@@ -2150,6 +2175,7 @@ mod tests {
             credited_reporters: &[],
             expect_stage: "decided",
             expect_disposition: Some("ban"),
+            expect_revision: None,
             appeal_state: None,
             new_holder_state: None,
             extra_event: None,

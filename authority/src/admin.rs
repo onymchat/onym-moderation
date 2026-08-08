@@ -528,7 +528,7 @@ async fn review(
             // to decide what kind of review this was, because the JSON
             // API reaches the same code and must reach the same
             // answer.
-            decisions::apply(
+            decisions::apply_reviewing(
                 &state,
                 &case_id,
                 Disposition::Reverse,
@@ -545,6 +545,15 @@ async fn review(
                     Decider::Human
                 },
                 now,
+                // The claim this form answered. Without it a reversal
+                // resolved both, so granting the unauthenticated
+                // new-holder claim also recorded the accused's appeal
+                // as reversed — a review nobody performed.
+                if subject == "new-holder" {
+                    decisions::Claim::NewHolder
+                } else {
+                    decisions::Claim::Appeal
+                },
             )
             .await?;
         }
@@ -708,6 +717,7 @@ mod tests {
             appeal_deadline: None,
             appeal_state: appeal_state.into(),
             new_holder_state: new_holder_state.into(),
+            revision: 0,
         }
     }
 
@@ -923,6 +933,48 @@ mod tests {
         assert!(uncontested.contains("value=none"));
         assert!(uncontested.contains("correcting its"));
         assert!(!uncontested.contains("value=uphold"));
+    }
+
+
+    /// A reversal resolves the claim that was *reviewed*. Resolving
+    /// both recorded a claim nobody had read as decided: granting the
+    /// unauthenticated new-holder claim also marked the accused's
+    /// appeal reversed, and reversing on the appeal granted the
+    /// stranger's claim. The other becomes moot — the marks are gone,
+    /// so its remedy has arrived — without a review being invented.
+    #[tokio::test]
+    async fn a_reversal_resolves_only_the_claim_that_was_reviewed() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        state.store.put_case(&reviewable_case_with(Some("ban"), "pending", "pending")).unwrap();
+        state.store.put_delivered_open_case_verdict("c1", "v-open").unwrap();
+
+        review(
+            State(state.clone()),
+            Path("c1".to_string()),
+            signed_in(&state),
+            Form(ReviewForm {
+                outcome: "reverse".into(),
+                reasoning: "hash:claim".into(),
+                subject: "new-holder".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let case = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(case.disposition.as_deref(), Some("reversed"), "the marks are cleared");
+        assert_eq!(case.new_holder_state, "granted", "the claim that was read");
+        assert_eq!(
+            case.appeal_state, "moot",
+            "the appeal's remedy arrived, but nobody reviewed it"
+        );
+
+        let events = state.store.events("c1").unwrap();
+        assert!(events.iter().any(|(_, kind, _)| kind == "new_holder_claim_granted"));
+        assert!(
+            !events.iter().any(|(_, kind, _)| kind == "appeal_reversed"),
+            "an appeal nobody read must not be recorded as reversed"
+        );
     }
 
 }
