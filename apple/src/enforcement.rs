@@ -163,10 +163,13 @@ impl Engine {
         }
 
         let mut case_open = false;
-        let mut ban: Option<(String, Verdict)> = None;
+        // More than one consented class can produce a live ban on the
+        // same device. Keep them by case while folding so a dismissal
+        // reverses only the case it names rather than clearing an
+        // unrelated sanction.
+        let mut bans: Vec<(String, Verdict, bool)> = Vec::new();
         let mut authorized_by = String::from("reconciliation");
         let mut realizes: Vec<String> = Vec::new();
-        let mut ban_executed = false;
 
         for stored in verdicts.iter().rev() {
             if stored.superseded {
@@ -190,34 +193,81 @@ impl Engine {
                     realizes.push(stored.verdict_ref.clone());
                 }
                 crate::types::Disposition::Dismiss => {
-                    // Dismissal clears the case-open mark, and a
-                    // reversal on appeal clears a ban.
+                    // The profile has one aggregate case-open bit, so
+                    // any terminal verdict clears it. A dismissal is a
+                    // ban reversal only for its own case.
                     case_open = false;
-                    ban = None;
+                    let mut removed_refs = Vec::new();
+                    bans.retain(|(verdict_ref, active, _)| {
+                        if active.case_id == verdict.case_id {
+                            removed_refs.push(verdict_ref.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    realizes.retain(|verdict_ref| !removed_refs.contains(verdict_ref));
                     authorized_by = stored.verdict_ref.clone();
                     realizes.push(stored.verdict_ref.clone());
                 }
                 crate::types::Disposition::Ban => {
                     if !Self::ban_in_force(stored, now) {
                         // Either not yet at executeAfter, or expired.
-                        // Both mean: not banned right now.
+                        // A pending replacement does not end an
+                        // already-active ban for the same case. An
+                        // expired verdict does.
                         if Self::ban_expired(stored, now) {
+                            let mut removed_refs = Vec::new();
+                            bans.retain(|(verdict_ref, active, _)| {
+                                if active.case_id == verdict.case_id {
+                                    removed_refs.push(verdict_ref.clone());
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
+                            realizes.retain(|verdict_ref| !removed_refs.contains(verdict_ref));
                             authorized_by = "expiry".into();
-                            ban = None;
                         }
                         continue;
                     }
+
+                    // A later in-force verdict for the same case
+                    // replaces the earlier one; other cases remain
+                    // independently in force.
+                    let mut removed_refs = Vec::new();
+                    bans.retain(|(verdict_ref, active, _)| {
+                        if active.case_id == verdict.case_id {
+                            removed_refs.push(verdict_ref.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    realizes.retain(|verdict_ref| !removed_refs.contains(verdict_ref));
+
                     case_open = false;
-                    ban = Some((stored.verdict_ref.clone(), verdict));
+                    bans.push((stored.verdict_ref.clone(), verdict, stored.executed));
                     authorized_by = stored.verdict_ref.clone();
                     realizes.push(stored.verdict_ref.clone());
-                    ban_executed = stored.executed;
                 }
             }
         }
 
+        // The bit is aggregate, while the refusal response can carry
+        // one governing verdict. Show the newest ban still in force;
+        // clearing it later reveals the next active case rather than
+        // clearing the device.
+        let ban = bans
+            .last()
+            .map(|(verdict_ref, verdict, _)| (verdict_ref.clone(), verdict.clone()));
+        let ban_executed = bans
+            .last()
+            .map(|(_, _, executed)| *executed)
+            .unwrap_or(false);
+
         Ok(Some(Intended {
-            bits: Bits { case_open, banned: ban.is_some() },
+            bits: Bits { case_open, banned: !bans.is_empty() },
             authorized_by,
             ban,
             realizes,
@@ -347,5 +397,145 @@ impl Engine {
             &stamp,
         )?;
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Disposition, Marks};
+
+    const DEVICE: &str = "device-1";
+    const MANDATE: &str = "mandate-1";
+
+    fn verdict(case_id: &str, disposition: Disposition, class_id: &str) -> Verdict {
+        let banned = disposition == Disposition::Ban;
+        Verdict {
+            verdict_version: 1,
+            case_id: case_id.into(),
+            authority: "onym:component:authority".into(),
+            mandate_ref: MANDATE.into(),
+            accused_keys: vec!["onym:key:accused".into()],
+            device_binding: DEVICE.into(),
+            class_id: class_id.into(),
+            disposition,
+            marks: Marks {
+                case_open: false,
+                banned,
+            },
+            ban_expires: None,
+            execute_after: banned.then(|| "2026-08-08T00:00:00Z".into()),
+            reasoning: "reasoning-ref".into(),
+            appeal_deadline: banned.then(|| "2026-09-07T00:00:00Z".into()),
+            decided_at: "2026-08-08T00:00:00Z".into(),
+            signature: "signature".into(),
+            is_final: !banned,
+        }
+    }
+
+    fn store_verdict(store: &Store, verdict_ref: &str, verdict: Verdict, received_at: &str) {
+        let raw = serde_json::to_vec(&verdict).unwrap();
+        let disposition = match verdict.disposition {
+            Disposition::OpenCase => "open-case",
+            Disposition::Dismiss => "dismiss",
+            Disposition::Ban => "ban",
+        };
+        store
+            .put_verdict(
+                &StoredVerdict {
+                    verdict_ref: verdict_ref.into(),
+                    case_id: verdict.case_id,
+                    mandate_ref: MANDATE.into(),
+                    device_binding: DEVICE.into(),
+                    raw,
+                    disposition: disposition.into(),
+                    ban_expires: verdict.ban_expires,
+                    execute_after: verdict.execute_after,
+                    executed: true,
+                    superseded: false,
+                },
+                received_at,
+            )
+            .unwrap();
+    }
+
+    fn engine() -> Engine {
+        Engine {
+            store: Store::in_memory().unwrap(),
+            device_check: None,
+        }
+    }
+
+    fn now() -> OffsetDateTime {
+        util::parse_timestamp("2026-08-09T00:00:00Z").unwrap()
+    }
+
+    #[test]
+    fn dismissal_does_not_clear_a_ban_from_another_case() {
+        let engine = engine();
+        store_verdict(
+            &engine.store,
+            "ban-csam",
+            verdict("case-csam", Disposition::Ban, "csam"),
+            "2026-08-08T00:00:00Z",
+        );
+        store_verdict(
+            &engine.store,
+            "dismiss-violence",
+            verdict("case-violence", Disposition::Dismiss, "credible-violence"),
+            "2026-08-08T01:00:00Z",
+        );
+
+        let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
+        assert!(intended.bits.banned);
+        assert_eq!(intended.ban.unwrap().1.case_id, "case-csam");
+    }
+
+    #[test]
+    fn dismissal_clears_only_its_case_when_two_bans_are_live() {
+        let engine = engine();
+        store_verdict(
+            &engine.store,
+            "ban-csam",
+            verdict("case-csam", Disposition::Ban, "csam"),
+            "2026-08-08T00:00:00Z",
+        );
+        store_verdict(
+            &engine.store,
+            "ban-violence",
+            verdict("case-violence", Disposition::Ban, "credible-violence"),
+            "2026-08-08T01:00:00Z",
+        );
+        store_verdict(
+            &engine.store,
+            "dismiss-violence",
+            verdict("case-violence", Disposition::Dismiss, "credible-violence"),
+            "2026-08-08T02:00:00Z",
+        );
+
+        let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
+        assert!(intended.bits.banned);
+        assert_eq!(intended.ban.unwrap().1.case_id, "case-csam");
+    }
+
+    #[test]
+    fn dismissal_clears_a_ban_from_the_same_case() {
+        let engine = engine();
+        store_verdict(
+            &engine.store,
+            "ban-csam",
+            verdict("case-csam", Disposition::Ban, "csam"),
+            "2026-08-08T00:00:00Z",
+        );
+        store_verdict(
+            &engine.store,
+            "dismiss-csam",
+            verdict("case-csam", Disposition::Dismiss, "csam"),
+            "2026-08-08T01:00:00Z",
+        );
+
+        let intended = engine.intended_marks(DEVICE, now()).unwrap().unwrap();
+        assert!(!intended.bits.banned);
+        assert!(intended.ban.is_none());
     }
 }
