@@ -232,6 +232,7 @@ mod tests {
             responded: false,
             disposition: None,
             appeal_deadline: None,
+            appeal_state: "none".into(),
         };
         store.put_case(&case).unwrap();
         let mut decided = case.clone();
