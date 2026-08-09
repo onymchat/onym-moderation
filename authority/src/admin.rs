@@ -235,10 +235,11 @@ async fn recovery_claim_detail(
              authorizes one thing: moving the named case's verdict record to the grantee's \
              enrollment. The interface refuses it while any record still bans the device, so \
              a ban that should stand must be left standing (or reversed through the case \
-             itself) — not worked around here.</p>\
+             itself) — not worked around here. Leave Case blank when this claim has only one \
+             decided case available; the authority will fill it in safely.</p>\
              <form method=post action=\"/admin/recovery/{id}/decide\">\
-             <label>Case — the case whose record marks this device.<br>\
-             <input class=addr name=case_id placeholder=\"case-…\"></label>\
+             <label>Case (optional) — the case whose record marks this device.<br>\
+             <input class=addr name=case_id placeholder=\"Leave blank to resolve automatically\"></label>\
              <label>Reasoning — how the holder's account was verified, or why it was not.<br>\
              <input name=reasoning size=70 required></label>\
              <div class=actions><button class=\"sign primary\" name=outcome value=grant>Issue grant</button>\
@@ -298,11 +299,23 @@ async fn recovery_claim_decide(
 
     match form.outcome.as_str() {
         "grant" => {
-            let case_id = form.case_id.trim();
-            let case = state
-                .store
-                .case(case_id)?
-                .ok_or_else(|| Error::BadRequest(format!("no case {case_id:?}")))?;
+            let entered_case_id = form.case_id.trim();
+            let case = if entered_case_id.is_empty() {
+                let candidates = state.store.decided_cases_for_recovery()?;
+                match candidates.as_slice() {
+                    [case] => case.clone(),
+                    [] => return Err(Error::BadRequest(
+                        "no decided case is available; enter the case number".into(),
+                    )),
+                    _ => return Err(Error::BadRequest(
+                        "more than one decided case is available; enter the case number so the grant is not applied to the wrong record".into(),
+                    )),
+                }
+            } else {
+                state.store.case(entered_case_id)?.ok_or_else(|| {
+                    Error::BadRequest(format!("no case {entered_case_id:?}"))
+                })?
+            };
             // A grant against an undecided case would race the case
             // itself; and the interface will refuse a record that
             // still bans, so granting one here only strands the
@@ -1958,6 +1971,26 @@ mod tests {
         assert_eq!(claim.state, "refused");
         assert_eq!(claim.reasoning.as_deref(), Some("verified the holder by phone"));
         assert!(claim.grant_raw.is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_grant_resolves_the_only_decided_case_when_case_is_blank() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        state.store.put_case(&reviewable_case(Some("reversed"), "reversed")).unwrap();
+        let claim_id = open_claim(&state);
+
+        recovery_claim_decide(
+            State(state.clone()),
+            Path(claim_id.clone()),
+            signed_in(&state),
+            Form(recovery_form("grant", "")),
+        )
+        .await
+        .unwrap();
+
+        let claim = state.store.recovery_claim(&claim_id).unwrap().unwrap();
+        assert_eq!(claim.state, "granted");
+        assert_eq!(claim.case_id.as_deref(), Some("c1"));
     }
 
     /// The decide endpoint is a signed-in surface like every other
