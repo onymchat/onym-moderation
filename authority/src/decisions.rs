@@ -12,6 +12,7 @@ use time::OffsetDateTime;
 use crate::cases::{self, Issued};
 use crate::error::Error;
 use crate::state::AppState;
+use crate::store::NoticeDelivery;
 use crate::util;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -412,14 +413,42 @@ fn consented_manifest(
 /// it — the caller most likely to reach a verdict while delivery is
 /// still queued.
 fn require_notice_delivered(state: &AppState, case_id: &str) -> Result<(), Error> {
-    if !state.store.open_case_verdict_delivered(case_id)? {
-        return Err(Error::CaseState(
-            "the opening verdict has not reached the interface; banning before notice would run \
-             the response window silently"
+    // One read. Which notice, and whether waiting will help: a refusal
+    // on shape marks the verdict `undeliverable` and leaves
+    // `delivered = 0` permanently, so this guard then refuses every ban
+    // on the case for the rest of its life. That is the safe direction
+    // and it is not a reason to be unhelpful about it — a moderator
+    // reading "the opening verdict has not reached the interface" on a
+    // case that will never clear has no way to tell a queue from a dead
+    // end.
+    match state.store.notice_delivery(case_id)? {
+        NoticeDelivery::AllDelivered => Ok(()),
+        NoticeDelivery::NoneIssued => Err(Error::CaseState(
+            "no notice has been issued for this case, so the accused has never been served; \
+             banning would run the response window silently"
                 .into(),
-        ));
+        )),
+        NoticeDelivery::Queued(refs) => Err(Error::CaseState(format!(
+            "notice {} has not reached the interface yet, so the accused has not been served; \
+             banning now would run the response window silently. It is still queued — no action \
+             is needed beyond letting delivery finish.",
+            refs.join(", ")
+        ))),
+        // One URL per stuck ref. Listing every ref and then a single
+        // URL built from the first left a moderator with two problems
+        // and one instruction, having to infer the rest.
+        NoticeDelivery::GivenUp(refs) => Err(Error::CaseState(format!(
+            "this case cannot be banned: {} {} refused by the interface and given up on, so the \
+             accused has never been served. Banning would run the response window silently. \
+             Repair the interface, then requeue — this will not happen on its own: {}",
+            if refs.len() == 1 { format!("notice {}", refs[0]) } else { format!("notices {}", refs.join(", ")) },
+            if refs.len() == 1 { "was" } else { "were" },
+            refs.iter()
+                .map(|reference| format!("POST /v1/verdicts/{reference}/requeue"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ))),
     }
-    Ok(())
 }
 
 /// Once the decision deadline passes the case is dismissed by default

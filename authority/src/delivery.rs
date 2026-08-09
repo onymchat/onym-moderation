@@ -19,13 +19,80 @@ use crate::util;
 /// re-attempted every stuck verdict, inflating their counts. The sweep
 /// remains the reliable path; this only lets a fresh verdict leave
 /// promptly when the interface is healthy.
+///
+/// **Single-flight, and re-armed.** Spawning one of these per report
+/// and per decision moved the problem rather than solving it: with a
+/// slow interface the tasks overlap, each drains the same backlog, and
+/// the same verdicts are re-POSTed by several flushes at once —
+/// inflating `attempts`, which is the number the refusal budget and the
+/// operator both read.
+///
+/// So one background drain runs at a time. But a call arriving while
+/// one is in flight cannot simply be dropped: `flush` snapshots the
+/// backlog once, before its loop, so a verdict enqueued after that
+/// snapshot is invisible to the drain already running. Dropping the
+/// call would leave a fresh notice waiting for the sweep —
+/// `deadline_sweep_secs` is 300 — on a *healthy* interface, which is
+/// precisely the case this function exists to serve. The call instead
+/// re-arms the running drain, which goes round again.
 pub fn flush_soon(state: &std::sync::Arc<crate::state::AppState>) {
+    use std::sync::atomic::Ordering;
+
+    if state.delivery.flush_in_flight.swap(true, Ordering::AcqRel) {
+        state.delivery.flush_again.store(true, Ordering::Release);
+        return;
+    }
+
     let state = std::sync::Arc::clone(state);
     tokio::spawn(async move {
-        if let Err(e) = state.delivery.flush(&state.store).await {
-            tracing::warn!(error = %e, "background verdict delivery failed; the sweep will retry");
+        {
+            let _gate = FlushGate(std::sync::Arc::clone(&state));
+            loop {
+                if let Err(e) = state.delivery.flush(&state.store).await {
+                    tracing::warn!(
+                        error = %e,
+                        "background verdict delivery failed; the sweep will retry"
+                    );
+                }
+                // Only set by a caller that found the gate closed, so
+                // this loops when there is genuinely new work and never
+                // spins on a backlog that is merely failing to drain.
+                if !state.delivery.flush_again.swap(false, Ordering::AcqRel) {
+                    break;
+                }
+            }
+        }
+        // The gate is down now. A call landing between the last check
+        // and the drop set the flag with nobody left to read it, and
+        // would otherwise wait for the sweep — so consume it and start
+        // a fresh cycle. Terminates: the flag is only ever set by a
+        // call that lost the gate.
+        if state.delivery.flush_again.swap(false, Ordering::AcqRel) {
+            flush_soon(&state);
         }
     });
+}
+
+/// Releases the single-flight gate however the drain ends.
+///
+/// A straight-line `store(false)` after the `.await` covered errors and
+/// not panics, and the panic case is the one that matters: every
+/// `Store` method takes `conn.lock().unwrap()`, so a single panic under
+/// that lock poisons the mutex and *every* subsequent `flush` panics
+/// too. `tokio::spawn` swallows the unwind into a `JoinError` nobody
+/// reads, leaving the flag pinned true for the life of the process —
+/// exactly the failure the straight-line release was written to
+/// prevent, with exactly the symptom it predicted: verdicts leaving
+/// only on the sweep's clock, looking like a slow interface.
+struct FlushGate(std::sync::Arc<crate::state::AppState>);
+
+impl Drop for FlushGate {
+    fn drop(&mut self) {
+        self.0
+            .delivery
+            .flush_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -68,6 +135,15 @@ pub struct Delivery {
     /// when those exact bytes still hash to the mandate's reference.
     published_manifest: String,
     published_manifest_hash: String,
+    /// Whether a `flush_soon` task is already draining the backlog.
+    /// The sweep's own `flush` is deliberately not gated by this — it
+    /// is the reliable path and must run on its own clock.
+    pub flush_in_flight: std::sync::atomic::AtomicBool,
+    /// Set by a `flush_soon` call that found the gate closed. `flush`
+    /// snapshots its backlog before its loop, so the drain in progress
+    /// cannot see what that caller enqueued; this asks it to go round
+    /// again rather than leaving the new verdict to the sweep.
+    pub flush_again: std::sync::atomic::AtomicBool,
 }
 
 impl Delivery {
@@ -81,6 +157,8 @@ impl Delivery {
             token,
             published_manifest: util::base64_encode(manifest_raw),
             published_manifest_hash: util::sha256_hex(manifest_raw),
+            flush_in_flight: std::sync::atomic::AtomicBool::new(false),
+            flush_again: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

@@ -11,6 +11,22 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
+/// Where a case's notices stand — the whole answer, read under one
+/// lock, so a delivery landing mid-diagnosis cannot produce a refusal
+/// that contradicts itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoticeDelivery {
+    /// No notice has been issued for this case at all.
+    NoneIssued,
+    /// Every notice has reached the interface.
+    AllDelivered,
+    /// Still queued, nothing given up on. Waiting is the right move.
+    Queued(Vec<String>),
+    /// At least one notice the interface refuses. This case will not
+    /// clear on its own.
+    GivenUp(Vec<String>),
+}
+
 /// How many columns `CASE_COLUMNS` selects. Any query that appends its
 /// own columns indexes from here, so adding a case field cannot quietly
 /// shift a later read onto the wrong one — which is exactly what
@@ -1830,15 +1846,68 @@ impl Store {
     ///
     /// A case with no notice at all answers `false`: there is nothing
     /// to have been served.
+    /// Test-only now. The guard reads `notice_delivery` instead, which
+    /// answers this *and* names what is stuck in the same query —
+    /// asking both separately was two lock acquisitions and a race.
+    #[cfg(test)]
     pub fn open_case_verdict_delivered(&self, case_id: &str) -> Result<bool, Error> {
+        Ok(self.notice_delivery(case_id)? == NoticeDelivery::AllDelivered)
+    }
+
+    /// Where this case's notices stand, in one read.
+    ///
+    /// `open_case_verdict_delivered` answers yes-or-no, which is the
+    /// right guard and a useless diagnosis. A notice the interface
+    /// refuses on shape is marked `undeliverable` and keeps
+    /// `delivered = 0` forever, so the guard refuses every ban on that
+    /// case for the rest of its life while the error said only that
+    /// "the opening verdict has not reached the interface" — true, and
+    /// no help at all in finding the ref that is stuck or knowing that
+    /// `/v1/verdicts/:ref/requeue` is the way out.
+    ///
+    /// One query, not a yes-or-no followed by a lookup. Those were two
+    /// lock acquisitions, and a flush marking the last notice delivered
+    /// in between produced a refusal that asserted the case had *no*
+    /// notice — the most confusing possible wording for a
+    /// retry-and-it-works race, on a case that had just been served.
+    pub fn notice_delivery(&self, case_id: &str) -> Result<NoticeDelivery, Error> {
         let conn = self.conn.lock().unwrap();
-        let (total, delivered): (i64, i64) = conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(delivered), 0) FROM verdicts
-              WHERE case_id = ?1 AND disposition = 'open-case'",
-            params![case_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+        let mut statement = conn.prepare(
+            "SELECT verdict_ref, delivered, undeliverable FROM verdicts
+              WHERE case_id = ?1 AND disposition = 'open-case'
+              ORDER BY issued_at, verdict_ref",
         )?;
-        Ok(total > 0 && total == delivered)
+        let rows = statement.query_map(params![case_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)? != 0, row.get::<_, i32>(2)? != 0))
+        })?;
+
+        let mut issued = false;
+        let mut queued = Vec::new();
+        let mut given_up = Vec::new();
+        for row in rows {
+            let (reference, delivered, undeliverable) = row?;
+            issued = true;
+            if delivered {
+                continue;
+            }
+            if undeliverable {
+                given_up.push(reference);
+            } else {
+                queued.push(reference);
+            }
+        }
+
+        // Given up on first: a case carrying one of those needs an
+        // operator whatever else is still in the queue behind it.
+        Ok(if !issued {
+            NoticeDelivery::NoneIssued
+        } else if !given_up.is_empty() {
+            NoticeDelivery::GivenUp(given_up)
+        } else if !queued.is_empty() {
+            NoticeDelivery::Queued(queued)
+        } else {
+            NoticeDelivery::AllDelivered
+        })
     }
 
     /// Record a failed delivery. `refused` distinguishes the interface
