@@ -1,0 +1,199 @@
+/* ============================================================
+   moderation authority — panel stylesheet
+   Imported by admin.rs as `include_str!("panel.css")`.
+   sections: 1 tokens · 2 base · 3 chrome · 4 tables/queue
+             5 evidence quarantine · 6 assessment · 7 forms
+   ============================================================ */
+
+/* 1. tokens — light, then dark override */
+:root{
+  color-scheme:light dark;
+  --bg:#f2f2ef;--panel:#ffffff;--ink:#1c1c1e;--mut:#585860;
+  --hair:rgba(20,20,25,.16);--hair-soft:rgba(20,20,25,.08);
+  --focus:#1c1c1e;
+  --overdue:#a02018;--overdue-bg:#faeceb;
+  --soon:#7a5200;--soon-bg:#faf3e2;
+  --hold:#565662;--hold-bg:#ededf0;
+  --warn-ink:#5c3a00;--warn-bg:#fbf1dd;--warn-border:#c9962e;
+  --ev-bg:#efe9dd;--ev-border:#8a7a55;--ev-label:#6b5d3c;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#161618;--panel:#1f1f22;--ink:#ececee;--mut:#a4a4ae;
+    --hair:rgba(235,235,245,.18);--hair-soft:rgba(235,235,245,.08);
+    --focus:#ececee;
+    --overdue:#f2988f;--overdue-bg:#3a1f1c;
+    --soon:#e0b45e;--soon-bg:#332a17;
+    --hold:#b9b9c4;--hold-bg:#2a2a30;
+    --warn-ink:#e8c684;--warn-bg:#33290f;--warn-border:#a67c22;
+    --ev-bg:#26231b;--ev-border:#8a7a55;--ev-label:#c4b183;
+  }
+}
+
+/* 2. base */
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:var(--bg);color:var(--ink);
+  font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+code,.mono,table.queue td.id,.addr{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+a{color:var(--ink);text-underline-offset:3px}
+a:hover{opacity:.7}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.wrap{max-width:1060px;margin:0 auto;padding:0 20px}
+main.wrap{padding-bottom:80px}
+h1{font-size:22px;letter-spacing:-.01em;font-weight:650;margin:34px 0 6px}
+h2{font-size:16px;font-weight:650;margin:44px 0 12px}
+h3{font-size:14.5px;font-weight:650}
+.sub{color:var(--mut);font-size:13.5px;max-width:64ch}
+.k{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--mut);font-weight:600}
+
+/* 3. chrome */
+header.top{border-bottom:1px solid var(--hair);background:var(--panel)}
+header.top .wrap{display:flex;align-items:baseline;gap:18px;height:52px;align-items:center}
+header.top .brand{font-weight:650;font-size:14.5px}
+header.top .brand span{color:var(--mut);font-weight:400}
+header.top nav{margin-left:auto;display:flex;gap:18px;font-size:13.5px;align-items:center}
+header.top nav a{text-decoration:none;color:var(--mut)}
+header.top nav a[aria-current]{color:var(--ink);font-weight:600}
+/* Sign out is a POST, not a link: a session must not end on a GET that
+   something else can trigger. Styled as nav text so it reads as one. */
+header.top nav form{display:inline}
+header.top nav button.linkish{
+  font:inherit;font-size:13.5px;color:var(--mut);background:none;border:0;
+  padding:0;cursor:pointer;text-decoration:underline;text-underline-offset:3px;
+}
+header.top nav button.linkish:hover{opacity:.7}
+.panel{background:var(--panel);border:1px solid var(--hair);border-radius:10px}
+.warnbox{
+  display:flex;gap:12px;align-items:flex-start;
+  background:var(--warn-bg);color:var(--warn-ink);
+  border:1px solid var(--warn-border);border-left-width:4px;
+  border-radius:8px;padding:14px 16px;font-size:14px;max-width:56ch;
+}
+.warnbox b{display:block;margin-bottom:2px}
+
+/* 4. queue tables */
+table.queue{width:100%;border-collapse:collapse;font-size:14px;background:var(--panel);border:1px solid var(--hair);border-radius:10px;overflow:hidden}
+table.queue th{
+  font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--mut);
+  font-weight:600;text-align:left;padding:10px 14px;border-bottom:1px solid var(--hair);
+}
+table.queue td{padding:11px 14px;border-bottom:1px solid var(--hair-soft);vertical-align:top}
+table.queue tr:last-child td{border-bottom:0}
+table.queue td.id a{font-family:inherit}
+/* row cannot be decided yet: de-emphasised, not hidden */
+table.queue tr.held td{color:var(--mut)}
+.badge{display:inline-block;font-size:12px;font-weight:600;border-radius:6px;padding:2px 8px;white-space:nowrap}
+.badge.overdue{color:var(--overdue);background:var(--overdue-bg)}
+.badge.soon{color:var(--soon);background:var(--soon-bg)}
+.badge.hold{color:var(--hold);background:var(--hold-bg)}
+.empty{
+  border:1px dashed var(--hair);border-radius:10px;padding:30px 20px;
+  text-align:center;color:var(--mut);font-size:14px;background:none;
+}
+section.recent{opacity:.75}
+section.recent table.queue{font-size:13px}
+
+/* 5. evidence quarantine
+   everything inside .ev-body was written by a stranger.
+   quarantine = own background family used NOWHERE else, dashed border,
+   corner label, forced monospace, pre-wrap, hard containment. */
+details.ev{border:1.5px dashed var(--ev-border);border-radius:10px;background:var(--ev-bg);margin:12px 0}
+details.ev>summary{
+  list-style:none;cursor:pointer;padding:13px 16px;
+  display:flex;gap:12px;align-items:baseline;font-size:14px;font-weight:600;
+}
+details.ev>summary::-webkit-details-marker{display:none}
+details.ev>summary::before{content:"\25B8 reveal";font-family:ui-monospace,Menlo,monospace;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--ev-label)}
+details.ev[open]>summary::before{content:"\25BE shown"}
+details.ev>summary .meta{color:var(--mut);font-weight:400;font-size:13px}
+.ev-frame{margin:0 12px 12px;border:1px solid var(--ev-border);border-radius:6px;background:var(--panel)}
+.ev-frame .ev-label{
+  display:block;font-family:ui-monospace,Menlo,monospace;font-size:10.5px;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--ev-label);
+  padding:6px 12px;border-bottom:1px dashed var(--ev-border);
+}
+.ev-body{
+  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;line-height:1.55;
+  color:var(--ink);padding:12px;margin:0;
+  white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;
+  max-height:22em;overflow-y:auto;contain:content;
+}
+
+/* 6. automated assessment */
+.assess{padding:18px}
+dl.facts{display:grid;grid-template-columns:max-content 1fr;gap:6px 22px;font-size:13.5px}
+dl.facts dt{color:var(--mut)}
+dl.facts dd{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;overflow-wrap:anywhere}
+table.scores{border-collapse:collapse;font-size:13px;margin-top:14px;min-width:340px}
+table.scores th{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut);text-align:left;font-weight:600;padding:6px 16px 6px 0;border-bottom:1px solid var(--hair)}
+table.scores td{padding:6px 16px 6px 0;border-bottom:1px solid var(--hair-soft);font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
+details.raw{border:1px solid var(--hair);border-radius:8px;margin-top:12px}
+details.raw>summary{cursor:pointer;padding:10px 14px;font-size:13.5px;font-weight:600;list-style:none}
+details.raw>summary::-webkit-details-marker{display:none}
+details.raw>summary::after{content:" +";color:var(--mut)}
+details.raw[open]>summary::after{content:" \2212"}
+details.raw pre{
+  font-size:12px;line-height:1.55;padding:12px 14px;border-top:1px solid var(--hair-soft);
+  white-space:pre-wrap;overflow-wrap:anywhere;max-height:26em;overflow-y:auto;color:var(--mut);
+}
+
+/* 7. history + review forms */
+table.hist{width:100%;border-collapse:collapse;font-size:13.5px}
+table.hist td{padding:8px 14px 8px 0;border-bottom:1px solid var(--hair-soft);vertical-align:top}
+table.hist td.at{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:var(--mut);white-space:nowrap}
+table.hist td.ev-name{font-weight:600;white-space:nowrap}
+
+form.review{padding:18px;display:flex;flex-direction:column;gap:14px}
+form.review .sub{font-size:13px}
+/* the two outcomes: identical radio cards, no default, no colour bias */
+.outcomes{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media(max-width:620px){.outcomes{grid-template-columns:1fr}}
+.outcomes label{
+  border:1.5px solid var(--hair);border-radius:8px;padding:13px 14px;
+  display:flex;gap:10px;align-items:flex-start;cursor:pointer;font-size:14px;font-weight:550;
+}
+.outcomes label small{display:block;font-weight:400;color:var(--mut);margin-top:2px}
+.outcomes input{accent-color:var(--ink);margin-top:3px}
+.outcomes label:has(input:checked){border-color:var(--ink)}
+label.field{font-size:13px;color:var(--mut)}
+input.addr{
+  width:100%;margin-top:5px;background:var(--bg);border:1px solid var(--hair);
+  border-radius:8px;padding:10px 12px;font-size:13px;color:var(--ink);
+}
+input.addr::placeholder{color:var(--mut);opacity:.8}
+button.sign{
+  align-self:flex-start;font:inherit;font-size:14px;font-weight:600;cursor:pointer;
+  background:var(--ink);color:var(--bg);border:1.5px solid var(--ink);
+  border-radius:8px;padding:10px 18px;
+}
+button.sign:hover{opacity:.85}
+
+/* sign-in */
+.gate{min-height:100svh;display:grid;place-items:center;padding:20px}
+.gate form{width:min(420px,100%);display:flex;flex-direction:column;gap:16px;padding:26px}
+.error{color:var(--overdue);font-weight:600;font-size:13.5px}
+
+/* ------------------------------------------------------------
+   Screens not yet redesigned: the case file still renders the
+   pre-design markup. These keep it legible under the new tokens
+   until `moderator/case-*.html` is implemented, and should be
+   deleted wholesale at that point rather than extended.
+   ------------------------------------------------------------ */
+table.facts{width:100%;border-collapse:collapse;font-size:14px;background:var(--panel);border:1px solid var(--hair);border-radius:10px;overflow:hidden}
+table.facts th{width:14rem;text-align:left;font-weight:600;color:var(--mut);padding:9px 14px;border-bottom:1px solid var(--hair-soft)}
+table.facts td{padding:9px 14px;border-bottom:1px solid var(--hair-soft)}
+table.facts tr:last-child th,table.facts tr:last-child td{border-bottom:0}
+pre.evidence{
+  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;line-height:1.55;
+  white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;padding:12px;
+  background:var(--ev-bg);border:1.5px dashed var(--ev-border);border-radius:8px;
+  max-height:22em;overflow-y:auto;contain:content;
+}
+pre.mono{
+  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.55;
+  white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;background:var(--panel);
+  border:1px solid var(--hair);border-radius:8px;max-height:26em;overflow-y:auto;color:var(--mut);
+}
