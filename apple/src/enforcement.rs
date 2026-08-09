@@ -219,6 +219,14 @@ impl Engine {
 
         let grant: RecoveryGrant = serde_json::from_slice(grant_raw)
             .map_err(|e| Error::BadRequest(format!("malformed recovery grant: {e}")))?;
+        if grant.grant_version != 1 {
+            // A grant minted under semantics this build does not
+            // implement must not redeem under the ones it does.
+            return Err(Error::BadRequest(format!(
+                "unsupported grantVersion {} (this interface implements 1)",
+                grant.grant_version
+            )));
+        }
         if grant.grantee != user_key {
             return Err(Error::SignatureInvalid(
                 "the grant was not issued to this identity".into(),
@@ -241,10 +249,14 @@ impl Engine {
             return Err(Error::BadRequest("this grant has already been redeemed".into()));
         }
 
+        // Everything from here to a verified signature answers with
+        // ONE refusal. Verification needs the case (the operator key
+        // comes from the case's consented manifest, so the order can't
+        // flip), and distinguishable answers on the way — "no such
+        // case" vs "bad signature" — would let a garbage-signed grant
+        // probe which cases this interface holds records for.
         let Some(from_binding) = self.store.binding_for_case(&grant.case_id)? else {
-            return Err(Error::BadRequest(
-                "the grant names a case this interface holds no record for".into(),
-            ));
+            return Err(Self::grant_refused());
         };
 
         // The verifying key comes from the consented manifest pinned by
@@ -287,33 +299,22 @@ impl Engine {
             }
         }
 
-        if from_binding != to_binding {
-            let stamp = util::format_timestamp(now);
-            let moved = self.store.adopt_binding(
-                &grant_ref,
-                &grant.case_id,
-                &from_binding,
-                &to_binding,
-                &stamp,
-            )?;
-            // The move goes in the write log: it changes what the next
-            // write is authorized by, and an audit that cannot see it
-            // cannot follow the chain of custody from the verdict to
-            // the bits it clears. This row records no bit write — the
-            // outcome says so explicitly so a reader of the log never
-            // mistakes it for one.
-            self.store.append_write_log(
-                &to_binding,
-                &format!("recovery-grant:{grant_ref}"),
-                bits.case_open,
-                bits.banned,
-                &format!(
-                    "record move only, no bits written: adopted {} case(s) from {from_binding}",
-                    moved.len()
-                ),
-                &stamp,
-            )?;
-        }
+        // The move and the redemption commit together; the recoveries
+        // table is the audit trail for both (grant, case, from, to).
+        // Deliberately NOT a write-log row: that log's columns mean
+        // "bits written", and a row there authorized by a grant would
+        // read, column-wise, as a grant writing a mark. The clearing
+        // write below lands in the write log on the reversal's own
+        // authority, and an auditor joins the two ledgers on the
+        // binding. Redemption is recorded even when nothing moves
+        // (`from == to`): single-use is unconditional.
+        self.store.adopt_binding(
+            &grant_ref,
+            &grant.case_id,
+            &from_binding,
+            &to_binding,
+            &util::format_timestamp(now),
+        )?;
 
         // Ordinary reconciliation now resolves the moved record and
         // performs the clearing write on the verdicts' own authority,
@@ -322,11 +323,24 @@ impl Engine {
         Ok(RecoveryResult::Recovered { gate })
     }
 
+    /// The one refusal for everything between "the grant parsed" and
+    /// "the operator signature verified": unknown case, no consented
+    /// manifest, authority mismatch, malformed or wrong signature.
+    /// One shape, one status — a distinguishable step would be an
+    /// existence probe for case records.
+    fn grant_refused() -> Error {
+        Error::SignatureInvalid(
+            "the grant did not verify against any record this interface holds".into(),
+        )
+    }
+
     /// Verify a grant against the operator key of the authority the
     /// case's consented manifest names. The manifest travels with the
     /// first delivered verdict and is pinned by the mandate's hash, so
     /// this is the key the user consented to — not one the grant, the
     /// claimant, or even this interface's configuration could swap.
+    ///
+    /// Every refusal on this path is `grant_refused()` — see there.
     fn verify_grant_signature(
         &self,
         grant: &RecoveryGrant,
@@ -338,20 +352,14 @@ impl Engine {
             .iter()
             .find(|v| v.case_id == grant.case_id)
             .map(|v| v.mandate_ref.clone())
-            .ok_or_else(|| {
-                Error::BadRequest("the grant names a case this interface holds no record for".into())
-            })?;
+            .ok_or_else(Self::grant_refused)?;
         let Some(manifest_raw) = self.store.manifest_for_mandate(&mandate_ref)? else {
-            return Err(Error::BadRequest(
-                "no consented manifest on file for the case's mandate".into(),
-            ));
+            return Err(Self::grant_refused());
         };
         let manifest: crate::types::AuthorityManifest = serde_json::from_slice(&manifest_raw)
             .map_err(|e| Error::Internal(format!("stored manifest unparseable: {e}")))?;
         if manifest.component_id != grant.authority {
-            return Err(Error::SignatureInvalid(
-                "the grant names a different authority than the case's consented manifest".into(),
-            ));
+            return Err(Self::grant_refused());
         }
         let key_bytes: [u8; 32] = util::key_bytes_from_reference(&manifest.operator_key)
             .and_then(|b| b.try_into().ok())
@@ -360,15 +368,12 @@ impl Engine {
             })?;
         let key = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes)
             .map_err(|e| Error::Internal(format!("consented manifest operator key: {e}")))?;
-        let raw_signature = util::base64_decode(&grant.signature)
-            .ok_or_else(|| Error::BadRequest("grant signature is not base64".into()))?;
+        let Some(raw_signature) = util::base64_decode(&grant.signature) else {
+            return Err(Self::grant_refused());
+        };
         let signature = ed25519_dalek::Signature::from_slice(&raw_signature)
-            .map_err(|e| Error::BadRequest(format!("grant signature is malformed: {e}")))?;
-        key.verify_strict(signing_bytes, &signature).map_err(|_| {
-            Error::SignatureInvalid(
-                "grant signature did not verify against the consented operator key".into(),
-            )
-        })
+            .map_err(|_| Self::grant_refused())?;
+        key.verify_strict(signing_bytes, &signature).map_err(|_| Self::grant_refused())
     }
 
     /// Fold this device's verdicts into the marks they currently
