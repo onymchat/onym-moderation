@@ -181,23 +181,23 @@ impl Store {
             -- Redeemed recovery grants — the move ledger. A grant is a
             -- moderator-signed authorization to move one case's record
             -- to a new identity's enrollment; recording its reference
-            -- here is what makes it single-use, and the from/to pair
-            -- is the audit trail for the move itself. `case_id` is the
-            -- grant's *named* case — the moderator's justification —
-            -- while `moved_cases` lists every case whose verdicts the
-            -- whole-binding move actually carried, so an auditor is
-            -- never left inferring the scope from the named case alone.
-            -- The write log stays strictly "bits written": the clearing
-            -- write that follows an adoption lands there separately,
-            -- authorized by the reversal already on file.
+            -- here is what makes it single-use. The move is scoped to
+            -- the grant's named `case_id`, so that column fully
+            -- describes what travelled, and `from_binding` is what
+            -- `binding_for_case` treats as superseded once a later
+            -- verdict re-lands on it. This table is the single-use
+            -- guard and the interface's operational record of the move;
+            -- the moderator's *authorization* of it is recorded on the
+            -- authority's own case-event ledger (`recovery_grant_issued`).
             CREATE TABLE IF NOT EXISTS recoveries (
                 grant_ref    TEXT PRIMARY KEY,
                 case_id      TEXT NOT NULL,
-                moved_cases  TEXT NOT NULL,
                 from_binding TEXT NOT NULL,
                 to_binding   TEXT NOT NULL,
                 recovered_at TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS recoveries_from
+                ON recoveries (from_binding);
 
             -- Append-only. Nothing in the service updates or deletes a
             -- row here; `previous_hash` chains them so removal shows.
@@ -582,47 +582,65 @@ impl Store {
         for row in rows {
             bindings.push(row?);
         }
+        if bindings.len() > 1 {
+            // A recovered case legitimately names two bindings for a
+            // while: its verdicts moved to the new one, and a later
+            // verdict the authority still signs for the old binding
+            // re-lands there (the mandate did not move). That is
+            // expected, not corruption — drop any binding a recovery
+            // has since superseded, and see whether one governing
+            // binding remains.
+            let mut superseded = conn.prepare(
+                "SELECT 1 FROM recoveries WHERE from_binding = ?1 LIMIT 1",
+            )?;
+            bindings.retain(|binding| {
+                !superseded
+                    .exists(params![binding])
+                    .unwrap_or(false)
+            });
+        }
         match bindings.len() {
             0 => Ok(None),
             1 => Ok(bindings.pop()),
             n => {
-                tracing::error!(%case_id, bindings = n, "case names more than one device binding");
+                // More than one *live* binding after dropping recovered
+                // ones is a genuine inconsistency worth an alarm.
+                tracing::error!(%case_id, bindings = n, "case names more than one live device binding");
                 Ok(None)
             }
         }
     }
 
     /// Move the stored verdicts bound to `from` onto `to`, and redeem
-    /// the grant that authorized it, in one transaction. Returns the
-    /// distinct case ids the move carried.
+    /// the grant that authorized it, in one transaction.
     ///
-    /// **Only the verdicts move, not the mandate.** The authority signs
-    /// `deviceBinding` inside every verdict — always the original
-    /// binding, because the authority does not know a device changed
-    /// hands here — and ingest refuses a verdict whose signed binding
-    /// disagrees with its mandate row (`verdict.rs`). Rewriting the
-    /// mandate's binding would therefore make the case's *next* signed
-    /// verdict fail ingest outright, which is worse than the stranding
-    /// it was meant to cure. It is safe to leave the mandate because
-    /// recovery only ever runs against a fully terminal binding (see
-    /// `Engine::recover`): a reversed or expired case receives no
-    /// further governing verdict, so nothing new is left routed to the
-    /// old binding. Moving the existing terminal verdicts is enough for
-    /// reconciliation on the new binding to clear the device.
+    /// **Only the named case's verdicts move**, and only the verdicts —
+    /// not the mandate. Scoping to `case_id` is what keeps the server's
+    /// effect inside the moderator's authorization: the grant names one
+    /// case, the moderator reviewed one case, and exactly that case's
+    /// verdicts travel. Other (terminal) cases on the same binding stay
+    /// put; the terminal-only guard in `Engine::recover` guarantees
+    /// none of them carries a live mark, so leaving them behind strands
+    /// nothing.
+    ///
+    /// The mandate stays because the authority signs `deviceBinding`
+    /// inside every verdict — always the original binding, since it
+    /// never learns the device changed hands — and ingest refuses a
+    /// verdict whose signed binding disagrees with its mandate row
+    /// (`verdict.rs`). Rewriting the mandate's binding would make the
+    /// case's *next* signed verdict fail ingest outright. Leaving it is
+    /// safe under the same terminal-only guard.
     ///
     /// The redemption row is written even when `from == to` (a holder
     /// whose enrollment already resolves the record): "single-use" is
-    /// unconditional, not "single-use when a move happened". This
-    /// table is the move ledger — the write log records only bit
-    /// writes, and the clearing write that follows an adoption lands
-    /// there on the reversal's own authority.
+    /// unconditional, not "single-use when a move happened".
     ///
-    /// Returns `Ok(None)` when the grant was already redeemed —
-    /// including the race where two fresh sessions clear the
-    /// `grant_redeemed` pre-check and arrive together: the redemption
-    /// `INSERT` is the single serialization point (`ON CONFLICT DO
-    /// NOTHING`), and the loser moves nothing and reports the same
-    /// "already redeemed" refusal rather than a primary-key 500.
+    /// Returns `false` when the grant was already redeemed — including
+    /// the race where two fresh sessions clear the `grant_redeemed`
+    /// pre-check and arrive together: the redemption `INSERT` is the
+    /// single serialization point (`ON CONFLICT DO NOTHING`), and the
+    /// loser moves nothing and reports the same "already redeemed"
+    /// refusal rather than a primary-key 500.
     pub fn adopt_binding(
         &self,
         grant_ref: &str,
@@ -630,45 +648,31 @@ impl Store {
         from: &str,
         to: &str,
         now: &str,
-    ) -> Result<Option<Vec<String>>, Error> {
+    ) -> Result<bool, Error> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| Error::Internal(format!("begin adoption: {e}")))?;
 
-        // The scope of the move, recorded so the ledger names every
-        // case that travelled, not only the grant's named one.
-        let moved: Vec<String> = {
-            let mut statement =
-                tx.prepare("SELECT DISTINCT case_id FROM verdicts WHERE device_binding = ?1")?;
-            let rows = statement.query_map(params![from], |row| row.get::<_, String>(0))?;
-            let mut cases = Vec::new();
-            for row in rows {
-                cases.push(row?);
-            }
-            cases
-        };
-        let moved_cases = moved.join(",");
-
         let redeemed = tx.execute(
-            "INSERT INTO recoveries
-                 (grant_ref, case_id, moved_cases, from_binding, to_binding, recovered_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO recoveries (grant_ref, case_id, from_binding, to_binding, recovered_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(grant_ref) DO NOTHING",
-            params![grant_ref, case_id, moved_cases, from, to, now],
+            params![grant_ref, case_id, from, to, now],
         )?;
         if redeemed == 0 {
             // Someone else redeemed this grant; the transaction rolls
             // back on drop, moving nothing.
-            return Ok(None);
+            return Ok(false);
         }
+        // Scoped to the named case: exactly what the grant authorized.
         tx.execute(
-            "UPDATE verdicts SET device_binding = ?2 WHERE device_binding = ?1",
-            params![from, to],
+            "UPDATE verdicts SET device_binding = ?2 WHERE device_binding = ?1 AND case_id = ?3",
+            params![from, to, case_id],
         )?;
         tx.commit()
             .map_err(|e| Error::Internal(format!("commit adoption: {e}")))?;
-        Ok(Some(moved))
+        Ok(true)
     }
 
     /// Every verdict for a device, newest **decided** first.
