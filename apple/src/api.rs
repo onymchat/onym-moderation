@@ -10,7 +10,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, VerifyingKey};
 use serde::Serialize;
 use serde_json::{json, Value};
 use time::OffsetDateTime;
@@ -30,7 +30,7 @@ const MAX_MANDATE_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 pub struct AppState {
     pub config: Config,
     pub engine: Engine,
-    pub signing_key: SigningKey,
+    pub countersigning: crate::countersigning::CountersigningKeys,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -50,7 +50,10 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
         "deviceCheck": state.config.device_check_configured(),
         "enforceSignatures": state.config.enforce_signatures,
         "interface": state.config.interface_component_id,
-        "interfaceKey": util::key_reference(state.signing_key.verifying_key().as_bytes()),
+        "interfaceKey": state.countersigning.root_reference(),
+        "rotatedInterfaceKeys": state.countersigning.rotated().into_iter()
+            .map(|(authority, (epoch, reference))| (authority.to_string(), serde_json::json!({"epoch": epoch, "key": reference})))
+            .collect::<serde_json::Map<_, _>>(),
     }))
 }
 
@@ -135,7 +138,10 @@ async fn countersign(
         }
     }
 
-    let signature = state.signing_key.sign(&signing_bytes);
+    // Keyed on the authority this mandate names, so rotating one
+    // relationship does not invalidate the countersignatures held by
+    // every other authority.
+    let signature = state.countersigning.signing_key(&mandate.authority).sign(&signing_bytes);
     let mandate_ref = util::sha256_hex(&signing_bytes);
     let now = util::format_timestamp(OffsetDateTime::now_utc());
 

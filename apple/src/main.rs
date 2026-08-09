@@ -13,6 +13,7 @@
 mod api;
 mod canonical;
 mod config;
+mod countersigning;
 mod devicecheck;
 mod enforcement;
 mod error;
@@ -25,7 +26,6 @@ mod verdict;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use ed25519_dalek::SigningKey;
 
 use api::AppState;
 use config::Config;
@@ -91,18 +91,26 @@ async fn main() {
         );
     }
 
-    let signing_key = SigningKey::from_bytes(&config.interface_signing_seed);
+    let countersigning = countersigning::CountersigningKeys::new(
+        config.interface_signing_seed,
+        config.interface_key_epochs.clone(),
+    );
     tracing::info!(
         interface = %config.interface_component_id,
-        key = %util::key_reference(signing_key.verifying_key().as_bytes()),
-        "interface countersigning key"
+        key = %countersigning.root_reference(),
+        "interface countersigning key (authorities with no epoch configured)"
     );
+    // Named individually, because an authority whose key has been
+    // rotated needs the new value and there is nowhere else to read it.
+    for (authority, (epoch, reference)) in countersigning.rotated() {
+        tracing::info!(%authority, %epoch, key = %reference, "rotated countersigning key");
+    }
 
     let bind_addr = config.bind_addr.clone();
     let state = Arc::new(AppState {
         config,
         engine: Engine { store, device_check },
-        signing_key,
+        countersigning,
     });
 
     let app = api::router(state).layer(tower_http::limit::RequestBodyLimitLayer::new(256 * 1024));

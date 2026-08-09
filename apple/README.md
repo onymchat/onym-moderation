@@ -94,6 +94,62 @@ These are the ones worth checking a reimplementation against:
   faithfully (§8 gap 3) — until an auditor actually attests a
   deployment, it remains a paper control.
 
+## Countersigning keys, and rotating one
+
+The interface countersigns a mandate to say it witnessed *this user*
+consenting to *that authority*. `MODERATION_INTERFACE_SIGNING_SEED` is
+the root of those signatures, and its public half is what an authority
+puts in its `AUTHORITY_INTERFACE_KEY`.
+
+One key for every authority made rotation all-or-nothing: changing the
+seed invalidated every countersignature ever issued, to every
+authority, at once — so a key you suspected was compromised was a key
+you were stuck with. Keys are now **per authority**, derived from the
+root and a per-authority epoch:
+
+```
+epoch 0  →  the root seed itself, underived
+epoch n  →  SHA-256(domain ‖ root ‖ componentId ‖ 0x00 ‖ n)
+```
+
+`MODERATION_INTERFACE_KEY_EPOCHS` sets the epochs, as
+`<componentId>=<epoch>` pairs. **An authority you have never rotated
+needs no entry**: epoch 0 is the root key, unchanged, so adopting this
+costs no coordination with anyone already configured.
+
+### What it does and does not protect
+
+It buys **rotation and revocation** — burning one relationship without
+touching the others.
+
+It does **not** contain a compromise, and it would be a mistake to
+believe otherwise. The private seed never leaves this process;
+authorities receive only public keys, so no authority can leak it. The
+realistic compromise is this host, and every derived key lives in the
+same memory as the root. That is also why the keys are derived rather
+than stored as N independent secrets: N secrets to generate, back up
+and not lose, in exchange for containment the design does not provide.
+
+### Rotating
+
+Order matters — the authority must be expecting the new key before you
+start signing with it, or every registration in the gap is refused.
+
+1. Compute the next epoch's key without deploying it. Bump the epoch in
+   a scratch environment and read `rotatedInterfaceKeys` from `/health`,
+   or derive it offline with the formula above.
+2. Give that value to the authority operator; they set it as their
+   `AUTHORITY_INTERFACE_KEY` and restart.
+3. Bump the epoch here and deploy.
+
+Mandates countersigned under the old epoch stop verifying at step 3.
+That is the point of rotating, and it is why you would only do it for a
+key you no longer trust or an authority you are de-listing — not as
+routine hygiene.
+
+`/health` reports the root key as `interfaceKey` and every rotated
+authority under `rotatedInterfaceKeys`.
+
 ## Cross-implementation agreement
 
 The signed session payloads are reconstructed here from exactly the
