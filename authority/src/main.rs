@@ -52,23 +52,7 @@ use store::Store;
 /// this locally, against their own secret, and the only thing that
 /// leaves is a public key.
 fn derive_operator_key() -> ! {
-    let Ok(hex_seed) = std::env::var("AUTHORITY_SIGNING_SEED") else {
-        eprintln!(
-            "AUTHORITY_SIGNING_SEED is not set.\n\n\
-             Generate one with `openssl rand -hex 32` and keep it in a secret store. It signs \
-             every verdict this authority issues, so rotating it later invalidates all of them \
-             — treat it as long-lived from the start."
-        );
-        std::process::exit(1);
-    };
-    let seed: [u8; 32] = match hex::decode(hex_seed.trim()).ok().and_then(|raw| raw.try_into().ok())
-    {
-        Some(seed) => seed,
-        None => {
-            eprintln!("AUTHORITY_SIGNING_SEED must be 32 bytes as 64 hex characters.");
-            std::process::exit(1);
-        }
-    };
+    let seed = seed_from_env();
     // Bare on stdout, so it can be piped straight into the manifest.
     println!("{}", operator_key_for(&seed));
     std::process::exit(0);
@@ -85,6 +69,64 @@ fn operator_key_for(seed: &[u8; 32]) -> String {
     util::key_reference(key.verifying_key().as_bytes())
 }
 
+/// Sign a file's exact bytes with `AUTHORITY_SIGNING_SEED` and print
+/// the detached Ed25519 signature as base64, and nothing else.
+///
+/// This exists so a deployment can publish `manifest.json.sig` next to
+/// the manifest it materialized: clients verify the manifest's exact
+/// bytes against the directory-pinned operator key before trusting the
+/// terms inside, and without the detached signature they can only
+/// accept it soft-verified. Like `derive-operator-key`, the seed never
+/// leaves its secret store — the operator runs this against their own
+/// secret and the only thing that comes out is a signature over bytes
+/// that were already public.
+///
+/// Signing is deliberately over the file's raw bytes, not a parsed or
+/// re-encoded form: mandates pin the manifest's exact bytes, and the
+/// signature must cover the same artifact.
+fn sign_manifest(path: &str) -> ! {
+    use ed25519_dalek::Signer;
+
+    let seed = seed_from_env();
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("could not read {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    if bytes.is_empty() {
+        eprintln!("{path} is empty; refusing to sign an empty manifest.");
+        std::process::exit(1);
+    }
+    let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let signature = key.sign(&bytes);
+    // Bare on stdout, so it can be piped straight into the `.sig` file.
+    println!("{}", util::base64_encode(&signature.to_bytes()));
+    std::process::exit(0);
+}
+
+/// `AUTHORITY_SIGNING_SEED` as raw bytes, or a usage error. Shared by
+/// both operator subcommands so their seed handling cannot drift.
+fn seed_from_env() -> [u8; 32] {
+    let Ok(hex_seed) = std::env::var("AUTHORITY_SIGNING_SEED") else {
+        eprintln!(
+            "AUTHORITY_SIGNING_SEED is not set.\n\n\
+             Generate one with `openssl rand -hex 32` and keep it in a secret store. It signs \
+             every verdict this authority issues, so rotating it later invalidates all of them \
+             — treat it as long-lived from the start."
+        );
+        std::process::exit(1);
+    };
+    match hex::decode(hex_seed.trim()).ok().and_then(|raw| raw.try_into().ok()) {
+        Some(seed) => seed,
+        None => {
+            eprintln!("AUTHORITY_SIGNING_SEED must be 32 bytes as 64 hex characters.");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Before anything reads a manifest or opens a store: this
@@ -92,6 +134,13 @@ async fn main() {
     // configured yet.
     if std::env::args().nth(1).as_deref() == Some("derive-operator-key") {
         derive_operator_key();
+    }
+    if std::env::args().nth(1).as_deref() == Some("sign-manifest") {
+        let Some(path) = std::env::args().nth(2) else {
+            eprintln!("usage: onym-moderation-authority sign-manifest <manifest-path>");
+            std::process::exit(1);
+        };
+        sign_manifest(&path);
     }
 
     tracing_subscriber::fmt()
