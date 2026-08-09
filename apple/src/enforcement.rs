@@ -316,7 +316,8 @@ impl Engine {
         }
 
         // The move and the redemption commit together; the recoveries
-        // table is the audit trail for both (grant, case, from, to).
+        // table is the audit trail for both, and records every case the
+        // whole-binding move carried, not only the grant's named one.
         // Deliberately NOT a write-log row: that log's columns mean
         // "bits written", and a row there authorized by a grant would
         // read, column-wise, as a grant writing a mark. The clearing
@@ -326,22 +327,39 @@ impl Engine {
         // (`from == to`): single-use is unconditional. A grant redeemed
         // concurrently loses the `ON CONFLICT` race and answers the
         // same refusal, rather than a 500 on the primary-key clash.
-        let redeemed = self.store.adopt_binding(
+        let Some(moved) = self.store.adopt_binding(
             &grant_ref,
             &grant.case_id,
             &from_binding,
             &to_binding,
             &util::format_timestamp(now),
-        )?;
-        if !redeemed {
+        )?
+        else {
             return Err(Error::BadRequest("this grant has already been redeemed".into()));
-        }
+        };
 
         // Ordinary reconciliation now resolves the moved record and
         // performs the clearing write on the verdicts' own authority,
-        // against the bits already read in this session.
-        let gate = self.reconcile(device_check, device_token, user_key, bits, now).await?;
-        Ok(RecoveryResult::Recovered { gate })
+        // against the bits already read in this session. The grant is
+        // already spent and the record already moved, so a failure here
+        // is not a lost grant: the next ordinary gate check on the new
+        // enrollment finishes the clear. Say exactly that, rather than
+        // let it read as "redeem again".
+        match self.reconcile(device_check, device_token, user_key, bits, now).await {
+            Ok(gate) => Ok(RecoveryResult::Recovered { gate }),
+            Err(Error::MarkWriteFailed(detail)) => {
+                tracing::warn!(
+                    %grant_ref, cases = moved.len(),
+                    "recovery moved the record but the clearing write failed: {detail}"
+                );
+                Err(Error::MarkWriteFailed(
+                    "recovery is recorded and the grant is spent; this device will clear on \
+                     its next verification — do not present the grant again"
+                        .into(),
+                ))
+            }
+            Err(other) => Err(other),
+        }
     }
 
     /// What a binding still carries that recovery must not move or
@@ -425,18 +443,35 @@ impl Engine {
         let Some(manifest_raw) = self.store.manifest_for_mandate(&mandate_ref)? else {
             return Err(Self::grant_refused());
         };
-        let manifest: crate::types::AuthorityManifest = serde_json::from_slice(&manifest_raw)
-            .map_err(|e| Error::Internal(format!("stored manifest unparseable: {e}")))?;
+        // A stored manifest or operator key that will not parse is a
+        // server-data fault, not the caller's — but it is reached only
+        // *after* the case resolved, so a distinguishable 500 here
+        // would still confirm the case exists where every sibling
+        // answers the uniform refusal. Log the detail, answer the same
+        // shape.
+        let manifest: crate::types::AuthorityManifest = match serde_json::from_slice(&manifest_raw) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                tracing::error!(mandate_ref = %mandate_ref, "stored manifest unparseable: {e}");
+                return Err(Self::grant_refused());
+            }
+        };
         if manifest.component_id != grant.authority {
             return Err(Self::grant_refused());
         }
-        let key_bytes: [u8; 32] = util::key_bytes_from_reference(&manifest.operator_key)
-            .and_then(|b| b.try_into().ok())
-            .ok_or_else(|| {
-                Error::Internal("consented manifest operator key is not a 32-byte reference".into())
-            })?;
-        let key = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes)
-            .map_err(|e| Error::Internal(format!("consented manifest operator key: {e}")))?;
+        let Some(key_bytes) =
+            util::key_bytes_from_reference(&manifest.operator_key).and_then(|b| <[u8; 32]>::try_from(b).ok())
+        else {
+            tracing::error!("consented manifest operator key is not a 32-byte reference");
+            return Err(Self::grant_refused());
+        };
+        let key = match ed25519_dalek::VerifyingKey::from_bytes(&key_bytes) {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::error!("consented manifest operator key is not a valid Ed25519 key: {e}");
+                return Err(Self::grant_refused());
+            }
+        };
         let Some(raw_signature) = util::base64_decode(&grant.signature) else {
             return Err(Self::grant_refused());
         };
@@ -1548,15 +1583,22 @@ mod tests {
         struct FakeApple {
             bits: Bits,
             updates: Vec<Bits>,
+            queries: usize,
         }
 
         async fn spawn_fake_apple(initial: Bits) -> (String, Arc<Mutex<FakeApple>>) {
-            let shared = Arc::new(Mutex::new(FakeApple { bits: initial, updates: Vec::new() }));
+            let shared = Arc::new(Mutex::new(FakeApple {
+                bits: initial,
+                updates: Vec::new(),
+                queries: 0,
+            }));
 
             async fn query(
                 AxumState(shared): AxumState<Arc<Mutex<FakeApple>>>,
             ) -> Json<serde_json::Value> {
-                let bits = shared.lock().unwrap().bits;
+                let mut shared = shared.lock().unwrap();
+                shared.queries += 1;
+                let bits = shared.bits;
                 Json(serde_json::json!({ "bit0": bits.case_open, "bit1": bits.banned }))
             }
             async fn update(
@@ -1739,16 +1781,16 @@ mod tests {
             assert_eq!(apple.updates.last(), Some(&Bits::default()));
             assert!(!apple.bits.banned);
 
-            // The record followed the device onto the new enrollment —
-            // verdicts AND the mandate, so the case's next verdict
-            // (ingest binds to the mandate's binding) reaches this
-            // device instead of the abandoned binding.
+            // The verdicts followed the device onto the new enrollment;
+            // the mandate stays put (moving it would break ingest for
+            // the case's next signed verdict — see
+            // `a_later_verdict_still_ingests_because_the_mandate_did_not_move`).
             assert_eq!(engine.store.verdicts_for_device(OLD_BINDING).unwrap().len(), 0);
             assert_eq!(engine.store.verdicts_for_device(&to_binding).unwrap().len(), 2);
             assert_eq!(
                 engine.store.mandate(MANDATE).unwrap().unwrap().device_binding,
-                to_binding,
-                "post-recovery verdicts must not land on the abandoned binding"
+                OLD_BINDING,
+                "the mandate must not move"
             );
 
             // The write log records only bit writes: the clearing
@@ -1761,34 +1803,59 @@ mod tests {
             assert!(log.iter().all(|entry| !entry.authorized_by.starts_with("recovery-grant:")));
         }
 
-        /// The binding-split regression the review caught: with the
-        /// mandate left behind, `binding_for_case` would see two
-        /// bindings after the next delivery and refuse every later
-        /// grant. After a proper move the case still resolves — to the
-        /// new binding.
+        /// The mandate must NOT move — the regression an earlier
+        /// over-correction introduced. The authority signs
+        /// `deviceBinding` inside every verdict, always the original
+        /// binding, and ingest (`verdict::validate`) refuses a verdict
+        /// whose signed binding disagrees with its mandate row. Had
+        /// recovery rewritten the mandate's binding, the case's next
+        /// real verdict would fail that check outright — worse than any
+        /// stranding. This drives a real authority verdict through
+        /// `validate` after recovery and asserts it still ingests.
         #[tokio::test]
-        async fn the_case_still_resolves_to_one_binding_after_recovery() {
+        async fn a_later_verdict_still_ingests_because_the_mandate_did_not_move() {
             let key = operator();
             let (engine, apple) = engine_with_apple(BANNED).await;
             seed_reversed_case(&engine, &key);
-            let to_binding = enroll_claimant(&engine);
+            enroll_claimant(&engine);
 
             let grant_bytes = grant("case-csam", CLAIMANT, "2026-08-09T00:00:00Z", &key);
-            let result =
-                engine.recover(Some("token"), CLAIMANT, &grant_bytes, now()).await.unwrap();
-            assert!(matches!(result, RecoveryResult::Recovered { .. }));
+            engine
+                .recover(Some("token"), CLAIMANT, &grant_bytes, now())
+                .await
+                .unwrap();
 
-            // A verdict delivered after redemption binds to the
-            // mandate's (moved) binding — simulate ingest's binding
-            // choice and confirm the case stays whole.
+            // The mandate stays on the original binding.
             let mandate = engine.store.mandate(MANDATE).unwrap().unwrap();
-            let mut late = verdict("case-csam", Disposition::Dismiss, "csam");
-            late.decided_at = "2026-08-10T00:00:00Z".into();
-            store_verdict_bound(&engine, "late-dup", late, &mandate.device_binding, "2026-08-10T00:00:00Z");
+            assert_eq!(mandate.device_binding, OLD_BINDING, "the mandate must not move");
 
-            assert_eq!(
-                engine.store.binding_for_case("case-csam").unwrap().as_deref(),
-                Some(to_binding.as_str())
+            // A later authority verdict carries the signed binding the
+            // authority has always used — the original one. It must
+            // pass the mandate-binding check the move used to break.
+            let mut late = verdict("case-csam", Disposition::Dismiss, "csam");
+            late.device_binding = OLD_BINDING.into();
+            late.decided_at = "2026-08-08T02:00:00Z".into();
+            let raw = serde_json::to_vec(&late).unwrap();
+            let signing_bytes = canonical::verdict_signing_bytes(&raw).unwrap();
+            let outcome = crate::verdict::validate(crate::verdict::ValidationInput {
+                verdict: &late,
+                signing_bytes: &signing_bytes,
+                mandate_authority: AUTHORITY,
+                // The verdict fixture names this accused key.
+                mandate_user: "onym:key:accused",
+                mandate_device_binding: &mandate.device_binding,
+                mandate_classes: &["csam".to_string()],
+                authority_operator_key: &operator_reference(&key),
+                violation_class: None,
+                now: now(),
+                // Soft mode: this test is about the binding check, not
+                // the signature; a real signature is exercised
+                // elsewhere.
+                enforce_signature: false,
+            });
+            assert!(
+                outcome.is_ok(),
+                "a later verdict for the recovered case must still ingest: {outcome:?}"
             );
             drop(apple);
         }
@@ -2122,16 +2189,12 @@ mod tests {
             assert!(matches!(&refused, Err(Error::SignatureInvalid(_))), "{refused:?}");
         }
 
+        /// Recovery pays for the DeviceCheck query once and reconciles
+        /// on that read; a second query would be a wasted Apple round
+        /// trip and could disagree with the first. The fake counts
+        /// queries directly.
         #[tokio::test]
         async fn recovery_reads_apple_once_and_reconciles_on_that_read() {
-            // A regression guard for the double-query: the fake counts
-            // queries via updates + a query counter would be nicer, but
-            // the observable contract is simpler — recovery must not
-            // fail when the *second* read would disagree, because there
-            // is no second read. We simulate by flipping the fake's
-            // bits to clean immediately after the first query would
-            // have run; if recovery re-queried, it would see a clean
-            // device and refuse to write.
             let key = operator();
             let (engine, apple) = engine_with_apple(BANNED).await;
             seed_reversed_case(&engine, &key);
@@ -2140,8 +2203,10 @@ mod tests {
             let grant_bytes = grant("case-csam", CLAIMANT, "2026-08-09T00:00:00Z", &key);
             let result = engine.recover(Some("token"), CLAIMANT, &grant_bytes, now()).await.unwrap();
             assert!(matches!(result, RecoveryResult::Recovered { .. }));
-            // Exactly one clearing write, driven by the single read.
-            assert_eq!(apple.lock().unwrap().updates.len(), 1);
+
+            let apple = apple.lock().unwrap();
+            assert_eq!(apple.queries, 1, "exactly one DeviceCheck query for the whole recovery");
+            assert_eq!(apple.updates.len(), 1, "exactly one clearing write");
         }
     }
 }

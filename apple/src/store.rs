@@ -182,13 +182,18 @@ impl Store {
             -- moderator-signed authorization to move one case's record
             -- to a new identity's enrollment; recording its reference
             -- here is what makes it single-use, and the from/to pair
-            -- is the audit trail for the move itself. The write log
-            -- stays strictly "bits written": the clearing write that
-            -- follows an adoption lands there separately, authorized
-            -- by the reversal already on file.
+            -- is the audit trail for the move itself. `case_id` is the
+            -- grant's *named* case — the moderator's justification —
+            -- while `moved_cases` lists every case whose verdicts the
+            -- whole-binding move actually carried, so an auditor is
+            -- never left inferring the scope from the named case alone.
+            -- The write log stays strictly "bits written": the clearing
+            -- write that follows an adoption lands there separately,
+            -- authorized by the reversal already on file.
             CREATE TABLE IF NOT EXISTS recoveries (
                 grant_ref    TEXT PRIMARY KEY,
                 case_id      TEXT NOT NULL,
+                moved_cases  TEXT NOT NULL,
                 from_binding TEXT NOT NULL,
                 to_binding   TEXT NOT NULL,
                 recovered_at TEXT NOT NULL
@@ -587,16 +592,23 @@ impl Store {
         }
     }
 
-    /// Move the whole record bound to `from` onto `to` — verdicts
-    /// **and mandates** — and redeem the grant that authorized it, in
-    /// one transaction. The record moves together deliberately: marks
-    /// belong to the device, and moving one case's verdicts alone
-    /// would let a live ban stay behind on a binding nothing resolves
-    /// any more. The mandates move because ingest binds every incoming
-    /// verdict to *its mandate's* binding: leave them behind and the
-    /// case's next verdict — a late redelivery, an appeal outcome —
-    /// lands on the abandoned binding and never reaches the device
-    /// again.
+    /// Move the stored verdicts bound to `from` onto `to`, and redeem
+    /// the grant that authorized it, in one transaction. Returns the
+    /// distinct case ids the move carried.
+    ///
+    /// **Only the verdicts move, not the mandate.** The authority signs
+    /// `deviceBinding` inside every verdict — always the original
+    /// binding, because the authority does not know a device changed
+    /// hands here — and ingest refuses a verdict whose signed binding
+    /// disagrees with its mandate row (`verdict.rs`). Rewriting the
+    /// mandate's binding would therefore make the case's *next* signed
+    /// verdict fail ingest outright, which is worse than the stranding
+    /// it was meant to cure. It is safe to leave the mandate because
+    /// recovery only ever runs against a fully terminal binding (see
+    /// `Engine::recover`): a reversed or expired case receives no
+    /// further governing verdict, so nothing new is left routed to the
+    /// old binding. Moving the existing terminal verdicts is enough for
+    /// reconciliation on the new binding to clear the device.
     ///
     /// The redemption row is written even when `from == to` (a holder
     /// whose enrollment already resolves the record): "single-use" is
@@ -605,12 +617,12 @@ impl Store {
     /// writes, and the clearing write that follows an adoption lands
     /// there on the reversal's own authority.
     ///
-    /// Returns `false` when the grant was already redeemed — including
-    /// the race where two fresh sessions clear the `grant_redeemed`
-    /// pre-check and arrive here together: the redemption `INSERT` is
-    /// the single serialization point (`ON CONFLICT DO NOTHING`), and
-    /// the loser makes no move and reports the same "already redeemed"
-    /// refusal rather than a primary-key 500.
+    /// Returns `Ok(None)` when the grant was already redeemed —
+    /// including the race where two fresh sessions clear the
+    /// `grant_redeemed` pre-check and arrive together: the redemption
+    /// `INSERT` is the single serialization point (`ON CONFLICT DO
+    /// NOTHING`), and the loser moves nothing and reports the same
+    /// "already redeemed" refusal rather than a primary-key 500.
     pub fn adopt_binding(
         &self,
         grant_ref: &str,
@@ -618,33 +630,45 @@ impl Store {
         from: &str,
         to: &str,
         now: &str,
-    ) -> Result<bool, Error> {
+    ) -> Result<Option<Vec<String>>, Error> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| Error::Internal(format!("begin adoption: {e}")))?;
+
+        // The scope of the move, recorded so the ledger names every
+        // case that travelled, not only the grant's named one.
+        let moved: Vec<String> = {
+            let mut statement =
+                tx.prepare("SELECT DISTINCT case_id FROM verdicts WHERE device_binding = ?1")?;
+            let rows = statement.query_map(params![from], |row| row.get::<_, String>(0))?;
+            let mut cases = Vec::new();
+            for row in rows {
+                cases.push(row?);
+            }
+            cases
+        };
+        let moved_cases = moved.join(",");
+
         let redeemed = tx.execute(
-            "INSERT INTO recoveries (grant_ref, case_id, from_binding, to_binding, recovered_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO recoveries
+                 (grant_ref, case_id, moved_cases, from_binding, to_binding, recovered_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(grant_ref) DO NOTHING",
-            params![grant_ref, case_id, from, to, now],
+            params![grant_ref, case_id, moved_cases, from, to, now],
         )?;
         if redeemed == 0 {
             // Someone else redeemed this grant; the transaction rolls
             // back on drop, moving nothing.
-            return Ok(false);
+            return Ok(None);
         }
         tx.execute(
             "UPDATE verdicts SET device_binding = ?2 WHERE device_binding = ?1",
             params![from, to],
         )?;
-        tx.execute(
-            "UPDATE mandates SET device_binding = ?2 WHERE device_binding = ?1",
-            params![from, to],
-        )?;
         tx.commit()
             .map_err(|e| Error::Internal(format!("commit adoption: {e}")))?;
-        Ok(true)
+        Ok(Some(moved))
     }
 
     /// Every verdict for a device, newest **decided** first.

@@ -84,17 +84,36 @@ misdirected token achieves is clearing a ban the authority had already
 lifted.
 
 If the case's record has cleared (reversal, expiry), the stored
-verdicts **and their mandates** are re-bound to the grantee's
-enrollment — the mandates too, because ingest binds each incoming
-verdict to its mandate's binding, so leaving them behind would strand
-the case's next verdict on the abandoned binding. Ordinary
-reconciliation then performs the clearing write; marks still move only
-on the signed verdicts already on file. Recovery refuses outright — no
+verdicts are re-bound to the grantee's enrollment and ordinary
+reconciliation performs the clearing write; marks still move only on
+the signed verdicts already on file. Recovery refuses outright — no
 move, grant unconsumed — if the source binding still carries *any*
 unresolved case: an open case (whose notice must never reach a
 non-party) or a ban not yet reversed or expired, **including one still
 queued behind its `executeAfter`**. A ban on the claimant's own
 binding refuses too. Only a fully cleared binding recovers.
+
+**Only the verdicts move, never the mandate.** The authority signs
+`deviceBinding` inside every verdict — always the original binding,
+since it does not know a device changed hands — and ingest refuses a
+verdict whose signed binding disagrees with its mandate row. Rewriting
+the mandate's binding would therefore make the case's *next* signed
+verdict fail ingest outright, so the mandate stays where it is. This
+is safe precisely because recovery runs only against a fully terminal
+binding: a reversed or expired case has no further governing verdict
+to strand, and a claimant who wants a moderation relationship going
+forward re-consents under their own new binding.
+
+**What this endpoint does not do.** §6's *new-holder claim* is about
+someone who acquired a device that is **still marked** — a live ban
+they want lifted because the device, not they, was the subject. This
+endpoint does not serve that: it refuses on any unresolved ban, so
+`newHolderURL` has no interface path through `recover`. Clearing a
+live ban is the authority's call, not the interface's — the reviewer
+reverses the original verdict (which also clears the former holder's
+record), and only then, with the record terminal, does recovery move
+it to the new holder. `recover` covers the narrower, common case:
+*identity lost after the record had already cleared*.
 
 One receives verdicts from the designated authority:
 

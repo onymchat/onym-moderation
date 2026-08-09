@@ -635,4 +635,86 @@ mod tests {
         assert!(validate_mandate_consent(&[], "2026-08-08T12:00:00Z", now).is_err());
         assert!(validate_mandate_consent(&classes, "2099-01-01T00:00:00Z", now).is_err());
     }
+
+    // ─── POST /v1/recover ────────────────────────────────────────────
+    //
+    // The engine owns redemption; these exercise the handler's own
+    // work, which the engine tests cannot reach: base64-decoding the
+    // grant, and binding the session signature to *this grant's*
+    // reference (its canonical-bytes hash) rather than to some other
+    // payload. The device_check is unconfigured, so a request that
+    // clears the handler lands on the engine's "attestation
+    // unavailable" — which is exactly the signal that it cleared.
+
+    fn recover_request(
+        user: &SigningKey,
+        grant_raw: &[u8],
+        sign_over_ref: &str,
+        timestamp: &str,
+    ) -> RecoveryRequest {
+        let user_ref = util::key_reference(user.verifying_key().as_bytes());
+        let payload = crate::payload::recovery(None, &user_ref, sign_over_ref, timestamp);
+        RecoveryRequest {
+            device_token: None,
+            user_key: user_ref,
+            grant: util::base64_encode(grant_raw),
+            timestamp: timestamp.to_string(),
+            signature: util::base64_encode(&user.sign(&payload).to_bytes()),
+        }
+    }
+
+    #[tokio::test]
+    async fn recover_binds_the_session_signature_to_the_grant_reference() {
+        let state = state_with(&[]);
+        let user = SigningKey::from_bytes(&[7u8; 32]);
+        let grant_raw = br#"{"grantVersion":1,"caseId":"c","grantee":"g","authority":"a","issuedAt":"t","signature":"s"}"#;
+        let grant_ref = util::sha256_hex(&crate::canonical::grant_signing_bytes(grant_raw).unwrap());
+        let now = util::format_timestamp(OffsetDateTime::now_utc());
+
+        // Signed over the real grant reference: the handler accepts the
+        // session and passes through to the engine, which — with no
+        // DeviceCheck configured — refuses for want of attestation.
+        let request = recover_request(&user, grant_raw, &grant_ref, &now);
+        let result = recover(State(Arc::clone(&state)), Json(request)).await;
+        assert!(
+            matches!(&result, Err(Error::BadRequest(m)) if m.contains("attestation is unavailable")),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_rejects_a_session_signed_over_a_different_grant() {
+        let state = state_with(&[]);
+        let user = SigningKey::from_bytes(&[7u8; 32]);
+        let grant_raw = br#"{"grantVersion":1,"caseId":"c","grantee":"g","authority":"a","issuedAt":"t","signature":"s"}"#;
+        let now = util::format_timestamp(OffsetDateTime::now_utc());
+
+        // Signed over some other reference: the handler reconstructs the
+        // payload from the grant actually presented, so the signature
+        // does not verify and the request is refused before the engine.
+        let request = recover_request(&user, grant_raw, "a-different-grant-ref", &now);
+        let result = recover(State(Arc::clone(&state)), Json(request)).await;
+        assert!(matches!(&result, Err(Error::SignatureInvalid(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn recover_rejects_a_grant_that_is_not_base64() {
+        let state = state_with(&[]);
+        let user = SigningKey::from_bytes(&[7u8; 32]);
+        let now = util::format_timestamp(OffsetDateTime::now_utc());
+        let user_ref = util::key_reference(user.verifying_key().as_bytes());
+        let payload = crate::payload::recovery(None, &user_ref, "unused", &now);
+        let request = RecoveryRequest {
+            device_token: None,
+            user_key: user_ref,
+            grant: "not %% base64".into(),
+            timestamp: now,
+            signature: util::base64_encode(&user.sign(&payload).to_bytes()),
+        };
+        let result = recover(State(Arc::clone(&state)), Json(request)).await;
+        assert!(
+            matches!(&result, Err(Error::BadRequest(m)) if m.contains("grant is not base64")),
+            "{result:?}"
+        );
+    }
 }
