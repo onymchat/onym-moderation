@@ -218,7 +218,11 @@ async fn apply_inner(
             // wrong reason.
             require_decision_deadline_not_passed(&case, now)?;
             require_notice_delivered(state, case_id)?;
-            require_response_window_closed(&case, now)?;
+            if !(state.config.allow_early_ban_for_qa
+                && matches!(decider, Decider::Human | Decider::HumanAssisted))
+            {
+                require_response_window_closed(&case, now)?;
+            }
             // The terms come from the manifest the accused's mandate
             // pinned. Republishing with a longer ban term must not
             // re-term someone who consented before it.

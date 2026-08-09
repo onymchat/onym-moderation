@@ -109,6 +109,13 @@ Three configurations, chosen with `AUTHORITY_TRIAGE_MODE`:
 moderation model triages each case, and a person reads the file when
 someone says the machine got it wrong. Appeals are the panel's queue.
 
+The web panel also exposes the initial human decision for an open case.
+Set `AUTHORITY_TRIAGE_MODE=off` when humans should decide every case. For
+local or staging QA only, `AUTHORITY_QA_ALLOW_EARLY_BAN=true` lets a human
+exercise the ban form before the consented response window closes. Never set
+that flag on a public authority; it is deliberately ignored for automated
+decisions and defaults to false.
+
 With triage enabled, an `AUTHORITY_TRIAGE_URL` that is not on this host
 is a **startup failure**, not a warning — and where the name cannot be
 resolved yet, a refusal at the first case rather than a pass. Case

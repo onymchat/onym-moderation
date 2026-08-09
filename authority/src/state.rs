@@ -96,6 +96,7 @@ impl AppState {
             deadline_sweep_secs: 300,
             triage: None,
             admin_token: Some("test-admin".into()),
+            allow_early_ban_for_qa: false,
         };
         let mut state = Self::new(config, store);
         // Pinned to the instant every test that injects a `now` uses,
