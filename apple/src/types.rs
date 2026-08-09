@@ -81,6 +81,15 @@ pub struct RecoveryRequest {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecoveryGrant {
+    /// Domain tag inside the signed document. A grant and a verdict are
+    /// otherwise signed by the same operator key over the same
+    /// canonical-bytes-minus-signature form; this string (checked
+    /// against `RECOVERY_GRANT_DOMAIN`) is what makes them distinct
+    /// documents *by design* rather than by an accident of which fields
+    /// each happens to require, so neither can ever be presented as the
+    /// other.
+    #[serde(rename = "grantType")]
+    pub grant_type: String,
     #[serde(default = "one")]
     pub grant_version: u32,
     pub case_id: String,
@@ -103,6 +112,8 @@ pub struct RecoveryGrant {
 pub enum RecoveryResult {
     #[serde(rename = "recovered")]
     Recovered { gate: GateCheckResult },
+    /// A ban still stands on one of the bindings — the grant's case, or
+    /// the grantee's own. Carries that ban's routes.
     #[serde(rename = "markInForce")]
     MarkInForce {
         authority_contact: String,
@@ -111,6 +122,13 @@ pub enum RecoveryResult {
         #[serde(skip_serializing_if = "Option::is_none")]
         appeal_url: Option<String>,
     },
+    /// The record is not yet terminal for a reason a ban's routes do
+    /// not describe — the case is still open at the authority and must
+    /// be decided before the device can be recovered. A distinct answer
+    /// so the client never labels an open case as a ban, nor shows the
+    /// empty appeal/new-holder routes a ban would carry.
+    #[serde(rename = "caseUnsettled")]
+    CaseUnsettled { note: String },
 }
 
 /// Just the signature: the client appends it to its own copy of the

@@ -57,63 +57,79 @@ Four serve the iOS client's `EnforcementBackendClient` seam:
 | `POST` | `/v1/gate-check` | Read the bits, reconcile, answer `clear` / `caseOpen` / `banned` / `checkRequired` |
 | `POST` | `/v1/recover` | Redeem a moderator-issued recovery grant: re-bind the case's verdict record, then reconcile |
 
-A word on `/v1/recover`, because it answers `checkRequired:
-reidentificationRequired` — the state a marked device lands in when
-its enrolled identity did not survive a reinstall or a change of
-hands. **There is no self-serve unban.** The holder's claim — real
-contact and proof of new-holder status — goes to the authority, where
-a human moderator decides it (REFERENCE-AUTHORITY-POLICY §6). What the
-device presents here is that decision: a recovery grant signed by the
-authority's operator key, resolved through the consented manifest the
-case's mandate pinned — the same key the case's verdicts verify
-against, so redemption introduces no new trust root.
+**What `/v1/recover` is, stated plainly.** It clears a device's
+moderation bits for a new holder, on a **moderator's signed
+authorization**. That is the whole of it. It does **not** — and
+cannot — prove the device presented is the one the case marked:
+DeviceCheck tokens are unlinkable, so no case-to-device binding
+exists to check. The interface knows only that Apple confirms *some*
+banned device is presented in a session signed by the grant's
+grantee. **The moderator's verification of the new-holder claim is the
+control — not any cryptographic device-to-case link, because there is
+none.** Everything below is the plumbing that keeps this honest clear
+inside the seat's invariants; none of it manufactures a link the
+model can't have.
 
-A grant is bound to the identity it names (stolen, it is useless
-without that identity's key on the session), single-use, and lapses
-after 30 days. It is redeemable only in a session that presents a
-device token Apple confirms carries the banned bit — but note the
-limit of what that proves: DeviceCheck tokens are unlinkable, so the
-interface cannot verify the presented token is the *case's original
-device*, only that it is *some* banned Apple device. This is the same
-property `gate_check` has — bits are written to whichever token a
-session presents — and is inherent to the per-token model, not
-specific to recovery; recovery is strictly narrower, since it also
-requires a moderator-issued grant. Redemption only ever *clears*, and
-proceeds only when the record is already cleared, so the worst a
-misdirected token achieves is clearing a ban the authority had already
-lifted.
+It answers `checkRequired: reidentificationRequired` — the state a
+marked device lands in when its enrolled identity did not survive a
+reinstall or a change of hands. There is no self-serve unban: the
+holder's claim (real contact, account of how they hold the device)
+goes to the authority, a human decides it (REFERENCE-AUTHORITY-POLICY
+§6), and what the device presents here is that decision — a recovery
+grant signed by the authority's operator key, resolved through the
+consented manifest the case's mandate pinned, so redemption adds no
+trust root the user did not already consent to. The signed grant
+carries a domain tag and an interface audience, so it can never be
+mistaken for (or replayed as) a verdict signed by the same key.
 
-If the case's record has cleared (reversal, expiry), the stored
-verdicts are re-bound to the grantee's enrollment and ordinary
-reconciliation performs the clearing write; marks still move only on
-the signed verdicts already on file. Recovery refuses outright — no
-move, grant unconsumed — if the source binding still carries *any*
-unresolved case: an open case (whose notice must never reach a
-non-party) or a ban not yet reversed or expired, **including one still
-queued behind its `executeAfter`**. A ban on the claimant's own
-binding refuses too. Only a fully cleared binding recovers.
+The grant is bound to the grantee identity (useless stolen, without
+that key on the session), single-use, and lapses after 30 days.
+
+**Marks still move only on verdicts (§11.2).** The grant does not
+write a bit. If the named case's record has cleared (reversal,
+expiry), redemption re-binds *that case's* verdicts to the grantee's
+enrollment and ordinary reconciliation performs the clear — carried by
+the reversal verdict already on file, not by the grant. The move is
+scoped to the grant's named case, so the server's effect matches
+exactly what the moderator signed for; other terminal cases on the
+binding stay put. Recovery refuses outright — no move, grant
+unconsumed — if the source still carries *any* unresolved case (an
+open case, whose notice must never reach a non-party, or a ban not yet
+reversed or expired, **queued bans included**), or if the grantee's
+own binding carries a ban. Only a fully cleared record recovers.
+
+**The honest residual.** Because the presented token is not linked to
+the case, a grantee holding a valid grant for a cleared case can, by
+presenting a *different* banned device, have its bit cleared on the
+strength of the cleared case. This is not unique to recovery: plain
+`gate_check` already writes clear to whatever token a clear-history
+identity presents (`would_brand_another_device` guards only the
+opposite direction), and it needs no grant — so recovery is strictly
+narrower. It cannot be closed at the interface: gating on "the grantee
+has no ban under any of their identities" is both insufficient (the
+laundered ban is a *victim's*, on a binding the grantee never enrolled)
+and unimplementable (identities are unlinkable, so "all of the
+grantee's identities" is not a set the interface can enumerate). It is
+bounded instead by what recovery *only* does — clear, never ban,
+under a human-issued single-use grant, from a device the presenter
+physically holds.
 
 **Only the verdicts move, never the mandate.** The authority signs
 `deviceBinding` inside every verdict — always the original binding,
 since it does not know a device changed hands — and ingest refuses a
 verdict whose signed binding disagrees with its mandate row. Rewriting
-the mandate's binding would therefore make the case's *next* signed
-verdict fail ingest outright, so the mandate stays where it is. This
-is safe precisely because recovery runs only against a fully terminal
-binding: a reversed or expired case has no further governing verdict
-to strand, and a claimant who wants a moderation relationship going
-forward re-consents under their own new binding.
+the mandate would make the case's *next* signed verdict fail ingest,
+so it stays; a later verdict that re-lands on the old binding is
+resolved through the `recoveries` table rather than read as a split.
 
-**What this endpoint does not do.** §6's *new-holder claim* is about
-someone who acquired a device that is **still marked** — a live ban
-they want lifted because the device, not they, was the subject. This
-endpoint does not serve that: it refuses on any unresolved ban, so
-`newHolderURL` has no interface path through `recover`. Clearing a
-live ban is the authority's call, not the interface's — the reviewer
-reverses the original verdict (which also clears the former holder's
-record), and only then, with the record terminal, does recovery move
-it to the new holder. `recover` covers the narrower, common case:
-*identity lost after the record had already cleared*.
+**What this endpoint does not do.** §6's *new-holder claim* over a
+device that is **still marked** is not served here: recovery refuses
+on any unresolved ban, so `newHolderURL` has no path through
+`recover`. Clearing a live ban is the authority's call — the reviewer
+reverses the original verdict (which also clears the former holder),
+and only then does the now-terminal record become recoverable.
+`recover` covers the common case: *identity lost after the record had
+already cleared*.
 
 One receives verdicts from the designated authority:
 

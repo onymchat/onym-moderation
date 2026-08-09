@@ -28,6 +28,13 @@ use crate::util;
 const GRANT_MAX_AGE: time::Duration = time::Duration::days(30);
 const GRANT_MAX_CLOCK_SKEW: time::Duration = time::Duration::minutes(5);
 
+/// The domain tag every recovery grant carries inside its signed
+/// bytes. Must stay byte-identical to the authority's
+/// `recovery::GRANT_DOMAIN`; the pair is what keeps a grant and a
+/// verdict — signed by the same key over the same canonical form —
+/// from ever being presented as one another.
+const RECOVERY_GRANT_DOMAIN: &str = "onym-recovery-grant-v1";
+
 pub struct Engine {
     pub store: Store,
     pub device_check: Option<DeviceCheck>,
@@ -230,6 +237,15 @@ impl Engine {
 
         let grant: RecoveryGrant = serde_json::from_slice(grant_raw)
             .map_err(|e| Error::BadRequest(format!("malformed recovery grant: {e}")))?;
+        if grant.grant_type != RECOVERY_GRANT_DOMAIN {
+            // A document that is not a recovery grant — a verdict signed
+            // by the same operator key, say — must not be redeemed as
+            // one, whatever else it happens to contain.
+            return Err(Error::BadRequest(format!(
+                "not a recovery grant (grantType {:?})",
+                grant.grant_type
+            )));
+        }
         if grant.grant_version != 1 {
             // A grant minted under semantics this build does not
             // implement must not redeem under the ones it does.
@@ -296,50 +312,73 @@ impl Engine {
         // claimant's own open cases are theirs to see, but a live or
         // queued ban on their binding means recovery would clear a
         // device its own record still bans.
+        //
+        // This check is read outside the `adopt_binding` transaction, so
+        // a verdict could in principle ingest between here and the move.
+        // The window is benign: the move is scoped to the grant's named
+        // case, which is terminal (reversed/expired) — the authority
+        // does not issue a new *governing* verdict on a reversed case,
+        // so nothing that would flip `binding_state` for *this* case can
+        // arrive in the gap. A verdict for some *other* case cannot ride
+        // along, because the move no longer touches it.
         let source = self.binding_state(&from_binding, now)?;
         let dest = self.binding_state(&to_binding, now)?;
-        if source.open || source.ban_present || dest.ban_present {
-            let (authority_contact, new_holder_url, appeal_url) = source
-                .ban_route
-                .as_ref()
-                .or(dest.ban_route.as_ref())
-                .map(|(verdict_ref, verdict)| {
-                    let state = self.ban_state(verdict_ref, verdict);
-                    (state.authority_contact, state.new_holder_url, state.appeal_url)
-                })
-                .unwrap_or_else(|| ("the authority named in the case notice".into(), None, None));
+        // A ban in force — the grant's case or the grantee's own —
+        // answers with that ban's routes. An *open* case is a different
+        // refusal: nothing is banned, the matter is simply undecided,
+        // and a ban's appeal/new-holder routes would be the wrong
+        // answer — so it gets its own shape rather than a mislabelled
+        // `markInForce` with empty URLs.
+        if let Some((verdict_ref, verdict)) = source.ban_route.as_ref().or(dest.ban_route.as_ref()) {
+            let state = self.ban_state(verdict_ref, verdict);
             return Ok(RecoveryResult::MarkInForce {
-                authority_contact,
-                new_holder_url,
-                appeal_url,
+                authority_contact: state.authority_contact,
+                new_holder_url: state.new_holder_url,
+                appeal_url: state.appeal_url,
+            });
+        }
+        if source.ban_present || dest.ban_present {
+            // A ban with no parseable verdict for routes still refuses.
+            return Ok(RecoveryResult::MarkInForce {
+                authority_contact: "the authority named in the case notice".into(),
+                new_holder_url: None,
+                appeal_url: None,
+            });
+        }
+        if source.open {
+            return Ok(RecoveryResult::CaseUnsettled {
+                note: "this case is still open at the authority; it must be decided before the \
+                       device can be recovered"
+                    .into(),
             });
         }
 
-        // The move and the redemption commit together; the recoveries
-        // table is the audit trail for both, and records every case the
-        // whole-binding move carried, not only the grant's named one.
-        // Deliberately NOT a write-log row: that log's columns mean
-        // "bits written", and a row there authorized by a grant would
-        // read, column-wise, as a grant writing a mark. The clearing
-        // write below lands in the write log on the reversal's own
-        // authority, and an auditor joins the two ledgers on the
-        // binding. Redemption is recorded even when nothing moves
+        // Re-bind the named case's cleared verdicts to the new holder
+        // and redeem the grant, in one transaction. This does NOT write
+        // a device bit: the clearing write below is still carried by
+        // the reversal verdict already on file (marks move only on
+        // verdicts, §11.2) — the grant authorizes the re-bind, not the
+        // bit. Redemption is recorded even when nothing moves
         // (`from == to`): single-use is unconditional. A grant redeemed
         // concurrently loses the `ON CONFLICT` race and answers the
         // same refusal, rather than a 500 on the primary-key clash.
-        let Some(moved) = self.store.adopt_binding(
+        //
+        // The single-use record and the moderator's authorization of it
+        // (the authority's `recovery_grant_issued` case event) are the
+        // audit trail; the move is not a write-log row, because that
+        // log's columns mean "bits written" and this writes none.
+        if !self.store.adopt_binding(
             &grant_ref,
             &grant.case_id,
             &from_binding,
             &to_binding,
             &util::format_timestamp(now),
-        )?
-        else {
+        )? {
             return Err(Error::BadRequest("this grant has already been redeemed".into()));
-        };
+        }
 
         // Ordinary reconciliation now resolves the moved record and
-        // performs the clearing write on the verdicts' own authority,
+        // performs the clearing write on the reversal's own authority,
         // against the bits already read in this session. The grant is
         // already spent and the record already moved, so a failure here
         // is not a lost grant: the next ordinary gate check on the new
@@ -349,7 +388,7 @@ impl Engine {
             Ok(gate) => Ok(RecoveryResult::Recovered { gate }),
             Err(Error::MarkWriteFailed(detail)) => {
                 tracing::warn!(
-                    %grant_ref, cases = moved.len(),
+                    %grant_ref,
                     "recovery moved the record but the clearing write failed: {detail}"
                 );
                 Err(Error::MarkWriteFailed(
@@ -1648,6 +1687,7 @@ mod tests {
         /// the canonical bytes with the signature field removed.
         fn grant(case_id: &str, grantee: &str, issued_at: &str, key: &SigningKey) -> Vec<u8> {
             let mut value = serde_json::json!({
+                "grantType": RECOVERY_GRANT_DOMAIN,
                 "grantVersion": 1,
                 "caseId": case_id,
                 "grantee": grantee,
@@ -2102,7 +2142,9 @@ mod tests {
             let grant_bytes = grant("case-csam", CLAIMANT, "2026-08-09T00:00:00Z", &key);
             let result =
                 engine.recover(Some("token"), CLAIMANT, &grant_bytes, now()).await.unwrap();
-            assert!(matches!(result, RecoveryResult::MarkInForce { .. }), "{result:?}");
+            // An open case is not a ban: a distinct answer, not a
+            // mislabelled `markInForce` with empty routes.
+            assert!(matches!(result, RecoveryResult::CaseUnsettled { .. }), "{result:?}");
             assert_eq!(engine.store.verdicts_for_device(&to_binding).unwrap().len(), 0);
         }
 
@@ -2207,6 +2249,152 @@ mod tests {
             let apple = apple.lock().unwrap();
             assert_eq!(apple.queries, 1, "exactly one DeviceCheck query for the whole recovery");
             assert_eq!(apple.updates.len(), 1, "exactly one clearing write");
+        }
+
+        /// A document signed by the operator key that is not a recovery
+        /// grant — the domain tag missing or wrong — is refused, so a
+        /// verdict (same key, same canonical form) can never redeem as
+        /// a grant.
+        #[tokio::test]
+        async fn a_document_without_the_recovery_domain_tag_is_refused() {
+            let key = operator();
+            let (engine, _apple) = engine_with_apple(BANNED).await;
+            seed_reversed_case(&engine, &key);
+            enroll_claimant(&engine);
+
+            // Re-sign the grant with the domain tag altered.
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&grant("case-csam", CLAIMANT, "2026-08-09T00:00:00Z", &key))
+                    .unwrap();
+            value["grantType"] = "onym-verdict-v1".into();
+            let unsigned = {
+                let mut v = value.clone();
+                v["signature"] = "".into();
+                serde_json::to_vec(&v).unwrap()
+            };
+            let signing_bytes = canonical::grant_signing_bytes(&unsigned).unwrap();
+            value["signature"] = util::base64_encode(&key.sign(&signing_bytes).to_bytes()).into();
+            let mistyped = serde_json::to_vec(&value).unwrap();
+
+            let refused = engine.recover(Some("token"), CLAIMANT, &mistyped, now()).await;
+            assert!(
+                matches!(&refused, Err(Error::BadRequest(m)) if m.contains("not a recovery grant")),
+                "{refused:?}"
+            );
+        }
+
+        /// The move carries only the grant's named case; other terminal
+        /// cases on the same binding stay where they are.
+        #[tokio::test]
+        async fn the_move_is_scoped_to_the_named_case() {
+            let key = operator();
+            let (engine, _apple) = engine_with_apple(BANNED).await;
+            seed_reversed_case(&engine, &key);
+            let to_binding = enroll_claimant(&engine);
+
+            // A second, already-terminal case (an expired ban) on the
+            // same source binding.
+            let mut expired = verdict("case-other", Disposition::Ban, "csam");
+            expired.ban_expires = Some("2026-08-01T00:00:00Z".into());
+            store_verdict_bound(&engine, "ban-expired", expired, OLD_BINDING, "2026-07-01T00:00:00Z");
+
+            let grant_bytes = grant("case-csam", CLAIMANT, "2026-08-09T00:00:00Z", &key);
+            engine.recover(Some("token"), CLAIMANT, &grant_bytes, now()).await.unwrap();
+
+            // Only case-csam's two verdicts moved; case-other stayed.
+            assert_eq!(
+                engine.store.binding_for_case("case-csam").unwrap().as_deref(),
+                Some(to_binding.as_str())
+            );
+            assert_eq!(
+                engine.store.binding_for_case("case-other").unwrap().as_deref(),
+                Some(OLD_BINDING)
+            );
+        }
+
+        /// Two fresh sessions redeeming the same grant: the store's
+        /// `ON CONFLICT` makes exactly one win. Exercised serially here
+        /// via a second call whose bits are banned again.
+        #[tokio::test]
+        async fn the_conflict_loser_moves_nothing_and_refuses() {
+            let key = operator();
+            let (engine, apple) = engine_with_apple(BANNED).await;
+            seed_reversed_case(&engine, &key);
+            let to_binding = enroll_claimant(&engine);
+
+            let grant_bytes = grant("case-csam", CLAIMANT, "2026-08-09T00:00:00Z", &key);
+            engine.recover(Some("token"), CLAIMANT, &grant_bytes, now()).await.unwrap();
+            let moved = engine.store.verdicts_for_device(&to_binding).unwrap().len();
+
+            // Redeem again (bits banned once more): the redemption row
+            // already exists, so adopt_binding's INSERT is a no-op and
+            // nothing moves a second time.
+            apple.lock().unwrap().bits = BANNED;
+            let again = engine.recover(Some("token"), CLAIMANT, &grant_bytes, now()).await;
+            assert!(
+                matches!(&again, Err(Error::BadRequest(m)) if m.contains("already been redeemed")),
+                "{again:?}"
+            );
+            assert_eq!(engine.store.verdicts_for_device(&to_binding).unwrap().len(), moved);
+        }
+
+        /// If Apple refuses the clearing write after the move, the grant
+        /// is already spent and the record already moved — the error
+        /// says so rather than reading as a lost grant.
+        #[tokio::test]
+        async fn a_failed_clearing_write_reports_recovery_recorded() {
+            let key = operator();
+            // A fake that accepts the query but 500s on update.
+            let (base, shared) = spawn_flaky_apple(BANNED).await;
+            let engine = Engine {
+                store: Store::in_memory().unwrap(),
+                device_check: Some(DeviceCheck::for_tests(base)),
+            };
+            seed_reversed_case(&engine, &key);
+            let to_binding = enroll_claimant(&engine);
+
+            let grant_bytes = grant("case-csam", CLAIMANT, "2026-08-09T00:00:00Z", &key);
+            let result = engine.recover(Some("token"), CLAIMANT, &grant_bytes, now()).await;
+            assert!(
+                matches!(&result, Err(Error::MarkWriteFailed(m)) if m.contains("recovery is recorded")),
+                "{result:?}"
+            );
+            // The move committed and the grant is spent even though the
+            // write failed.
+            assert_eq!(engine.store.verdicts_for_device(&to_binding).unwrap().len(), 2);
+            assert!(engine.store.grant_redeemed(&grant_ref(&grant_bytes)).unwrap());
+            drop(shared);
+        }
+
+        /// Apple stand-in whose `update_two_bits` fails, to drive the
+        /// post-move clearing-write failure path.
+        async fn spawn_flaky_apple(initial: Bits) -> (String, Arc<Mutex<FakeApple>>) {
+            let shared = Arc::new(Mutex::new(FakeApple {
+                bits: initial,
+                updates: Vec::new(),
+                queries: 0,
+            }));
+            async fn query(
+                AxumState(shared): AxumState<Arc<Mutex<FakeApple>>>,
+            ) -> Json<serde_json::Value> {
+                let mut shared = shared.lock().unwrap();
+                shared.queries += 1;
+                let bits = shared.bits;
+                Json(serde_json::json!({ "bit0": bits.case_open, "bit1": bits.banned }))
+            }
+            async fn update() -> (axum::http::StatusCode, &'static str) {
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom")
+            }
+            let app = axum::Router::new()
+                .route("/v1/query_two_bits", axum::routing::post(query))
+                .route("/v1/update_two_bits", axum::routing::post(update))
+                .with_state(shared.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            (base, shared)
         }
     }
 }
