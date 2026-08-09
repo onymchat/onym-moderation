@@ -91,7 +91,7 @@ impl AppState {
             // Tests exercise the fail-closed path deliberately, so the
             // default fixture is a *configured* deployment; the
             // unconfigured one gets its own test.
-            interface_key: Some(crate::testing::interface_key_reference()),
+            interface_keys: vec![crate::testing::interface_key_reference()],
             moderator_token: Some("test-token".into()),
             deadline_sweep_secs: 300,
             triage: None,

@@ -94,6 +94,87 @@ These are the ones worth checking a reimplementation against:
   faithfully (§8 gap 3) — until an auditor actually attests a
   deployment, it remains a paper control.
 
+## Countersigning keys, and rotating one
+
+The interface countersigns a mandate to say it witnessed *this user*
+consenting to *that authority*. `MODERATION_INTERFACE_SIGNING_SEED` is
+the root of those signatures, and its public half is what an authority
+puts in its `AUTHORITY_INTERFACE_KEY`.
+
+One key for every authority made rotation all-or-nothing: changing the
+seed invalidated every countersignature ever issued, to every
+authority, at once — so a key you suspected was compromised was a key
+you were stuck with. Keys are now **per authority**, derived from the
+root and a per-authority epoch:
+
+```
+epoch 0  →  the root seed itself, underived
+epoch n  →  SHA-256(domain ‖ root ‖ componentId ‖ 0x00 ‖ n)
+```
+
+`MODERATION_INTERFACE_KEY_EPOCHS` sets the epochs, as
+`<componentId>=<epoch>` pairs. **An authority you have never rotated
+needs no entry**: epoch 0 is the root key, unchanged, so adopting this
+costs no coordination with anyone already configured.
+
+### What it does and does not protect
+
+It buys **rotation and revocation** — burning one relationship without
+touching the others.
+
+It does **not** contain a compromise, and it would be a mistake to
+believe otherwise. The private seed never leaves this process;
+authorities receive only public keys, so no authority can leak it. The
+realistic compromise is this host, and every derived key lives in the
+same memory as the root. That is also why the keys are derived rather
+than stored as N independent secrets: N secrets to generate, back up
+and not lose, in exchange for containment the design does not provide.
+
+### Rotating
+
+The authority accepts a **list** of interface keys
+(`AUTHORITY_INTERFACE_KEY`, comma-separated), and that is what makes a
+gapless rotation possible. It holds one key per entry and checks a
+countersignature against any of them.
+
+Without that list there is no safe order. The authority would expect
+exactly one key, so whichever side moved first, every registration for
+that authority would be refused until the other caught up — reversing
+the steps only changes which side of the gap you are on.
+
+1. Derive the next epoch's key without deploying it: bump the epoch in a
+   scratch environment and read `rotatedInterfaceKeys` from `/health`,
+   or compute it offline with the formula above.
+2. The authority operator **adds** it to `AUTHORITY_INTERFACE_KEY`
+   alongside the current one and restarts. Both now verify.
+3. Bump the epoch here and deploy. Countersignatures switch to the new
+   key; the old ones already issued still verify, because the authority
+   still lists that key.
+4. The authority operator drops the old key. Now — and only now — do
+   mandates countersigned under the old epoch stop verifying.
+
+Step 4 is the irreversible one, and it is the point: it is what burns a
+key you no longer trust. Everything before it is reversible.
+
+`/health` reports the root key as `interfaceKey` and every rotated
+authority under `rotatedInterfaceKeys`. An authority that has never
+been rotated has no entry there and uses `interfaceKey` — which is why
+the authority-side docs tell operators to check for their own entry
+first rather than reading `interfaceKey` blindly.
+
+### If the component id is wrong
+
+`MODERATION_INTERFACE_KEY_EPOCHS` validates the shape of an id, not its
+existence — there is no allowlist here, deliberately, since which
+authority a user trusts is the user's business. So
+`onym:component:autority=1` parses cleanly and leaves the real
+authority on epoch 0, with the same symptom as a botched rotation:
+registrations refused with a signature error rather than a
+configuration one.
+
+The boot log names every configured id beside the key it produced.
+Check it against what the mandates actually carry.
+
 ## Cross-implementation agreement
 
 The signed session payloads are reconstructed here from exactly the

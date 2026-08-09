@@ -21,6 +21,10 @@ pub struct Config {
 
     /// Ed25519 seed for the interface's countersigning key, hex.
     pub interface_signing_seed: [u8; 32],
+    /// Per-authority countersigning epochs. An authority absent here
+    /// is on epoch 0, which is the root seed itself — rotation is
+    /// opt-in per relationship rather than a global event.
+    pub interface_key_epochs: std::collections::BTreeMap<String, u32>,
     /// This interface's component id, carried in mandates.
     pub interface_component_id: String,
 
@@ -86,6 +90,13 @@ impl Config {
             Err(_) => return Err("MODERATION_INTERFACE_SIGNING_SEED is required".into()),
         };
 
+        // Which countersigning key each authority expects. Absent
+        // means epoch 0, the un-rotated root — so an existing
+        // deployment needs no entry and nothing changes for it.
+        let interface_key_epochs = crate::countersigning::parse_epochs(
+            &env::var("MODERATION_INTERFACE_KEY_EPOCHS").unwrap_or_default(),
+        )?;
+
         let interface_component_id = env::var("MODERATION_INTERFACE_COMPONENT_ID")
             .unwrap_or_else(|_| "onym:component:onym-ios".into());
 
@@ -111,6 +122,7 @@ impl Config {
             team_id,
             environment,
             interface_signing_seed,
+            interface_key_epochs,
             interface_component_id,
             enforce_signatures,
             authority_token,
