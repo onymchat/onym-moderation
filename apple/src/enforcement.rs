@@ -1846,6 +1846,23 @@ mod tests {
             serde_json::to_vec(&value).unwrap()
         }
 
+        fn unban_grant(claim_id: &str, grantee: &str, issued_at: &str, key: &SigningKey) -> Vec<u8> {
+            let mut value = serde_json::json!({
+                "grantType": UNBAN_GRANT_DOMAIN,
+                "grantVersion": 1,
+                "claimId": claim_id,
+                "grantee": grantee,
+                "authority": AUTHORITY,
+                "issuedAt": issued_at,
+                "signature": "",
+            });
+            let unsigned = serde_json::to_vec(&value).unwrap();
+            let signing_bytes = canonical::grant_signing_bytes(&unsigned).unwrap();
+            value["signature"] =
+                util::base64_encode(&key.sign(&signing_bytes).to_bytes()).into();
+            serde_json::to_vec(&value).unwrap()
+        }
+
         /// The reference the interface records for a grant — its
         /// canonical signing bytes' hash.
         fn grant_ref(raw: &[u8]) -> String {
@@ -1991,6 +2008,28 @@ mod tests {
                 && !entry.case_open
                 && entry.outcome.contains("no device bits written")));
             assert!(engine.store.verify_write_log().unwrap().is_none(), "chain intact");
+        }
+
+        #[tokio::test]
+        async fn a_case_free_unban_clears_a_fresh_device_without_case_records() {
+            let key = operator();
+            let (engine, apple) = engine_with_apple(BANNED).await;
+            seed_consent(&engine, &key);
+            let to_binding = enroll_claimant(&engine);
+
+            let grant = unban_grant("claim-1", CLAIMANT, "2026-08-09T00:00:00Z", &key);
+            let result = engine.recover(Some("token"), CLAIMANT, &grant, now()).await.unwrap();
+
+            let RecoveryResult::Recovered { gate } = result else {
+                panic!("expected recovery, got {result:?}");
+            };
+            assert!(matches!(gate, GateCheckResult::Clear {}), "gate: {gate:?}");
+
+            let apple = apple.lock().unwrap();
+            assert_eq!(apple.updates.last(), Some(&Bits::default()));
+            assert!(!apple.bits.banned);
+            assert_eq!(engine.store.verdicts_for_device(&to_binding).unwrap().len(), 0);
+            assert!(engine.store.unban_redeemed(&grant_ref(&grant)).unwrap());
         }
 
         /// The mandate must NOT move — the regression an earlier
