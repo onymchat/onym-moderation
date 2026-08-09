@@ -178,6 +178,27 @@ impl Store {
             CREATE INDEX IF NOT EXISTS verdicts_by_device
                 ON verdicts (device_binding);
 
+            -- Redeemed recovery grants — the move ledger. A grant is a
+            -- moderator-signed authorization to move one case's record
+            -- to a new identity's enrollment; recording its reference
+            -- here is what makes it single-use. The move is scoped to
+            -- the grant's named `case_id`, so that column fully
+            -- describes what travelled, and `from_binding` is what
+            -- `binding_for_case` treats as superseded once a later
+            -- verdict re-lands on it. This table is the single-use
+            -- guard and the interface's operational record of the move;
+            -- the moderator's *authorization* of it is recorded on the
+            -- authority's own case-event ledger (`recovery_grant_issued`).
+            CREATE TABLE IF NOT EXISTS recoveries (
+                grant_ref    TEXT PRIMARY KEY,
+                case_id      TEXT NOT NULL,
+                from_binding TEXT NOT NULL,
+                to_binding   TEXT NOT NULL,
+                recovered_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS recoveries_from
+                ON recoveries (from_binding);
+
             -- Append-only. Nothing in the service updates or deletes a
             -- row here; `previous_hash` chains them so removal shows.
             CREATE TABLE IF NOT EXISTS write_log (
@@ -532,6 +553,156 @@ impl Store {
         Ok(())
     }
 
+    // ─── Recovery ────────────────────────────────────────────────────
+
+    /// Whether a recovery grant has already moved a record.
+    pub fn grant_redeemed(&self, grant_ref: &str) -> Result<bool, Error> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM recoveries WHERE grant_ref = ?1",
+                params![grant_ref],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(row.is_some())
+    }
+
+    /// The device binding a case's verdict record is bound to. A case
+    /// with no verdicts answers `None`; so does the impossible store
+    /// where one case names two bindings — logged here, but reported
+    /// to the caller exactly like a case that never existed, because a
+    /// distinguishable answer is an existence probe.
+    pub fn binding_for_case(&self, case_id: &str) -> Result<Option<String>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn
+            .prepare("SELECT DISTINCT device_binding FROM verdicts WHERE case_id = ?1")?;
+        let rows = statement.query_map(params![case_id], |row| row.get::<_, String>(0))?;
+        let mut bindings = Vec::new();
+        for row in rows {
+            bindings.push(row?);
+        }
+        match bindings.len() {
+            0 => Ok(None),
+            1 => Ok(bindings.pop()),
+            // A case never splits across bindings: existing verdicts
+            // move together on recovery, and later verdicts are routed
+            // to the recovered binding at ingest (`binding_for_ingest`),
+            // so more than one is a genuine inconsistency.
+            n => {
+                tracing::error!(%case_id, bindings = n, "case names more than one device binding");
+                Ok(None)
+            }
+        }
+    }
+
+    /// The binding an incoming verdict for `case_id` should be stored
+    /// under. Normally the mandate's own binding, but if the case has
+    /// been recovered onto a new enrollment, its verdicts live there
+    /// now — so a later verdict (a re-ban, a re-reversal) must follow,
+    /// or it would land on the abandoned binding and never reach the
+    /// device. Returns the most recent recovery target for the case, if
+    /// any; the caller falls back to the mandate binding.
+    ///
+    /// The signature/binding *check* at ingest still runs against the
+    /// mandate binding (the authority signs the original binding and
+    /// does not learn of the move); only where the verdict is *stored*
+    /// follows the record.
+    pub fn binding_for_ingest(&self, case_id: &str) -> Result<Option<String>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let recovered: Option<String> = conn
+            .query_row(
+                "SELECT to_binding FROM recoveries WHERE case_id = ?1
+                 ORDER BY recovered_at DESC, rowid DESC LIMIT 1",
+                params![case_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(recovered)
+    }
+
+    /// Move the stored verdicts bound to `from` onto `to`, and redeem
+    /// the grant that authorized it, in one transaction.
+    ///
+    /// **Only the named case's verdicts move**, and only the verdicts —
+    /// not the mandate. Scoping to `case_id` is what keeps the server's
+    /// effect inside the moderator's authorization: the grant names one
+    /// case, the moderator reviewed one case, and exactly that case's
+    /// verdicts travel. Other (terminal) cases on the same binding stay
+    /// put; the terminal-only guard in `Engine::recover` guarantees
+    /// none of them carries a live mark, so leaving them behind strands
+    /// nothing.
+    ///
+    /// The mandate stays because the authority signs `deviceBinding`
+    /// inside every verdict — always the original binding, since it
+    /// never learns the device changed hands — and ingest refuses a
+    /// verdict whose signed binding disagrees with its mandate row
+    /// (`verdict.rs`). Rewriting the mandate's binding would make the
+    /// case's *next* signed verdict fail ingest outright. Leaving it is
+    /// safe under the same terminal-only guard.
+    ///
+    /// The redemption row is written even when `from == to` (a holder
+    /// whose enrollment already resolves the record): "single-use" is
+    /// unconditional, not "single-use when a move happened".
+    ///
+    /// Returns `false` when the grant was already redeemed — including
+    /// the race where two fresh sessions clear the `grant_redeemed`
+    /// pre-check and arrive together: the redemption `INSERT` is the
+    /// single serialization point (`ON CONFLICT DO NOTHING`), and the
+    /// loser moves nothing and reports the same "already redeemed"
+    /// refusal rather than a primary-key 500.
+    pub fn adopt_binding(
+        &self,
+        grant_ref: &str,
+        case_id: &str,
+        from: &str,
+        to: &str,
+        now: &str,
+    ) -> Result<bool, Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Internal(format!("begin adoption: {e}")))?;
+
+        let redeemed = tx.execute(
+            "INSERT INTO recoveries (grant_ref, case_id, from_binding, to_binding, recovered_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(grant_ref) DO NOTHING",
+            params![grant_ref, case_id, from, to, now],
+        )?;
+        if redeemed == 0 {
+            // Someone else redeemed this grant; the transaction rolls
+            // back on drop, moving nothing.
+            return Ok(false);
+        }
+        // Scoped to the named case: exactly what the grant authorized.
+        tx.execute(
+            "UPDATE verdicts SET device_binding = ?2 WHERE device_binding = ?1 AND case_id = ?3",
+            params![from, to, case_id],
+        )?;
+
+        // Record the move on the tamper-evident, /v1/write-log-exposed
+        // chain, in the same transaction so it is atomic with the move
+        // and cannot be dropped without breaking the chain. It writes
+        // no device bit — `case_open` and `banned` are both false — so
+        // it does not pollute the log's bits-only meaning; it is the
+        // one auditable trace of the record having moved, and it names
+        // the grant that authorized it.
+        Self::append_write_log_conn(
+            &tx,
+            to,
+            &format!("recovery-move:{grant_ref}"),
+            false,
+            false,
+            &format!("record for case {case_id} moved from {from}; no device bits written"),
+            now,
+        )?;
+
+        tx.commit()
+            .map_err(|e| Error::Internal(format!("commit adoption: {e}")))?;
+        Ok(true)
+    }
+
     /// Every verdict for a device, newest **decided** first.
     ///
     /// Ordered by the authority's signed `decidedAt`, not by when the
@@ -610,6 +781,22 @@ impl Store {
         now: &str,
     ) -> Result<WriteLogEntry, Error> {
         let conn = self.conn.lock().unwrap();
+        Self::append_write_log_conn(&conn, device_binding, authorized_by, case_open, banned, outcome, now)
+    }
+
+    /// The chaining append, over any `Connection` — the locked handle
+    /// for `append_write_log`, or an open transaction so a caller can
+    /// fold a log row into the same atomic unit as the change it
+    /// records (recovery does this for the move).
+    fn append_write_log_conn(
+        conn: &rusqlite::Connection,
+        device_binding: &str,
+        authorized_by: &str,
+        case_open: bool,
+        banned: bool,
+        outcome: &str,
+        now: &str,
+    ) -> Result<WriteLogEntry, Error> {
         let previous_hash: String = conn
             .query_row(
                 "SELECT entry_hash FROM write_log ORDER BY sequence DESC LIMIT 1",

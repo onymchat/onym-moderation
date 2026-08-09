@@ -55,6 +55,83 @@ pub struct GateCheckRequest {
     pub signature: String,
 }
 
+/// A holder presenting a moderator-issued recovery grant — the way
+/// back for a marked device whose enrolled identity did not survive a
+/// reinstall or a change of hands. There is no self-serve path: the
+/// holder's claim, contact, and proof of new-holder status go to the
+/// authority, a human decides, and only the grant that decision signs
+/// can move a record. `grant` is the grant document's exact bytes,
+/// base64 — the signature is over them, so they travel unre-encoded.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryRequest {
+    #[serde(default)]
+    pub device_token: Option<String>,
+    pub user_key: String,
+    pub grant: String,
+    pub timestamp: String,
+    pub signature: String,
+}
+
+/// A moderator's signed authorization to move one case's verdict
+/// record to the enrollment of the identity it names. Signed by the
+/// authority's operator key — the same key the case's verdicts verify
+/// against, resolved through the consented manifest the case's mandate
+/// pinned, so no new trust root is involved.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryGrant {
+    /// Domain tag inside the signed document. A grant and a verdict are
+    /// otherwise signed by the same operator key over the same
+    /// canonical-bytes-minus-signature form; this string (checked
+    /// against `RECOVERY_GRANT_DOMAIN`) is what makes them distinct
+    /// documents *by design* rather than by an accident of which fields
+    /// each happens to require, so neither can ever be presented as the
+    /// other.
+    #[serde(rename = "grantType")]
+    pub grant_type: String,
+    #[serde(default = "one")]
+    pub grant_version: u32,
+    pub case_id: String,
+    /// The identity key the grant is issued to. Presenting a stolen
+    /// grant is useless without this key's signature on the session.
+    pub grantee: String,
+    pub authority: String,
+    pub issued_at: String,
+    pub signature: String,
+}
+
+/// The answer to a recovery claim. `Recovered` carries the gate result
+/// the reconciliation produced, so the client needs no second round
+/// trip. `MarkInForce` deliberately carries only the routes the holder
+/// needs to challenge the mark — not the verdict or its reasoning,
+/// which belong to the case's parties, and a recovery claimant has
+/// proved possession of a marked device, not party status.
+#[derive(Debug, Clone, Serialize)]
+// `rename_all` renames the *variants* (the `status` tag values);
+// `rename_all_fields` is what renames the struct-variant *fields* —
+// without it `MarkInForce`'s fields would serialize snake_case, unlike
+// every other response the client decodes.
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "status")]
+pub enum RecoveryResult {
+    Recovered { gate: GateCheckResult },
+    /// A ban still stands on one of the bindings — the grant's case, or
+    /// the grantee's own. Carries that ban's routes.
+    MarkInForce {
+        authority_contact: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        new_holder_url: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        appeal_url: Option<String>,
+    },
+    /// The record is not yet terminal for a reason a ban's routes do
+    /// not describe — the case is still open at the authority and must
+    /// be decided before the device can be recovered. A distinct answer
+    /// so the client never labels an open case as a ban, nor shows the
+    /// empty appeal/new-holder routes a ban would carry.
+    CaseUnsettled { note: String },
+}
+
 /// Just the signature: the client appends it to its own copy of the
 /// mandate, so this round-trip cannot alter a consented field.
 #[derive(Debug, Clone, Serialize)]

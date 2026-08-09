@@ -1,6 +1,6 @@
 //! HTTP surface.
 //!
-//! Three endpoints serve the iOS client's `EnforcementBackendClient`
+//! Four endpoints serve the iOS client's `EnforcementBackendClient`
 //! seam; one receives verdicts from the designated authority; two are
 //! for operators and auditors.
 
@@ -39,6 +39,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/enroll", post(enroll))
         .route("/v1/mandates/countersign", post(countersign))
         .route("/v1/gate-check", post(gate_check))
+        .route("/v1/recover", post(recover))
         .route("/v1/verdicts", post(receive_verdict))
         .route("/v1/write-log", get(write_log))
         .with_state(state)
@@ -288,6 +289,16 @@ async fn receive_verdict(
     })?;
 
     let now = util::format_timestamp(OffsetDateTime::now_utc());
+    // Where the verdict is *stored* follows the record: if this case
+    // was recovered onto a new enrollment, its verdicts live there now,
+    // and a later one must fold into the recovered device rather than
+    // the abandoned binding. The signature/binding check above still
+    // ran against the mandate's (original) binding — only storage moves.
+    let storage_binding = state
+        .engine
+        .store
+        .binding_for_ingest(&parsed.case_id)?
+        .unwrap_or_else(|| mandate.device_binding.clone());
     state.engine.store.put_verdict(
         &StoredVerdict {
             verdict_ref: verdict_ref.clone(),
@@ -298,7 +309,7 @@ async fn receive_verdict(
             // moment this request happened to arrive.
             decided_at: parsed.decided_at.clone(),
             mandate_ref: parsed.mandate_ref.clone(),
-            device_binding: mandate.device_binding.clone(),
+            device_binding: storage_binding,
             raw: verdict_bytes.clone(),
             disposition: match parsed.disposition {
                 Disposition::OpenCase => "open-case".into(),
@@ -390,6 +401,42 @@ fn claim_session(state: &AppState, timestamp: &str, signature: &str) -> Result<(
         return Err(Error::SignatureInvalid("session signature already used".into()));
     }
     Ok(())
+}
+
+/// A holder presenting a moderator-issued recovery grant — there is
+/// no self-serve unban: the claim, contact, and proof of new-holder
+/// status went to the authority, a human decided, and the grant is
+/// that decision, signed. The engine verifies the grant against the
+/// consented operator key and answers on the stored verdicts'
+/// authority; this handler only authenticates the session, binding it
+/// to the exact grant bytes presented.
+async fn recover(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<RecoveryRequest>,
+) -> Result<Json<RecoveryResult>, Error> {
+    let token = decode_optional_token(request.device_token.as_deref())?;
+    let grant_raw = util::base64_decode(&request.grant)
+        .ok_or_else(|| Error::BadRequest("grant is not base64".into()))?;
+    let grant_ref = util::sha256_hex(&canonical::grant_signing_bytes(&grant_raw)?);
+    let signed = payload::recovery(
+        token.as_deref(),
+        &request.user_key,
+        &grant_ref,
+        &request.timestamp,
+    );
+    verify_user_signature(&request.user_key, &signed, &request.signature)?;
+    claim_session(&state, &request.timestamp, &request.signature)?;
+
+    let result = state
+        .engine
+        .recover(
+            request.device_token.as_deref(),
+            &request.user_key,
+            &grant_raw,
+            OffsetDateTime::now_utc(),
+        )
+        .await?;
+    Ok(Json(result))
 }
 
 fn decode_optional_token(raw: Option<&str>) -> Result<Option<Vec<u8>>, Error> {
@@ -597,5 +644,107 @@ mod tests {
         assert!(validate_mandate_consent(&classes, "2026-08-08T12:00:00Z", now).is_ok());
         assert!(validate_mandate_consent(&[], "2026-08-08T12:00:00Z", now).is_err());
         assert!(validate_mandate_consent(&classes, "2099-01-01T00:00:00Z", now).is_err());
+    }
+
+    // ─── POST /v1/recover ────────────────────────────────────────────
+    //
+    // The engine owns redemption; these exercise the handler's own
+    // work, which the engine tests cannot reach: base64-decoding the
+    // grant, and binding the session signature to *this grant's*
+    // reference (its canonical-bytes hash) rather than to some other
+    // payload. The device_check is unconfigured, so a request that
+    // clears the handler lands on the engine's "attestation
+    // unavailable" — which is exactly the signal that it cleared.
+
+    fn recover_request(
+        user: &SigningKey,
+        grant_raw: &[u8],
+        sign_over_ref: &str,
+        timestamp: &str,
+    ) -> RecoveryRequest {
+        let user_ref = util::key_reference(user.verifying_key().as_bytes());
+        let payload = crate::payload::recovery(None, &user_ref, sign_over_ref, timestamp);
+        RecoveryRequest {
+            device_token: None,
+            user_key: user_ref,
+            grant: util::base64_encode(grant_raw),
+            timestamp: timestamp.to_string(),
+            signature: util::base64_encode(&user.sign(&payload).to_bytes()),
+        }
+    }
+
+    #[tokio::test]
+    async fn recover_binds_the_session_signature_to_the_grant_reference() {
+        let state = state_with(&[]);
+        let user = SigningKey::from_bytes(&[7u8; 32]);
+        let grant_raw = br#"{"grantVersion":1,"caseId":"c","grantee":"g","authority":"a","issuedAt":"t","signature":"s"}"#;
+        let grant_ref = util::sha256_hex(&crate::canonical::grant_signing_bytes(grant_raw).unwrap());
+        let now = util::format_timestamp(OffsetDateTime::now_utc());
+
+        // Signed over the real grant reference: the handler accepts the
+        // session and passes through to the engine, which — with no
+        // DeviceCheck configured — refuses for want of attestation.
+        let request = recover_request(&user, grant_raw, &grant_ref, &now);
+        let result = recover(State(Arc::clone(&state)), Json(request)).await;
+        assert!(
+            matches!(&result, Err(Error::BadRequest(m)) if m.contains("attestation is unavailable")),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_rejects_a_session_signed_over_a_different_grant() {
+        let state = state_with(&[]);
+        let user = SigningKey::from_bytes(&[7u8; 32]);
+        let grant_raw = br#"{"grantVersion":1,"caseId":"c","grantee":"g","authority":"a","issuedAt":"t","signature":"s"}"#;
+        let now = util::format_timestamp(OffsetDateTime::now_utc());
+
+        // Signed over some other reference: the handler reconstructs the
+        // payload from the grant actually presented, so the signature
+        // does not verify and the request is refused before the engine.
+        let request = recover_request(&user, grant_raw, "a-different-grant-ref", &now);
+        let result = recover(State(Arc::clone(&state)), Json(request)).await;
+        assert!(matches!(&result, Err(Error::SignatureInvalid(_))), "{result:?}");
+    }
+
+    #[test]
+    fn recovery_result_serializes_camelcase_fields() {
+        // The client decodes camelCase; a struct-variant field must not
+        // slip out snake_case. `rename_all_fields` is what guarantees it.
+        let value = serde_json::to_value(RecoveryResult::MarkInForce {
+            authority_contact: "appeals@a.org".into(),
+            new_holder_url: Some("https://a.org/nh".into()),
+            appeal_url: None,
+        })
+        .unwrap();
+        assert_eq!(value["status"], "markInForce");
+        assert_eq!(value["authorityContact"], "appeals@a.org");
+        assert_eq!(value["newHolderUrl"], "https://a.org/nh");
+        assert!(value.get("authority_contact").is_none());
+
+        let unsettled =
+            serde_json::to_value(RecoveryResult::CaseUnsettled { note: "n".into() }).unwrap();
+        assert_eq!(unsettled["status"], "caseUnsettled");
+    }
+
+    #[tokio::test]
+    async fn recover_rejects_a_grant_that_is_not_base64() {
+        let state = state_with(&[]);
+        let user = SigningKey::from_bytes(&[7u8; 32]);
+        let now = util::format_timestamp(OffsetDateTime::now_utc());
+        let user_ref = util::key_reference(user.verifying_key().as_bytes());
+        let payload = crate::payload::recovery(None, &user_ref, "unused", &now);
+        let request = RecoveryRequest {
+            device_token: None,
+            user_key: user_ref,
+            grant: "not %% base64".into(),
+            timestamp: now,
+            signature: util::base64_encode(&user.sign(&payload).to_bytes()),
+        };
+        let result = recover(State(Arc::clone(&state)), Json(request)).await;
+        assert!(
+            matches!(&result, Err(Error::BadRequest(m)) if m.contains("grant is not base64")),
+            "{result:?}"
+        );
     }
 }

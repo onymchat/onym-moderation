@@ -16,6 +16,7 @@
 
 pub const ENROLL_CONTEXT: &str = "onym-moderation-enroll-v1";
 pub const GATE_CONTEXT: &str = "onym-moderation-gate-v1";
+pub const RECOVER_CONTEXT: &str = "onym-moderation-recover-v1";
 
 fn append(out: &mut Vec<u8>, field: &[u8]) {
     out.extend_from_slice(&(field.len() as u32).to_be_bytes());
@@ -53,6 +54,20 @@ pub fn gate_check(
     bytes(GATE_CONTEXT, device_token, user_key, timestamp, mandate_ref)
 }
 
+/// Signed bytes for `POST /v1/recover`. Same five-field layout as the
+/// session payloads, with the grant's reference (the hash of its
+/// signing bytes) in the trailing slot the others use for the mandate
+/// ref — the session signature binds the presentation to one grant,
+/// so it cannot be replayed to present a different one.
+pub fn recovery(
+    device_token: Option<&[u8]>,
+    user_key: &str,
+    grant_ref: &str,
+    timestamp: &str,
+) -> Vec<u8> {
+    bytes(RECOVER_CONTEXT, device_token, user_key, timestamp, Some(grant_ref))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +94,16 @@ mod tests {
     #[test]
     fn enrollment_and_gate_payloads_are_domain_separated() {
         assert_ne!(enrollment(Some(b"t"), "u", "ts"), gate_check(Some(b"t"), "u", None, "ts"));
+    }
+
+    /// A recovery presentation can be replayed against neither session
+    /// endpoint, and binds the grant: a different grant ref is a
+    /// different signature.
+    #[test]
+    fn recovery_payloads_are_domain_separated_and_grant_bound() {
+        assert_ne!(recovery(Some(b"t"), "u", "g", "ts"), gate_check(Some(b"t"), "u", Some("g"), "ts"));
+        assert_ne!(recovery(Some(b"t"), "u", "g", "ts"), enrollment(Some(b"t"), "u", "ts"));
+        assert_ne!(recovery(Some(b"t"), "u", "g1", "ts"), recovery(Some(b"t"), "u", "g2", "ts"));
     }
 
     #[test]

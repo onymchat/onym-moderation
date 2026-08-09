@@ -53,6 +53,13 @@ pub fn verdict_signing_bytes(raw: &[u8]) -> Result<Vec<u8>, Error> {
     canonical_bytes(raw, &["signature"])
 }
 
+/// The bytes an authority's moderator signs for a recovery grant:
+/// every field except `signature`. Their hash is the grant's
+/// reference, which redemption records to make the grant single-use.
+pub fn grant_signing_bytes(raw: &[u8]) -> Result<Vec<u8>, Error> {
+    canonical_bytes(raw, &["signature"])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
