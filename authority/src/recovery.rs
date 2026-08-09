@@ -19,10 +19,18 @@ use crate::canonical;
 use crate::error::Error;
 use crate::util;
 
+/// Domain tag written into every grant's signed bytes. Must stay
+/// byte-identical to the interface's `RECOVERY_GRANT_DOMAIN`; the pair
+/// is what keeps a grant and a verdict — signed by the same operator
+/// key over the same canonical form — from ever being presented as one
+/// another.
+pub const GRANT_DOMAIN: &str = "onym-recovery-grant-v1";
+
 /// The signed grant, exactly as the device presents it for redemption.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RecoveryGrant<'a> {
+    grant_type: &'a str,
     grant_version: u32,
     case_id: &'a str,
     grantee: &'a str,
@@ -51,6 +59,7 @@ pub fn issue_grant(
     key: &SigningKey,
 ) -> Result<IssuedGrant, Error> {
     let mut grant = RecoveryGrant {
+        grant_type: GRANT_DOMAIN,
         grant_version: 1,
         case_id,
         grantee,
@@ -69,4 +78,24 @@ pub fn issue_grant(
         grant_ref: util::sha256_hex(&signing_bytes),
         raw,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the domain tag the interface refuses a grant without. If
+    /// this value drifts from the interface's `RECOVERY_GRANT_DOMAIN`,
+    /// every grant this authority issues stops redeeming — so the
+    /// constant is asserted here and mirrored there, the same
+    /// agreement-by-fixture the canonical bytes use.
+    #[test]
+    fn issued_grants_carry_the_recovery_domain_tag() {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let now = OffsetDateTime::from_unix_timestamp(1_765_000_000).unwrap();
+        let issued = issue_grant("case-1", "onym:key:g", "onym:component:a", now, &key).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&issued.raw).unwrap();
+        assert_eq!(value["grantType"], "onym-recovery-grant-v1");
+        assert_eq!(value["grantType"], GRANT_DOMAIN);
+    }
 }
