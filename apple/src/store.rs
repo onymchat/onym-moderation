@@ -178,12 +178,14 @@ impl Store {
             CREATE INDEX IF NOT EXISTS verdicts_by_device
                 ON verdicts (device_binding);
 
-            -- Redeemed recovery grants. A grant is a moderator-signed
-            -- authorization to move one case's verdict record to a new
-            -- identity's enrollment; recording its reference here is
-            -- what makes it single-use. Issuance is the authority's
-            -- decision — this table only stops one grant from moving
-            -- records twice.
+            -- Redeemed recovery grants — the move ledger. A grant is a
+            -- moderator-signed authorization to move one case's record
+            -- to a new identity's enrollment; recording its reference
+            -- here is what makes it single-use, and the from/to pair
+            -- is the audit trail for the move itself. The write log
+            -- stays strictly "bits written": the clearing write that
+            -- follows an adoption lands there separately, authorized
+            -- by the reversal already on file.
             CREATE TABLE IF NOT EXISTS recoveries (
                 grant_ref    TEXT PRIMARY KEY,
                 case_id      TEXT NOT NULL,
@@ -585,12 +587,23 @@ impl Store {
         }
     }
 
-    /// Move the whole verdict record bound to `from` onto `to`, and
-    /// redeem the grant that authorized it, in one transaction. The
-    /// record moves together deliberately: marks belong to the device,
-    /// and moving one case's verdicts alone would let a live ban stay
-    /// behind on a binding nothing resolves any more. Returns the case
-    /// ids the move carried.
+    /// Move the whole record bound to `from` onto `to` — verdicts
+    /// **and mandates** — and redeem the grant that authorized it, in
+    /// one transaction. The record moves together deliberately: marks
+    /// belong to the device, and moving one case's verdicts alone
+    /// would let a live ban stay behind on a binding nothing resolves
+    /// any more. The mandates move because ingest binds every incoming
+    /// verdict to *its mandate's* binding: leave them behind and the
+    /// case's next verdict — a late redelivery, an appeal outcome —
+    /// lands on the abandoned binding and never reaches the device
+    /// again.
+    ///
+    /// The redemption row is written even when `from == to` (a holder
+    /// whose enrollment already resolves the record): "single-use" is
+    /// unconditional, not "single-use when a move happened". This
+    /// table is the move ledger — the write log records only bit
+    /// writes, and the clearing write that follows an adoption lands
+    /// there on the reversal's own authority.
     pub fn adopt_binding(
         &self,
         grant_ref: &str,
@@ -620,6 +633,10 @@ impl Store {
         )?;
         tx.execute(
             "UPDATE verdicts SET device_binding = ?2 WHERE device_binding = ?1",
+            params![from, to],
+        )?;
+        tx.execute(
+            "UPDATE mandates SET device_binding = ?2 WHERE device_binding = ?1",
             params![from, to],
         )?;
         tx.commit()
