@@ -69,15 +69,32 @@ case's mandate pinned — the same key the case's verdicts verify
 against, so redemption introduces no new trust root.
 
 A grant is bound to the identity it names (stolen, it is useless
-without that identity's key on the session), presentable only from a
-device whose banned bit Apple confirms in the same signed session,
-single-use, and lapses after 30 days. If the case's record has cleared
-(reversal, expiry), the stored verdicts are re-bound to the grantee's
-enrollment and ordinary reconciliation performs the clearing write —
-marks still move only on the signed verdicts already on file. If a
-record still bans the device — the case's, or the claimant's own —
-nothing moves, the grant is not consumed, and the response carries the
-authority's declared routes instead.
+without that identity's key on the session), single-use, and lapses
+after 30 days. It is redeemable only in a session that presents a
+device token Apple confirms carries the banned bit — but note the
+limit of what that proves: DeviceCheck tokens are unlinkable, so the
+interface cannot verify the presented token is the *case's original
+device*, only that it is *some* banned Apple device. This is the same
+property `gate_check` has — bits are written to whichever token a
+session presents — and is inherent to the per-token model, not
+specific to recovery; recovery is strictly narrower, since it also
+requires a moderator-issued grant. Redemption only ever *clears*, and
+proceeds only when the record is already cleared, so the worst a
+misdirected token achieves is clearing a ban the authority had already
+lifted.
+
+If the case's record has cleared (reversal, expiry), the stored
+verdicts **and their mandates** are re-bound to the grantee's
+enrollment — the mandates too, because ingest binds each incoming
+verdict to its mandate's binding, so leaving them behind would strand
+the case's next verdict on the abandoned binding. Ordinary
+reconciliation then performs the clearing write; marks still move only
+on the signed verdicts already on file. Recovery refuses outright — no
+move, grant unconsumed — if the source binding still carries *any*
+unresolved case: an open case (whose notice must never reach a
+non-party) or a ban not yet reversed or expired, **including one still
+queued behind its `executeAfter`**. A ban on the claimant's own
+binding refuses too. Only a fully cleared binding recovers.
 
 One receives verdicts from the designated authority:
 

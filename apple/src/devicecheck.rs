@@ -93,7 +93,7 @@ pub struct DeviceCheck {
     encoding_key: EncodingKey,
     key_id: String,
     team_id: String,
-    environment: Environment,
+    base_url: String,
 }
 
 impl DeviceCheck {
@@ -115,8 +115,28 @@ impl DeviceCheck {
             encoding_key,
             key_id,
             team_id,
-            environment,
+            base_url: environment.host().to_string(),
         })
+    }
+
+    /// A client aimed at a local stand-in for Apple's API. The key is
+    /// a throwaway generated for the fixture — it signs bearer tokens
+    /// nothing verifies. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn for_tests(base_url: String) -> Self {
+        const TEST_ONLY_EC_KEY: &[u8] = b"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgPC+5ufSkeZJWHsVf
+gW9U1RIbpSIrKIGPXtZQA3DFiCehRANCAAQrk0U30JpQ6sV4PjMPJXFh5+cUevmQ
+7sDoERfT71/j755DGo0x2PU/9HE2AQE2z6FtLqPng3mgknhrffXMFe07
+-----END PRIVATE KEY-----";
+        Self {
+            client: reqwest::Client::new(),
+            encoding_key: EncodingKey::from_ec_pem(TEST_ONLY_EC_KEY)
+                .expect("fixture key parses"),
+            key_id: "test-key".into(),
+            team_id: "test-team".into(),
+            base_url,
+        }
     }
 
     /// ES256 JWT, re-minted per call. Apple accepts tokens for a
@@ -144,7 +164,7 @@ impl DeviceCheck {
         };
         let response = self
             .client
-            .post(format!("{}/v1/query_two_bits", self.environment.host()))
+            .post(format!("{}/v1/query_two_bits", self.base_url))
             .bearer_auth(self.bearer()?)
             .json(&body)
             .send()
@@ -195,7 +215,7 @@ impl DeviceCheck {
         };
         let response = self
             .client
-            .post(format!("{}/v1/update_two_bits", self.environment.host()))
+            .post(format!("{}/v1/update_two_bits", self.base_url))
             .bearer_auth(self.bearer()?)
             .json(&body)
             .send()
