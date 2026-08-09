@@ -450,10 +450,10 @@ impl Engine {
 
         let signing_bytes = canonical::grant_signing_bytes(grant_raw)?;
         let grant_ref = util::sha256_hex(&signing_bytes);
+        self.verify_unban_grant_signature(&grant, &signing_bytes)?;
         if self.store.unban_redeemed(&grant_ref)? {
             return Err(Error::BadRequest("this grant has already been redeemed".into()));
         }
-        self.verify_unban_grant_signature(&grant, &signing_bytes)?;
 
         let Some(to_binding) = self.store.device_binding_for_user(user_key)? else {
             return Err(Error::BadRequest(
