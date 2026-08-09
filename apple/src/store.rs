@@ -199,6 +199,16 @@ impl Store {
             CREATE INDEX IF NOT EXISTS recoveries_from
                 ON recoveries (from_binding);
 
+            -- Case-free moderator unbans. These are separate from case
+            -- adoption because there is no source binding or case id after
+            -- a reinstall; the signed grant and DeviceCheck session are the
+            -- authorization, and this row makes redemption single-use.
+            CREATE TABLE IF NOT EXISTS unban_recoveries (
+                grant_ref    TEXT PRIMARY KEY,
+                to_binding   TEXT NOT NULL,
+                recovered_at TEXT NOT NULL
+            );
+
             -- Append-only. Nothing in the service updates or deletes a
             -- row here; `previous_hash` chains them so removal shows.
             CREATE TABLE IF NOT EXISTS write_log (
@@ -436,6 +446,47 @@ impl Store {
             .optional()?
             .flatten();
         Ok(raw)
+    }
+
+    pub fn manifests_for_authority(&self, authority: &str) -> Result<Vec<Vec<u8>>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT manifest_raw FROM mandates
+             WHERE authority = ?1 AND manifest_raw IS NOT NULL",
+        )?;
+        let rows = statement.query_map(params![authority], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut manifests = Vec::new();
+        for row in rows {
+            manifests.push(row?);
+        }
+        Ok(manifests)
+    }
+
+    pub fn unban_redeemed(&self, grant_ref: &str) -> Result<bool, Error> {
+        let conn = self.conn.lock().unwrap();
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM unban_recoveries WHERE grant_ref = ?1",
+                params![grant_ref],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(exists.is_some())
+    }
+
+    pub fn record_unban_redemption(
+        &self,
+        grant_ref: &str,
+        to_binding: &str,
+        recovered_at: &str,
+    ) -> Result<bool, Error> {
+        let conn = self.conn.lock().unwrap();
+        let inserted = conn.execute(
+            "INSERT INTO unban_recoveries (grant_ref, to_binding, recovered_at)
+             VALUES (?1, ?2, ?3) ON CONFLICT(grant_ref) DO NOTHING",
+            params![grant_ref, to_binding, recovered_at],
+        )?;
+        Ok(inserted > 0)
     }
 
     pub fn mandate(&self, mandate_ref: &str) -> Result<Option<MandateRecord>, Error> {

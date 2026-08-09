@@ -3977,7 +3977,7 @@ mod tests {
         assert!(harness
             .state
             .store
-            .grant_recovery_claim(&claim_id, &case_id, "verified by phone", &issued.raw, &issued.grant_ref, "2026-08-09T15:00:00Z")
+            .grant_recovery_claim(&claim_id, Some(&case_id), "verified by phone", &issued.raw, &issued.grant_ref, "2026-08-09T15:00:00Z")
             .unwrap());
 
         // The claimant polls and receives the exact signed bytes.
@@ -4016,7 +4016,7 @@ mod tests {
         assert!(!harness
             .state
             .store
-            .grant_recovery_claim(&claim_id, &case_id, "again", &issued.raw, &issued.grant_ref, "2026-08-09T16:00:00Z")
+            .grant_recovery_claim(&claim_id, Some(&case_id), "again", &issued.raw, &issued.grant_ref, "2026-08-09T16:00:00Z")
             .unwrap());
     }
 
