@@ -55,18 +55,40 @@ pub struct GateCheckRequest {
     pub signature: String,
 }
 
-/// A holder's claim that this device's marks are governed by a case
-/// whose record has since cleared — the reinstall/new-identity path.
-/// The case reference is the capability: it is disclosed only to the
-/// case's parties and the authority, and the signature binds it.
+/// A holder presenting a moderator-issued recovery grant — the way
+/// back for a marked device whose enrolled identity did not survive a
+/// reinstall or a change of hands. There is no self-serve path: the
+/// holder's claim, contact, and proof of new-holder status go to the
+/// authority, a human decides, and only the grant that decision signs
+/// can move a record. `grant` is the grant document's exact bytes,
+/// base64 — the signature is over them, so they travel unre-encoded.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecoveryRequest {
     #[serde(default)]
     pub device_token: Option<String>,
     pub user_key: String,
-    pub case_id: String,
+    pub grant: String,
     pub timestamp: String,
+    pub signature: String,
+}
+
+/// A moderator's signed authorization to move one case's verdict
+/// record to the enrollment of the identity it names. Signed by the
+/// authority's operator key — the same key the case's verdicts verify
+/// against, resolved through the consented manifest the case's mandate
+/// pinned, so no new trust root is involved.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryGrant {
+    #[serde(default = "one")]
+    pub grant_version: u32,
+    pub case_id: String,
+    /// The identity key the grant is issued to. Presenting a stolen
+    /// grant is useless without this key's signature on the session.
+    pub grantee: String,
+    pub authority: String,
+    pub issued_at: String,
     pub signature: String,
 }
 

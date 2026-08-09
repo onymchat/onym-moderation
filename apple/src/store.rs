@@ -178,13 +178,15 @@ impl Store {
             CREATE INDEX IF NOT EXISTS verdicts_by_device
                 ON verdicts (device_binding);
 
-            -- One recovery per case, ever. A recovery moves a device's
-            -- verdict record to the binding of the identity that
-            -- claimed it; recording the case here is what makes the
-            -- claim single-use, so a case reference cannot be redeemed
-            -- again to move the record a second time.
+            -- Redeemed recovery grants. A grant is a moderator-signed
+            -- authorization to move one case's verdict record to a new
+            -- identity's enrollment; recording its reference here is
+            -- what makes it single-use. Issuance is the authority's
+            -- decision — this table only stops one grant from moving
+            -- records twice.
             CREATE TABLE IF NOT EXISTS recoveries (
-                case_id      TEXT PRIMARY KEY,
+                grant_ref    TEXT PRIMARY KEY,
+                case_id      TEXT NOT NULL,
                 from_binding TEXT NOT NULL,
                 to_binding   TEXT NOT NULL,
                 recovered_at TEXT NOT NULL
@@ -546,22 +548,26 @@ impl Store {
 
     // ─── Recovery ────────────────────────────────────────────────────
 
-    /// The device binding a case's verdict record is bound to, if the
-    /// case can still anchor a recovery. A case with no verdicts here
-    /// and a case already redeemed answer the same `None`: the caller
-    /// must not be able to tell which of the two it hit.
-    pub fn recoverable_binding_for_case(&self, case_id: &str) -> Result<Option<String>, Error> {
+    /// Whether a recovery grant has already moved a record.
+    pub fn grant_redeemed(&self, grant_ref: &str) -> Result<bool, Error> {
         let conn = self.conn.lock().unwrap();
-        let redeemed: Option<i64> = conn
+        let row: Option<i64> = conn
             .query_row(
-                "SELECT 1 FROM recoveries WHERE case_id = ?1",
-                params![case_id],
+                "SELECT 1 FROM recoveries WHERE grant_ref = ?1",
+                params![grant_ref],
                 |row| row.get(0),
             )
             .optional()?;
-        if redeemed.is_some() {
-            return Ok(None);
-        }
+        Ok(row.is_some())
+    }
+
+    /// The device binding a case's verdict record is bound to. A case
+    /// with no verdicts answers `None`; so does the impossible store
+    /// where one case names two bindings — logged here, but reported
+    /// to the caller exactly like a case that never existed, because a
+    /// distinguishable answer is an existence probe.
+    pub fn binding_for_case(&self, case_id: &str) -> Result<Option<String>, Error> {
+        let conn = self.conn.lock().unwrap();
         let mut statement = conn
             .prepare("SELECT DISTINCT device_binding FROM verdicts WHERE case_id = ?1")?;
         let rows = statement.query_map(params![case_id], |row| row.get::<_, String>(0))?;
@@ -572,22 +578,27 @@ impl Store {
         match bindings.len() {
             0 => Ok(None),
             1 => Ok(bindings.pop()),
-            // Marks reach only the device a verdict names, so one case
-            // binding two devices is a store the fold cannot answer
-            // for — refuse rather than pick one.
-            _ => Err(Error::Internal(format!(
-                "case {case_id} names {} device bindings",
-                bindings.len()
-            ))),
+            n => {
+                tracing::error!(%case_id, bindings = n, "case names more than one device binding");
+                Ok(None)
+            }
         }
     }
 
-    /// Move the whole verdict record bound to `from` onto `to`,
-    /// recording every case moved so none of them can anchor a second
-    /// recovery. The record moves together deliberately: marks belong
-    /// to the device, and moving one case's verdicts alone would let a
-    /// live ban stay behind on a binding nothing resolves any more.
-    pub fn adopt_binding(&self, from: &str, to: &str, now: &str) -> Result<Vec<String>, Error> {
+    /// Move the whole verdict record bound to `from` onto `to`, and
+    /// redeem the grant that authorized it, in one transaction. The
+    /// record moves together deliberately: marks belong to the device,
+    /// and moving one case's verdicts alone would let a live ban stay
+    /// behind on a binding nothing resolves any more. Returns the case
+    /// ids the move carried.
+    pub fn adopt_binding(
+        &self,
+        grant_ref: &str,
+        case_id: &str,
+        from: &str,
+        to: &str,
+        now: &str,
+    ) -> Result<Vec<String>, Error> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
@@ -602,13 +613,11 @@ impl Store {
             }
             cases
         };
-        for case_id in &cases {
-            tx.execute(
-                "INSERT INTO recoveries (case_id, from_binding, to_binding, recovered_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![case_id, from, to, now],
-            )?;
-        }
+        tx.execute(
+            "INSERT INTO recoveries (grant_ref, case_id, from_binding, to_binding, recovered_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![grant_ref, case_id, from, to, now],
+        )?;
         tx.execute(
             "UPDATE verdicts SET device_binding = ?2 WHERE device_binding = ?1",
             params![from, to],

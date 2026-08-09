@@ -55,16 +55,17 @@ pub fn gate_check(
 }
 
 /// Signed bytes for `POST /v1/recover`. Same five-field layout as the
-/// session payloads, with the case reference in the trailing slot the
-/// others use for the mandate ref — the signature binds the claim to
-/// one case, so it cannot be replayed to recover a different one.
+/// session payloads, with the grant's reference (the hash of its
+/// signing bytes) in the trailing slot the others use for the mandate
+/// ref — the session signature binds the presentation to one grant,
+/// so it cannot be replayed to present a different one.
 pub fn recovery(
     device_token: Option<&[u8]>,
     user_key: &str,
-    case_id: &str,
+    grant_ref: &str,
     timestamp: &str,
 ) -> Vec<u8> {
-    bytes(RECOVER_CONTEXT, device_token, user_key, timestamp, Some(case_id))
+    bytes(RECOVER_CONTEXT, device_token, user_key, timestamp, Some(grant_ref))
 }
 
 #[cfg(test)]

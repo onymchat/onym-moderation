@@ -393,20 +393,25 @@ fn claim_session(state: &AppState, timestamp: &str, signature: &str) -> Result<(
     Ok(())
 }
 
-/// A holder's claim that this device's banned mark is governed by a
-/// case whose record has cleared — the path back for a device whose
-/// original identity did not survive a reinstall. The engine verifies
-/// the device against Apple and answers on the stored verdicts'
-/// authority; this handler only authenticates the session.
+/// A holder presenting a moderator-issued recovery grant — there is
+/// no self-serve unban: the claim, contact, and proof of new-holder
+/// status went to the authority, a human decided, and the grant is
+/// that decision, signed. The engine verifies the grant against the
+/// consented operator key and answers on the stored verdicts'
+/// authority; this handler only authenticates the session, binding it
+/// to the exact grant bytes presented.
 async fn recover(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RecoveryRequest>,
 ) -> Result<Json<RecoveryResult>, Error> {
     let token = decode_optional_token(request.device_token.as_deref())?;
+    let grant_raw = util::base64_decode(&request.grant)
+        .ok_or_else(|| Error::BadRequest("grant is not base64".into()))?;
+    let grant_ref = util::sha256_hex(&canonical::grant_signing_bytes(&grant_raw)?);
     let signed = payload::recovery(
         token.as_deref(),
         &request.user_key,
-        &request.case_id,
+        &grant_ref,
         &request.timestamp,
     );
     verify_user_signature(&request.user_key, &signed, &request.signature)?;
@@ -417,7 +422,7 @@ async fn recover(
         .recover(
             request.device_token.as_deref(),
             &request.user_key,
-            &request.case_id,
+            &grant_raw,
             OffsetDateTime::now_utc(),
         )
         .await?;

@@ -55,20 +55,29 @@ Four serve the iOS client's `EnforcementBackendClient` seam:
 | `POST` | `/v1/enroll` | First-session enrollment → the vendor-local `deviceBinding` a mandate carries |
 | `POST` | `/v1/mandates/countersign` | Interface countersignature over the mandate the user signed |
 | `POST` | `/v1/gate-check` | Read the bits, reconcile, answer `clear` / `caseOpen` / `banned` / `checkRequired` |
-| `POST` | `/v1/recover` | Re-bind a cleared case's verdict record to the holder's new identity, then reconcile |
+| `POST` | `/v1/recover` | Redeem a moderator-issued recovery grant: re-bind the case's verdict record, then reconcile |
 
 A word on `/v1/recover`, because it answers `checkRequired:
-reidentificationRequired` — the state a marked device lands in when its
-enrolled identity did not survive a reinstall. The claim is bound to
-the marked device (Apple must confirm the banned bit in the same
-signed session) and to one case reference, which only the case's
-parties and the authority hold. If the case's record has cleared
-(reversal, expiry), the stored verdicts are re-bound to the claiming
-identity's enrollment and an ordinary gate check performs the clearing
-write — marks still move only on the signed verdicts already on file.
-If the record still bans the device, nothing moves and the response
-carries the authority's declared appeal and new-holder routes instead.
-Each case anchors at most one recovery, ever.
+reidentificationRequired` — the state a marked device lands in when
+its enrolled identity did not survive a reinstall or a change of
+hands. **There is no self-serve unban.** The holder's claim — real
+contact and proof of new-holder status — goes to the authority, where
+a human moderator decides it (REFERENCE-AUTHORITY-POLICY §6). What the
+device presents here is that decision: a recovery grant signed by the
+authority's operator key, resolved through the consented manifest the
+case's mandate pinned — the same key the case's verdicts verify
+against, so redemption introduces no new trust root.
+
+A grant is bound to the identity it names (stolen, it is useless
+without that identity's key on the session), presentable only from a
+device whose banned bit Apple confirms in the same signed session,
+single-use, and lapses after 30 days. If the case's record has cleared
+(reversal, expiry), the stored verdicts are re-bound to the grantee's
+enrollment and ordinary reconciliation performs the clearing write —
+marks still move only on the signed verdicts already on file. If a
+record still bans the device — the case's, or the claimant's own —
+nothing moves, the grant is not consumed, and the response carries the
+authority's declared routes instead.
 
 One receives verdicts from the designated authority:
 

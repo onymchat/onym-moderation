@@ -13,11 +13,20 @@
 
 use time::OffsetDateTime;
 
+use crate::canonical;
 use crate::devicecheck::{Bits, DeviceCheck};
 use crate::error::Error;
 use crate::store::{Store, StoredVerdict};
-use crate::types::{BanState, CheckRequiredReason, GateCheckResult, RecoveryResult, Verdict};
+use crate::types::{
+    BanState, CheckRequiredReason, GateCheckResult, RecoveryGrant, RecoveryResult, Verdict,
+};
 use crate::util;
+
+/// How long an issued recovery grant stays presentable. Grants are
+/// identity-bound and single-use, so this bounds shelf life, not
+/// theft; a lapsed grant just means asking the authority again.
+const GRANT_MAX_AGE: time::Duration = time::Duration::days(30);
+const GRANT_MAX_CLOCK_SKEW: time::Duration = time::Duration::minutes(5);
 
 pub struct Engine {
     pub store: Store,
@@ -67,10 +76,22 @@ impl Engine {
         let Some(bits) = device_check.query(device_token).await? else {
             return Ok(GateCheckResult::check_required(CheckRequiredReason::TokenInvalid));
         };
+        self.reconcile(device_check, device_token, user_key, bits, now).await
+    }
 
-        // Session-mediated reconciliation: with a live token in hand,
-        // bring Apple's bits in line with what the verdict record now
-        // implies, before answering.
+    /// Session-mediated reconciliation: with a live token in hand,
+    /// bring Apple's bits in line with what the verdict record now
+    /// implies, before answering. Split from `gate_check` so recovery,
+    /// which has already paid for the bits, can reconcile on the same
+    /// read instead of asking Apple twice and racing itself.
+    async fn reconcile(
+        &self,
+        device_check: &DeviceCheck,
+        device_token: &str,
+        user_key: &str,
+        bits: Bits,
+        now: OffsetDateTime,
+    ) -> Result<GateCheckResult, Error> {
         let binding = self.store.device_binding_for_user(user_key)?;
         let intended = match binding.as_deref() {
             Some(binding) => self.intended_marks(binding, now)?,
@@ -150,31 +171,33 @@ impl Engine {
         Ok(GateCheckResult::clear())
     }
 
-    /// Answer a recovery claim: this session's holder says the device's
-    /// banned mark is governed by `case_id`, whose record has since
-    /// cleared, and asks that the record follow the device so ordinary
-    /// reconciliation can act on it.
+    /// Redeem a moderator-issued recovery grant: the authority has
+    /// decided — after hearing the holder's claim, contact, and proof
+    /// of new-holder status — that one case's verdict record should
+    /// follow its device onto the enrollment of the identity the grant
+    /// names. There is no self-serve path here: nothing a holder knows
+    /// or presents moves a record without that human decision.
     ///
-    /// Recovery moves no mark by itself. It re-binds the stored,
-    /// signed verdicts to the claiming identity's enrollment and then
-    /// answers a normal gate check, so the write that clears the bits
-    /// is still authorized by the reversal (or expiry) already on
+    /// Recovery still moves no mark by itself. It re-binds the stored,
+    /// signed verdicts and then reconciles, so the write that clears
+    /// the bits is authorized by the reversal (or expiry) already on
     /// file — rule 2 above holds. When the record still bans the
-    /// device, nothing moves and the holder is routed to the
-    /// authority's declared new-holder claim instead.
+    /// device — the case's own record, or the claimant's — nothing
+    /// moves, the grant is not consumed, and the holder is routed back
+    /// to the authority.
     ///
-    /// The claim is challenge-bound (§6): it is answered only for a
-    /// device whose banned bit Apple confirms is set, presented in the
-    /// same signed session. Requiring the marked device is what keeps
-    /// the case reference from being an unbind-anything capability —
-    /// and each case anchors at most one recovery, ever, so a leaked
-    /// reference cannot strand the genuine holder more than once nor
-    /// serve a second device.
+    /// The grant verifies against the operator key resolved through
+    /// the consented manifest the case's mandate pinned — the same key
+    /// the case's verdicts verify against, so redemption introduces no
+    /// trust root the user did not already consent to. It is bound to
+    /// the grantee identity (a stolen grant is useless without the
+    /// key), presented only from a device whose banned bit Apple
+    /// confirms in the same signed session, and single-use.
     pub async fn recover(
         &self,
         device_token: Option<&str>,
         user_key: &str,
-        case_id: &str,
+        grant_raw: &[u8],
         now: OffsetDateTime,
     ) -> Result<RecoveryResult, Error> {
         let Some(device_check) = self.device_check.as_ref() else {
@@ -194,65 +217,158 @@ impl Engine {
             ));
         }
 
-        // One refusal for a case that does not exist, names no device,
-        // or was already redeemed — a distinguishable answer would let
-        // anyone holding a marked device probe case references.
-        let Some(from_binding) = self.store.recoverable_binding_for_case(case_id)? else {
-            return Err(Error::BadRequest("no recoverable record for that case reference".into()));
-        };
-        let Some(to_binding) = self.store.device_binding_for_user(user_key)? else {
+        let grant: RecoveryGrant = serde_json::from_slice(grant_raw)
+            .map_err(|e| Error::BadRequest(format!("malformed recovery grant: {e}")))?;
+        if grant.grantee != user_key {
+            return Err(Error::SignatureInvalid(
+                "the grant was not issued to this identity".into(),
+            ));
+        }
+        let issued_at = util::parse_timestamp(&grant.issued_at)
+            .map_err(|e| Error::BadRequest(format!("grant issuedAt: {e}")))?;
+        if issued_at - now > GRANT_MAX_CLOCK_SKEW {
+            return Err(Error::BadRequest("grant issuedAt is in the future".into()));
+        }
+        if now - issued_at > GRANT_MAX_AGE {
             return Err(Error::BadRequest(
-                "this identity is not enrolled; enroll before claiming recovery".into(),
+                "grant has lapsed; ask the authority to issue a fresh one".into(),
+            ));
+        }
+
+        let signing_bytes = canonical::grant_signing_bytes(grant_raw)?;
+        let grant_ref = util::sha256_hex(&signing_bytes);
+        if self.store.grant_redeemed(&grant_ref)? {
+            return Err(Error::BadRequest("this grant has already been redeemed".into()));
+        }
+
+        let Some(from_binding) = self.store.binding_for_case(&grant.case_id)? else {
+            return Err(Error::BadRequest(
+                "the grant names a case this interface holds no record for".into(),
             ));
         };
 
-        // What the record intends for the device the case named. A
-        // live ban means the record and the mark agree, and recovery is
-        // not the instrument for disagreeing with them — the declared
-        // new-holder path is.
-        let intended = self.intended_marks(&from_binding, now)?;
-        if let Some(intended) = intended.as_ref() {
-            if intended.bits.banned {
-                let (authority_contact, new_holder_url, appeal_url) = intended
-                    .ban
-                    .as_ref()
-                    .map(|(verdict_ref, verdict)| {
-                        let state = self.ban_state(verdict_ref, verdict);
-                        (state.authority_contact, state.new_holder_url, state.appeal_url)
-                    })
-                    .unwrap_or_else(|| ("the authority named in the case notice".into(), None, None));
-                return Ok(RecoveryResult::MarkInForce {
-                    authority_contact,
-                    new_holder_url,
-                    appeal_url,
-                });
+        // The verifying key comes from the consented manifest pinned by
+        // the case's own mandate — taking it from the grant would make
+        // verification circular, exactly as it would for a verdict.
+        self.verify_grant_signature(&grant, &from_binding, &signing_bytes)?;
+
+        let Some(to_binding) = self.store.device_binding_for_user(user_key)? else {
+            return Err(Error::BadRequest(
+                "this identity is not enrolled; enroll before presenting a grant".into(),
+            ));
+        };
+
+        // A record still in force — on either side of the move — stops
+        // it. The case's own record banning means the moderator granted
+        // against what the verdicts say (or a later ban landed since);
+        // the *claimant's* record banning means the grant would splice
+        // a cleared history onto a banned binding and burn its one
+        // redemption clearing nothing. Neither consumes the grant.
+        for binding in [&from_binding, &to_binding] {
+            let intended = self.intended_marks(binding, now)?;
+            if let Some(intended) = intended.as_ref() {
+                if intended.bits.banned {
+                    let (authority_contact, new_holder_url, appeal_url) = intended
+                        .ban
+                        .as_ref()
+                        .map(|(verdict_ref, verdict)| {
+                            let state = self.ban_state(verdict_ref, verdict);
+                            (state.authority_contact, state.new_holder_url, state.appeal_url)
+                        })
+                        .unwrap_or_else(|| {
+                            ("the authority named in the case notice".into(), None, None)
+                        });
+                    return Ok(RecoveryResult::MarkInForce {
+                        authority_contact,
+                        new_holder_url,
+                        appeal_url,
+                    });
+                }
             }
         }
 
         if from_binding != to_binding {
             let stamp = util::format_timestamp(now);
-            let moved = self.store.adopt_binding(&from_binding, &to_binding, &stamp)?;
-            // The adoption itself goes in the write log: a binding move
-            // changes what the next write is authorized by, and an
-            // audit that cannot see the move cannot follow the chain of
-            // custody from the verdict to the bits it cleared.
+            let moved = self.store.adopt_binding(
+                &grant_ref,
+                &grant.case_id,
+                &from_binding,
+                &to_binding,
+                &stamp,
+            )?;
+            // The move goes in the write log: it changes what the next
+            // write is authorized by, and an audit that cannot see it
+            // cannot follow the chain of custody from the verdict to
+            // the bits it clears. This row records no bit write — the
+            // outcome says so explicitly so a reader of the log never
+            // mistakes it for one.
             self.store.append_write_log(
                 &to_binding,
-                intended
-                    .as_ref()
-                    .map(|i| i.authorized_by.as_str())
-                    .unwrap_or("reconciliation"),
+                &format!("recovery-grant:{grant_ref}"),
                 bits.case_open,
                 bits.banned,
-                &format!("adopted {} case(s) from {from_binding} for recovery", moved.len()),
+                &format!(
+                    "record move only, no bits written: adopted {} case(s) from {from_binding}",
+                    moved.len()
+                ),
                 &stamp,
             )?;
         }
 
-        // An ordinary gate check now resolves the moved record and
-        // performs the clearing write on the verdicts' own authority.
-        let gate = self.gate_check(Some(device_token), user_key, now).await?;
+        // Ordinary reconciliation now resolves the moved record and
+        // performs the clearing write on the verdicts' own authority,
+        // against the bits already read in this session.
+        let gate = self.reconcile(device_check, device_token, user_key, bits, now).await?;
         Ok(RecoveryResult::Recovered { gate })
+    }
+
+    /// Verify a grant against the operator key of the authority the
+    /// case's consented manifest names. The manifest travels with the
+    /// first delivered verdict and is pinned by the mandate's hash, so
+    /// this is the key the user consented to — not one the grant, the
+    /// claimant, or even this interface's configuration could swap.
+    fn verify_grant_signature(
+        &self,
+        grant: &RecoveryGrant,
+        case_binding: &str,
+        signing_bytes: &[u8],
+    ) -> Result<(), Error> {
+        let verdicts = self.store.verdicts_for_device(case_binding)?;
+        let mandate_ref = verdicts
+            .iter()
+            .find(|v| v.case_id == grant.case_id)
+            .map(|v| v.mandate_ref.clone())
+            .ok_or_else(|| {
+                Error::BadRequest("the grant names a case this interface holds no record for".into())
+            })?;
+        let Some(manifest_raw) = self.store.manifest_for_mandate(&mandate_ref)? else {
+            return Err(Error::BadRequest(
+                "no consented manifest on file for the case's mandate".into(),
+            ));
+        };
+        let manifest: crate::types::AuthorityManifest = serde_json::from_slice(&manifest_raw)
+            .map_err(|e| Error::Internal(format!("stored manifest unparseable: {e}")))?;
+        if manifest.component_id != grant.authority {
+            return Err(Error::SignatureInvalid(
+                "the grant names a different authority than the case's consented manifest".into(),
+            ));
+        }
+        let key_bytes: [u8; 32] = util::key_bytes_from_reference(&manifest.operator_key)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| {
+                Error::Internal("consented manifest operator key is not a 32-byte reference".into())
+            })?;
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes)
+            .map_err(|e| Error::Internal(format!("consented manifest operator key: {e}")))?;
+        let raw_signature = util::base64_decode(&grant.signature)
+            .ok_or_else(|| Error::BadRequest("grant signature is not base64".into()))?;
+        let signature = ed25519_dalek::Signature::from_slice(&raw_signature)
+            .map_err(|e| Error::BadRequest(format!("grant signature is malformed: {e}")))?;
+        key.verify_strict(signing_bytes, &signature).map_err(|_| {
+            Error::SignatureInvalid(
+                "grant signature did not verify against the consented operator key".into(),
+            )
+        })
     }
 
     /// Fold this device's verdicts into the marks they currently
