@@ -18,7 +18,8 @@ use crate::devicecheck::{Bits, DeviceCheck};
 use crate::error::Error;
 use crate::store::{Store, StoredVerdict};
 use crate::types::{
-    BanState, CheckRequiredReason, GateCheckResult, RecoveryGrant, RecoveryResult, Verdict,
+    BanState, CheckRequiredReason, GateCheckResult, RecoveryGrant, RecoveryResult, UnbanGrant,
+    Verdict,
 };
 use crate::util;
 
@@ -34,6 +35,7 @@ const GRANT_MAX_CLOCK_SKEW: time::Duration = time::Duration::minutes(5);
 /// verdict — signed by the same key over the same canonical form —
 /// from ever being presented as one another.
 const RECOVERY_GRANT_DOMAIN: &str = "onym-recovery-grant-v1";
+const UNBAN_GRANT_DOMAIN: &str = "onym-unban-grant-v1";
 
 pub struct Engine {
     pub store: Store,
@@ -235,6 +237,20 @@ impl Engine {
             ));
         }
 
+        let grant_value = serde_json::from_slice::<serde_json::Value>(grant_raw)
+            .map_err(|e| Error::BadRequest(format!("malformed recovery grant: {e}")))?
+            ;
+        let grant_type = grant_value
+            .get("grantType")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if grant_type == UNBAN_GRANT_DOMAIN {
+            let grant: UnbanGrant = serde_json::from_slice(grant_raw)
+                .map_err(|e| Error::BadRequest(format!("malformed unban grant: {e}")))?;
+            return self
+                .recover_unban_grant(device_check, device_token, user_key, grant_raw, grant, now)
+                .await;
+        }
         let grant: RecoveryGrant = serde_json::from_slice(grant_raw)
             .map_err(|e| Error::BadRequest(format!("malformed recovery grant: {e}")))?;
         if grant.grant_type != RECOVERY_GRANT_DOMAIN {
@@ -401,6 +417,92 @@ impl Engine {
         }
     }
 
+    async fn recover_unban_grant(
+        &self,
+        device_check: &DeviceCheck,
+        device_token: &str,
+        user_key: &str,
+        grant_raw: &[u8],
+        grant: UnbanGrant,
+        now: OffsetDateTime,
+    ) -> Result<RecoveryResult, Error> {
+        if grant.grant_version != 1 {
+            return Err(Error::BadRequest(format!(
+                "unsupported grantVersion {} (this interface implements 1)",
+                grant.grant_version
+            )));
+        }
+        if grant.grantee != user_key {
+            return Err(Error::SignatureInvalid(
+                "the grant was not issued to this identity".into(),
+            ));
+        }
+        let issued_at = util::parse_timestamp(&grant.issued_at)
+            .map_err(|e| Error::BadRequest(format!("grant issuedAt: {e}")))?;
+        if issued_at - now > GRANT_MAX_CLOCK_SKEW {
+            return Err(Error::BadRequest("grant issuedAt is in the future".into()));
+        }
+        if now - issued_at > GRANT_MAX_AGE {
+            return Err(Error::BadRequest(
+                "grant has lapsed; ask the authority to issue a fresh one".into(),
+            ));
+        }
+
+        let signing_bytes = canonical::grant_signing_bytes(grant_raw)?;
+        let grant_ref = util::sha256_hex(&signing_bytes);
+        if self.store.unban_redeemed(&grant_ref)? {
+            return Err(Error::BadRequest("this grant has already been redeemed".into()));
+        }
+        self.verify_unban_grant_signature(&grant, &signing_bytes)?;
+
+        let Some(to_binding) = self.store.device_binding_for_user(user_key)? else {
+            return Err(Error::BadRequest(
+                "this identity is not enrolled; enroll before presenting a grant".into(),
+            ));
+        };
+        let dest = self.binding_state(&to_binding, None, now)?;
+        if let Some((verdict_ref, verdict)) = dest.ban_route.as_ref() {
+            let state = self.ban_state(verdict_ref, verdict);
+            return Ok(RecoveryResult::MarkInForce {
+                authority_contact: state.authority_contact,
+                new_holder_url: state.new_holder_url,
+                appeal_url: state.appeal_url,
+            });
+        }
+        if dest.ban_present {
+            return Ok(RecoveryResult::MarkInForce {
+                authority_contact: "the authority named in the case notice".into(),
+                new_holder_url: None,
+                appeal_url: None,
+            });
+        }
+        if dest.open {
+            return Ok(RecoveryResult::CaseUnsettled {
+                note: "this identity has an open moderation case; it must be decided before the device can be unbanned".into(),
+            });
+        }
+
+        if !self.store.record_unban_redemption(
+            &grant_ref,
+            &to_binding,
+            &util::format_timestamp(now),
+        )? {
+            return Err(Error::BadRequest("this grant has already been redeemed".into()));
+        }
+        self.write_bits(
+            device_check,
+            device_token,
+            &to_binding,
+            Bits { case_open: false, banned: false },
+            &format!("recovery-unban:{grant_ref}"),
+            now,
+        )
+        .await?;
+        self.reconcile(device_check, device_token, user_key, Bits::default(), now)
+            .await
+            .map(|gate| RecoveryResult::Recovered { gate })
+    }
+
     /// What a binding still carries that recovery must not move or
     /// clear, derived from the *governing* verdict per case — the
     /// newest under the store's total order, exactly as the fold
@@ -530,6 +632,35 @@ impl Engine {
         let signature = ed25519_dalek::Signature::from_slice(&raw_signature)
             .map_err(|_| Self::grant_refused())?;
         key.verify_strict(signing_bytes, &signature).map_err(|_| Self::grant_refused())
+    }
+
+    fn verify_unban_grant_signature(
+        &self,
+        grant: &UnbanGrant,
+        signing_bytes: &[u8],
+    ) -> Result<(), Error> {
+        let raw_signature = util::base64_decode(&grant.signature).ok_or_else(Self::grant_refused)?;
+        let signature = ed25519_dalek::Signature::from_slice(&raw_signature)
+            .map_err(|_| Self::grant_refused())?;
+        for manifest_raw in self.store.manifests_for_authority(&grant.authority)? {
+            let Ok(manifest) = serde_json::from_slice::<crate::types::AuthorityManifest>(&manifest_raw) else {
+                continue;
+            };
+            if manifest.component_id != grant.authority {
+                continue;
+            }
+            let Some(key_bytes) = util::key_bytes_from_reference(&manifest.operator_key)
+                .and_then(|b| <[u8; 32]>::try_from(b).ok()) else {
+                continue;
+            };
+            let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes) else {
+                continue;
+            };
+            if key.verify_strict(signing_bytes, &signature).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(Self::grant_refused())
     }
 
     /// Fold this device's verdicts into the marks they currently

@@ -101,6 +101,23 @@ pub struct RecoveryGrant {
     pub signature: String,
 }
 
+/// A moderator's case-free authorization to clear a DeviceCheck ban after
+/// reinstall. There is intentionally no case id: the fresh token cannot be
+/// linked to the old device binding.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnbanGrant {
+    #[serde(rename = "grantType")]
+    pub grant_type: String,
+    #[serde(default = "one")]
+    pub grant_version: u32,
+    pub claim_id: String,
+    pub grantee: String,
+    pub authority: String,
+    pub issued_at: String,
+    pub signature: String,
+}
+
 /// The answer to a recovery claim. `Recovered` carries the gate result
 /// the reconciliation produced, so the client needs no second round
 /// trip. `MarkInForce` deliberately carries only the routes the holder
