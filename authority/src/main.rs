@@ -37,8 +37,63 @@ use config::Config;
 use state::AppState;
 use store::Store;
 
+/// Print the `onym:key:` reference of the public half of
+/// `AUTHORITY_SIGNING_SEED`, and nothing else.
+///
+/// This exists to break a chicken-and-egg that had no other exit. The
+/// manifest's `operator` must name the key this service signs with, and
+/// boot refuses when the two disagree — correctly, since a verdict
+/// signed by a key the manifest does not name is unverifiable. But the
+/// public half is derived from a seed that lives in a secret store, so
+/// there was no way to learn it without first standing the service up
+/// against a manifest that could not yet be right.
+///
+/// Deriving it here keeps the seed where it belongs. The operator runs
+/// this locally, against their own secret, and the only thing that
+/// leaves is a public key.
+fn derive_operator_key() -> ! {
+    let Ok(hex_seed) = std::env::var("AUTHORITY_SIGNING_SEED") else {
+        eprintln!(
+            "AUTHORITY_SIGNING_SEED is not set.\n\n\
+             Generate one with `openssl rand -hex 32` and keep it in a secret store. It signs \
+             every verdict this authority issues, so rotating it later invalidates all of them \
+             — treat it as long-lived from the start."
+        );
+        std::process::exit(1);
+    };
+    let seed: [u8; 32] = match hex::decode(hex_seed.trim()).ok().and_then(|raw| raw.try_into().ok())
+    {
+        Some(seed) => seed,
+        None => {
+            eprintln!("AUTHORITY_SIGNING_SEED must be 32 bytes as 64 hex characters.");
+            std::process::exit(1);
+        }
+    };
+    // Bare on stdout, so it can be piped straight into the manifest.
+    println!("{}", operator_key_for(&seed));
+    std::process::exit(0);
+}
+
+/// The manifest's `operator` value for a signing seed.
+///
+/// Shared with the boot check rather than reimplemented beside it: a
+/// derivation that disagreed with the one the service compares against
+/// would hand operators a key guaranteed to fail the check it exists to
+/// satisfy.
+fn operator_key_for(seed: &[u8; 32]) -> String {
+    let key = ed25519_dalek::SigningKey::from_bytes(seed);
+    util::key_reference(key.verifying_key().as_bytes())
+}
+
 #[tokio::main]
 async fn main() {
+    // Before anything reads a manifest or opens a store: this
+    // subcommand is what an operator runs *because* those are not
+    // configured yet.
+    if std::env::args().nth(1).as_deref() == Some("derive-operator-key") {
+        derive_operator_key();
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -83,10 +138,12 @@ async fn main() {
     if state.config.manifest.operator_key != signing_reference {
         eprintln!(
             "Configuration error: the manifest's `operator` is {} but this service signs with \
-             {}.\n\nEvery verdict issued would be refused downstream. Put the signing key in the \
-             manifest's `operator` field, or point AUTHORITY_SIGNING_SEED at the key the manifest \
-             already names.",
-            state.config.manifest.operator_key, signing_reference
+             {}.\n\nEvery verdict issued would be refused downstream. Put this key in the \
+             manifest's `operator` field:\n\n    {}\n\n…or point AUTHORITY_SIGNING_SEED at the \
+             key the manifest already names. To derive the key from a seed without starting the \
+             service:\n\n    AUTHORITY_SIGNING_SEED=… onym-moderation-authority \
+             derive-operator-key\n",
+            state.config.manifest.operator_key, signing_reference, signing_reference
         );
         std::process::exit(1);
     }
@@ -305,5 +362,25 @@ async fn main() {
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("server error: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The subcommand and the boot check must agree. If they did not,
+    /// `derive-operator-key` would hand an operator the one value
+    /// guaranteed to fail the check it exists to satisfy — and the
+    /// symptom would be a service that refuses to start while the
+    /// manifest looks correct.
+    #[test]
+    fn the_derived_key_is_the_one_boot_compares_against() {
+        let state = AppState::for_tests(Store::in_memory().unwrap());
+        let seed = state.config.signing_seed;
+        let at_boot = util::key_reference(state.signing_key.verifying_key().as_bytes());
+        assert_eq!(operator_key_for(&seed), at_boot);
+        assert!(at_boot.starts_with("onym:key:"));
+        assert_eq!(at_boot.len(), "onym:key:".len() + 64);
     }
 }
