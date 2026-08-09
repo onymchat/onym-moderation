@@ -123,11 +123,20 @@ fn derive(root: &[u8; 32], authority: &str, epoch: u32) -> [u8; 32] {
 /// Split on the **last** `=` of each entry, because a component id is
 /// full of colons and may one day contain worse.
 ///
-/// Strict: a malformed entry is a boot failure rather than a silent
-/// zero. Falling back to the root on a typo'd epoch would countersign
-/// with a key the authority is not expecting, and the symptom would be
-/// every mandate registration refused for a reason neither side can see
-/// from its own logs.
+/// Strict about what it can be strict about: a malformed entry is a
+/// boot failure rather than a silent zero, because falling back to the
+/// root on a typo'd epoch countersigns with a key the authority is not
+/// expecting, and the symptom is every registration refused for a
+/// reason neither side can see from its own logs.
+///
+/// **A typo in the component id has that same symptom and cannot be
+/// caught here.** `onym:component:autority=1` parses perfectly and
+/// leaves the real authority on epoch 0. There is no allowlist to check
+/// against — the interface deliberately has none, since which authority
+/// a user trusts is the user's business — so the shape is validated and
+/// the rest is left to the boot log, which names every configured id
+/// beside the key it produced. Compare that against what the mandates
+/// actually carry.
 pub fn parse_epochs(raw: &str) -> Result<BTreeMap<String, u32>, String> {
     let mut epochs = BTreeMap::new();
     for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
@@ -138,6 +147,15 @@ pub fn parse_epochs(raw: &str) -> Result<BTreeMap<String, u32>, String> {
         if authority.is_empty() {
             return Err(format!(
                 "MODERATION_INTERFACE_KEY_EPOCHS entry {entry:?} names no authority"
+            ));
+        }
+        // Catches a mistyped prefix, not a mistyped name. Worth the
+        // three lines anyway: it is the half of the typo space that
+        // can be checked without inventing an allowlist.
+        if !authority.starts_with("onym:component:") {
+            return Err(format!(
+                "MODERATION_INTERFACE_KEY_EPOCHS entry {entry:?} does not name a component \
+                 (expected onym:component:<id>=<epoch>)"
             ));
         }
         let epoch: u32 = epoch.trim().parse().map_err(|_| {
@@ -257,53 +275,11 @@ mod tests {
             "onym:component:a=one",    // not a number
             "onym:component:a=-1",     // negative
             "=3",                      // no authority
+            "onym:compnent:a=1",       // mistyped prefix
+            "just-a-name=1",           // not a component reference
             "onym:component:a=1,onym:component:a=2", // ambiguous
         ] {
             assert!(parse_epochs(bad).is_err(), "{bad:?} must be refused");
         }
-    }
-}
-
-/// Wiring, not derivation: the key `countersign` actually reaches for.
-///
-/// The unit tests above prove the derivation is per-authority and
-/// stable. This proves the handler consults it — that a mandate naming
-/// a rotated authority is signed with that authority's key, and one
-/// naming an unrotated authority is still signed with the root. A
-/// derivation nothing calls would pass every test in this file.
-#[cfg(test)]
-mod wiring_tests {
-    use super::*;
-    use ed25519_dalek::{Signer, Verifier};
-
-    #[test]
-    fn a_mandate_is_countersigned_with_its_own_authoritys_key() {
-        const ROOT: [u8; 32] = [3u8; 32];
-        let rotated = "onym:component:rotated";
-        let untouched = "onym:component:untouched";
-        let keys = CountersigningKeys::new(
-            ROOT,
-            [(rotated.to_string(), 5u32)].into_iter().collect(),
-        );
-
-        let bytes = b"the mandate's canonical signing bytes";
-        let root_public = SigningKey::from_bytes(&ROOT).verifying_key();
-
-        // Rotated: verifies under the rotated key, and specifically
-        // *not* under the root — the point of rotating is that the old
-        // key stops working for this relationship.
-        let signature = keys.signing_key(rotated).sign(bytes);
-        let rotated_public = keys.signing_key(rotated).verifying_key();
-        assert!(rotated_public.verify(bytes, &signature).is_ok());
-        assert!(
-            root_public.verify(bytes, &signature).is_err(),
-            "a rotated authority's countersignature must not verify under the old key"
-        );
-
-        // Untouched: still the root, so an authority that was never
-        // rotated needs no configuration change and notices nothing.
-        let signature = keys.signing_key(untouched).sign(bytes);
-        assert!(root_public.verify(bytes, &signature).is_ok());
-        assert_eq!(keys.key_reference(untouched), keys.root_reference());
     }
 }

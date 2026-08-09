@@ -26,7 +26,6 @@ mod verdict;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-
 use api::AppState;
 use config::Config;
 use devicecheck::DeviceCheck;

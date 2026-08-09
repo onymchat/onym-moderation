@@ -143,7 +143,14 @@ for a human and dismiss at their deadline.
   service refuses every mandate registration without it, so the
   deployment will run but acquire no jurisdiction at all — users will
   appear to consent and nothing will register. Set it to the
-  interface's countersigning key from its `/health`.
+  interface's countersigning key **for this authority** from its
+  `/health`: `rotatedInterfaceKeys["<our componentId>"].key` if that
+  entry exists, otherwise `interfaceKey`. The interface derives a key
+  per authority, so reading `interfaceKey` after it has rotated us
+  yields the wrong key and every registration is refused — with a
+  signature error, not a configuration one, which is the confusing
+  way round. Two comma-separated keys are accepted so a rotation
+  needs no downtime.
 - **Someone asks you to ban a user directly, or to skip the response
   window.** There is no such path: a ban requires a case, notice, and
   either an elapsed response window or a response. Adding a bypass is

@@ -478,6 +478,116 @@ fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{SigningKey, Verifier};
+
+    /// A signed-in-the-real-shape mandate and the state that will
+    /// countersign it.
+    ///
+    /// Built through `countersign` itself rather than by calling the
+    /// key derivation: a test that reaches for `CountersigningKeys`
+    /// directly proves the derivation works and says nothing about
+    /// whether the handler uses it — which is exactly the hole the
+    /// first version of this had. Reverting the handler to a fixed key
+    /// must fail *this* test.
+    fn state_with(epochs: &[(&str, u32)]) -> Arc<AppState> {
+        let config = Config {
+            bind_addr: "127.0.0.1:0".into(),
+            store_path: ":memory:".into(),
+            p8_pem: None,
+            key_id: None,
+            team_id: None,
+            environment: crate::devicecheck::Environment::Development,
+            interface_signing_seed: [11u8; 32],
+            interface_key_epochs: epochs
+                .iter()
+                .map(|(a, e)| ((*a).to_string(), *e))
+                .collect(),
+            interface_component_id: "onym:component:onym-ios".into(),
+            enforce_signatures: true,
+            authority_token: Some("token".into()),
+            allow_unauthenticated_authority: false,
+            audit_token: None,
+            session_max_skew_secs: 300,
+        };
+        let countersigning = crate::countersigning::CountersigningKeys::new(
+            config.interface_signing_seed,
+            config.interface_key_epochs.clone(),
+        );
+        Arc::new(AppState {
+            config,
+            engine: crate::enforcement::Engine {
+                store: crate::store::Store::in_memory().unwrap(),
+                device_check: None,
+            },
+            countersigning,
+        })
+    }
+
+    /// Ask the handler to countersign a mandate naming `authority`,
+    /// and return the signature it produced over the same bytes the
+    /// user signed.
+    async fn countersigned_for(state: &Arc<AppState>, authority: &str) -> (Vec<u8>, Vec<u8>) {
+        let user_key = SigningKey::from_bytes(&[5u8; 32]);
+        let user = util::key_reference(user_key.verifying_key().as_bytes());
+        // The binding must be one this interface issued to that identity.
+        let binding = state.engine.store
+            .enrollment_for(&user, "2026-08-08T00:00:00Z").unwrap().device_binding;
+
+        let mut mandate = serde_json::json!({
+            "mandateVersion": 1,
+            "user": user,
+            "interface": "onym:component:onym-ios",
+            "authority": authority,
+            "manifestHash": "0".repeat(64),
+            "classes": ["csam"],
+            "deviceBinding": binding,
+            "acceptedAt": "2026-08-08T00:00:00Z",
+        });
+        let unsigned = serde_json::to_vec(&mandate).unwrap();
+        let signing_bytes = crate::canonical::mandate_signing_bytes(&unsigned).unwrap();
+        mandate["signatures"] =
+            serde_json::json!([util::base64_encode(&user_key.sign(&signing_bytes).to_bytes())]);
+        let body = serde_json::to_vec(&mandate).unwrap();
+
+        let response = countersign(State(Arc::clone(state)), body.clone().into())
+            .await
+            .expect("the handler must countersign a well-formed mandate");
+        let signature = util::base64_decode(&response.0.signature).expect("base64 signature");
+        (crate::canonical::mandate_signing_bytes(&body).unwrap(), signature)
+    }
+
+    /// The wiring, exercised through the endpoint.
+    ///
+    /// A mandate naming a rotated authority must be countersigned with
+    /// that authority's key and **not** the root — otherwise rotation
+    /// is a derivation nothing calls.
+    #[tokio::test]
+    async fn the_handler_countersigns_with_the_named_authoritys_key() {
+        let rotated = "onym:component:rotated";
+        let untouched = "onym:component:untouched";
+        let state = state_with(&[(rotated, 4)]);
+
+        let root = SigningKey::from_bytes(&state.config.interface_signing_seed).verifying_key();
+        let rotated_public =
+            state.countersigning.signing_key(rotated).verifying_key();
+
+        let (bytes, signature) = countersigned_for(&state, rotated).await;
+        let signature = ed25519_dalek::Signature::from_slice(&signature).unwrap();
+        assert!(
+            rotated_public.verify(&bytes, &signature).is_ok(),
+            "must be signed with the rotated authority's key"
+        );
+        assert!(
+            root.verify(&bytes, &signature).is_err(),
+            "and must not still verify under the root — that is what rotating means"
+        );
+
+        // An authority nobody rotated is still on the root, so it
+        // notices nothing.
+        let (bytes, signature) = countersigned_for(&state, untouched).await;
+        let signature = ed25519_dalek::Signature::from_slice(&signature).unwrap();
+        assert!(root.verify(&bytes, &signature).is_ok());
+    }
 
     #[test]
     fn mandate_consent_rejects_empty_classes_and_future_timestamps() {

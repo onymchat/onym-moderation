@@ -132,23 +132,48 @@ and not lose, in exchange for containment the design does not provide.
 
 ### Rotating
 
-Order matters — the authority must be expecting the new key before you
-start signing with it, or every registration in the gap is refused.
+The authority accepts a **list** of interface keys
+(`AUTHORITY_INTERFACE_KEY`, comma-separated), and that is what makes a
+gapless rotation possible. It holds one key per entry and checks a
+countersignature against any of them.
 
-1. Compute the next epoch's key without deploying it. Bump the epoch in
-   a scratch environment and read `rotatedInterfaceKeys` from `/health`,
-   or derive it offline with the formula above.
-2. Give that value to the authority operator; they set it as their
-   `AUTHORITY_INTERFACE_KEY` and restart.
-3. Bump the epoch here and deploy.
+Without that list there is no safe order. The authority would expect
+exactly one key, so whichever side moved first, every registration for
+that authority would be refused until the other caught up — reversing
+the steps only changes which side of the gap you are on.
 
-Mandates countersigned under the old epoch stop verifying at step 3.
-That is the point of rotating, and it is why you would only do it for a
-key you no longer trust or an authority you are de-listing — not as
-routine hygiene.
+1. Derive the next epoch's key without deploying it: bump the epoch in a
+   scratch environment and read `rotatedInterfaceKeys` from `/health`,
+   or compute it offline with the formula above.
+2. The authority operator **adds** it to `AUTHORITY_INTERFACE_KEY`
+   alongside the current one and restarts. Both now verify.
+3. Bump the epoch here and deploy. Countersignatures switch to the new
+   key; the old ones already issued still verify, because the authority
+   still lists that key.
+4. The authority operator drops the old key. Now — and only now — do
+   mandates countersigned under the old epoch stop verifying.
+
+Step 4 is the irreversible one, and it is the point: it is what burns a
+key you no longer trust. Everything before it is reversible.
 
 `/health` reports the root key as `interfaceKey` and every rotated
-authority under `rotatedInterfaceKeys`.
+authority under `rotatedInterfaceKeys`. An authority that has never
+been rotated has no entry there and uses `interfaceKey` — which is why
+the authority-side docs tell operators to check for their own entry
+first rather than reading `interfaceKey` blindly.
+
+### If the component id is wrong
+
+`MODERATION_INTERFACE_KEY_EPOCHS` validates the shape of an id, not its
+existence — there is no allowlist here, deliberately, since which
+authority a user trusts is the user's business. So
+`onym:component:autority=1` parses cleanly and leaves the real
+authority on epoch 0, with the same symptom as a botched rotation:
+registrations refused with a signature error rather than a
+configuration one.
+
+The boot log names every configured id beside the key it produced.
+Check it against what the mandates actually carry.
 
 ## Cross-implementation agreement
 

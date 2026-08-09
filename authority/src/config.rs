@@ -56,10 +56,19 @@ pub struct Config {
     /// Where to deliver verdicts, and the token that endpoint expects.
     pub interface_base_url: Option<String>,
     pub interface_token: Option<String>,
-    /// The interface's countersigning key, used to check that a
+    /// The interface's countersigning key(s), used to check that a
     /// registered mandate really was countersigned by the interface
     /// that claims to have witnessed it.
-    pub interface_key: Option<String>,
+    ///
+    /// A list, because the interface derives a separate key per
+    /// authority and can rotate ours. With one accepted key there is no
+    /// order in which a rotation avoids downtime: whichever side moves
+    /// first, registrations fail until the other catches up. Accepting
+    /// the incoming key alongside the outgoing one closes that window —
+    /// add the new, let the interface cut over, then drop the old.
+    ///
+    /// Empty means unconfigured, which refuses every registration.
+    pub interface_keys: Vec<String>,
 
     /// Bearer token for the moderator's decision endpoint. Deciding a
     /// case is the authority's judgment; nothing here should be able to
@@ -276,7 +285,15 @@ impl Config {
             signing_seed,
             interface_base_url: env::var("AUTHORITY_INTERFACE_URL").ok().filter(|v| !v.is_empty()),
             interface_token: env::var("AUTHORITY_INTERFACE_TOKEN").ok().filter(|v| !v.is_empty()),
-            interface_key: env::var("AUTHORITY_INTERFACE_KEY").ok().filter(|v| !v.is_empty()),
+            // Comma-separated so a rotation can list both keys at
+            // once. Order is irrelevant; each is tried.
+            interface_keys: env::var("AUTHORITY_INTERFACE_KEY")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(str::to_string)
+                .collect(),
             moderator_token: env::var("AUTHORITY_MODERATOR_TOKEN").ok().filter(|v| !v.is_empty()),
             deadline_sweep_secs: env::var("AUTHORITY_DEADLINE_SWEEP_SECS")
                 .ok()
@@ -441,8 +458,13 @@ Delivering verdicts to the interface:
   AUTHORITY_INTERFACE_URL      Base URL of the enforcement backend (e.g.
                                https://moderation.onym.app)
   AUTHORITY_INTERFACE_TOKEN    Its MODERATION_AUTHORITY_TOKEN
-  AUTHORITY_INTERFACE_KEY      onym:key:<hex> of the interface's countersigning key,
-                               used to check registered mandates were really countersigned
+  AUTHORITY_INTERFACE_KEY      onym:key:<hex> of the interface's countersigning key for
+                               this authority, used to check registered mandates were
+                               really countersigned. From the interface's /health:
+                               rotatedInterfaceKeys["<our componentId>"].key if present,
+                               else interfaceKey — it derives a key per authority, so the
+                               root is only ours until someone rotates us.
+                               Comma-separate two to ride out a rotation with no gap.
 
 Optional:
   AUTHORITY_BIND               Listen address (default: 0.0.0.0:8080)

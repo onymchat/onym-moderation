@@ -168,17 +168,7 @@ async fn accept_mandate(
     // The interface's countersignature is what makes it a mandate
     // rather than a unilateral claim — it says the interface witnessed
     // the consent and will execute verdicts under it.
-    match (state.config.interface_key.as_deref(), mandate.signatures.get(1)) {
-        (Some(interface_key), Some(countersignature)) => {
-            verify_signature(interface_key, &signing_bytes, countersignature).map_err(|_| {
-                Error::SignatureInvalid("interface countersignature did not verify".into())
-            })?;
-        }
-        (Some(_), None) => {
-            return Err(Error::BadRequest(
-                "mandate is not countersigned by the interface".into(),
-            ))
-        }
+    match (state.config.interface_keys.as_slice(), mandate.signatures.get(1)) {
         // No interface key configured, so a countersignature cannot be
         // checked — and an unverifiable designation is exactly the
         // forgery this check exists to catch. Refuse. Accepting here
@@ -186,16 +176,41 @@ async fn accept_mandate(
         // jurisdiction over a user who never consented, which is the
         // one failure that turns a consent-bound authority into an
         // unbounded one.
-        (None, _) => {
+        ([], _) => {
             tracing::error!(
                 "AUTHORITY_INTERFACE_KEY is unset; refusing mandate registration. Set it to the \
-                 interface's countersigning key (its /health `countersigningKey`)."
+                 interface's countersigning key for this authority — its /health `interfaceKey`, \
+                 or `rotatedInterfaceKeys[<our componentId>].key` if the interface has rotated \
+                 ours."
             );
             return Err(Error::BadRequest(
                 "this authority is not configured with an interface countersigning key, so it \
                  cannot verify that the interface witnessed this consent"
                     .into(),
             ));
+        }
+        (_, None) => {
+            return Err(Error::BadRequest(
+                "mandate is not countersigned by the interface".into(),
+            ))
+        }
+        (interface_keys, Some(countersignature)) => {
+            // Any configured key. More than one is how a rotation
+            // happens without a window in which every registration
+            // fails: with a single accepted key there is no order that
+            // avoids one — whichever side moves first, registrations
+            // break until the other catches up. Listing the incoming
+            // key alongside the outgoing one closes that window.
+            let witnessed = interface_keys.iter().any(|interface_key| {
+                verify_signature(interface_key, &signing_bytes, countersignature).is_ok()
+            });
+            if !witnessed {
+                return Err(Error::SignatureInvalid(
+                    "interface countersignature did not verify against any configured interface \
+                     key"
+                        .into(),
+                ));
+            }
         }
     }
 
@@ -1681,7 +1696,7 @@ mod tests {
     #[tokio::test]
     async fn mandate_registration_fails_closed_without_an_interface_key() {
         let mut state = AppState::for_tests(Store::in_memory().unwrap());
-        state.config.interface_key = None;
+        state.config.interface_keys.clear();
         let harness = Harness { state: Arc::new(state) };
 
         let manifest_hash = util::sha256_hex(&harness.state.config.manifest_raw);
@@ -1693,6 +1708,69 @@ mod tests {
 
         let (status, _) = harness.post("/v1/mandates", body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// The reason `interface_keys` is a list.
+    ///
+    /// The interface derives a separate countersigning key per
+    /// authority and can rotate ours. With a single accepted key there
+    /// is no order in which that rotation avoids downtime — whichever
+    /// side moves first, every registration fails until the other
+    /// catches up. Accepting the incoming key alongside the outgoing
+    /// one is what closes that window: both verify while the cutover
+    /// happens, and the old entry is dropped afterwards.
+    #[tokio::test]
+    async fn both_keys_verify_while_a_rotation_is_in_flight() {
+        // A second interface key, as the interface would derive after
+        // bumping our epoch.
+        const NEXT_INTERFACE_SEED: [u8; 32] = [23u8; 32];
+        let next = crate::testing::key_reference(NEXT_INTERFACE_SEED);
+
+        let mut state = AppState::for_tests(Store::in_memory().unwrap());
+        state.config.interface_keys.push(next);
+        let harness = Harness { state: Arc::new(state) };
+        let manifest_hash = util::sha256_hex(&harness.state.config.manifest_raw);
+
+        // Countersigned with the outgoing key: still accepted.
+        let (status, response) = harness
+            .post(
+                "/v1/mandates",
+                signed(
+                    mandate_json(ACCUSED_SEED, json!(["csam"]), &manifest_hash),
+                    "signatures",
+                    &[ACCUSED_SEED, INTERFACE_SEED],
+                ),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "outgoing key: {response}");
+
+        // Countersigned with the incoming key: also accepted, which is
+        // the whole point — the interface can cut over without a gap.
+        let (status, response) = harness
+            .post(
+                "/v1/mandates",
+                signed(
+                    mandate_json(REPORTER_SEED, json!(["csam"]), &manifest_hash),
+                    "signatures",
+                    &[REPORTER_SEED, NEXT_INTERFACE_SEED],
+                ),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "incoming key: {response}");
+
+        // A key on neither side of the rotation is still refused —
+        // accepting a list is not accepting anything.
+        let (status, _) = harness
+            .post(
+                "/v1/mandates",
+                signed(
+                    mandate_json(ACCUSED_SEED, json!(["csam"]), &manifest_hash),
+                    "signatures",
+                    &[ACCUSED_SEED, [99u8; 32]],
+                ),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
