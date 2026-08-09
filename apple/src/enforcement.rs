@@ -371,11 +371,40 @@ impl Engine {
     /// don't hold yet is omitted rather than served with invented
     /// dates: these are shown to an accused person deciding when to
     /// respond, and a plausible wrong date is worse than none.
+    ///
+    /// **One notice per case, the latest.** The authority issues a
+    /// fresh `open-case` verdict for every report joined to a case, and
+    /// none of them supersede each other — they are all notices of the
+    /// same live case. Serving all of them handed the accused several
+    /// notices for one case, each with `responseDeadline` counted from
+    /// its own `decidedAt`, so the earlier ones showed windows that had
+    /// already lapsed while the authority was enforcing only the
+    /// newest. That is the invented-date failure the paragraph above
+    /// warns about, arrived at from the other direction: every date was
+    /// correctly derived, and all but one described a deadline nobody
+    /// was working to.
+    ///
+    /// `verdicts_for_device` already returns newest-first under a total
+    /// order, so the first `open-case` row seen for a case is the one
+    /// in force. Taking the dedupe from that ordering rather than
+    /// re-deriving "latest" here keeps this agreeing with the causal
+    /// fold that decides the marks.
     fn open_case_notices(&self, device_binding: &str) -> Result<Vec<crate::types::CaseNotice>, Error> {
         let verdicts = self.store.verdicts_for_device(device_binding)?;
+        let mut seen_cases = std::collections::HashSet::new();
         let mut notices = Vec::new();
         for stored in verdicts {
             if stored.superseded || stored.disposition != "open-case" {
+                continue;
+            }
+            // Claimed on the stored row, before the verdict is parsed
+            // and before any of the render checks below. A case whose
+            // newest notice cannot be rendered — no consented manifest
+            // on file yet, an unreadable class — must serve *nothing*,
+            // not fall back to an older notice carrying a lapsed
+            // deadline. Falling back is the same bug wearing the
+            // omission rule as a disguise.
+            if !seen_cases.insert(stored.case_id.clone()) {
                 continue;
             }
             let Ok(verdict) = serde_json::from_slice::<Verdict>(&stored.raw) else {
