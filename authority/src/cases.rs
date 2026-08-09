@@ -52,6 +52,9 @@ pub fn open_case_verdict(
         // reports the case rests on.
         reasoning: intake_basis.to_string(),
         appeal_deadline: None,
+        appeal_url: None,
+        new_holder_url: None,
+        authority_contact: None,
         decided_at: util::format_timestamp(now),
         signature: String::new(),
         is_final: false,
@@ -83,6 +86,9 @@ pub fn dismissal_verdict(
         execute_after: None,
         reasoning: reasoning.to_string(),
         appeal_deadline: None,
+        appeal_url: None,
+        new_holder_url: None,
+        authority_contact: None,
         decided_at: util::format_timestamp(now),
         signature: String::new(),
         // A dismissal ends the case; there is nothing left to appeal.
@@ -99,6 +105,7 @@ pub fn ban_verdict(
     reasoning: &str,
     now: OffsetDateTime,
     key: &SigningKey,
+    appeal_routes: Option<&crate::decisions::AppealRoutes>,
 ) -> Result<Issued, Error> {
     let appeal_window = util::parse_days(&class.appeal_window)
         .map_err(|e| Error::Internal(format!("manifest appealWindow: {e}")))?;
@@ -140,6 +147,9 @@ pub fn ban_verdict(
         execute_after: Some(util::format_timestamp(execute_after)),
         reasoning: reasoning.to_string(),
         appeal_deadline: Some(util::format_timestamp(appeal_deadline)),
+        appeal_url: appeal_routes.map(|routes| routes.appeal_url.clone()),
+        new_holder_url: appeal_routes.map(|routes| routes.new_holder_url.clone()),
+        authority_contact: appeal_routes.map(|routes| routes.authority_contact.clone()),
         decided_at: util::format_timestamp(now),
         signature: String::new(),
         // Not final until the appeal deadline passes or a declared
@@ -227,7 +237,7 @@ mod tests {
     #[test]
     fn suspensive_ban_derives_every_bound_from_the_consented_class() {
         let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
-        let issued = ban_verdict(&case(), &class("P90D", "suspensive"), "a", "hash:why", now, &key()).unwrap();
+        let issued = ban_verdict(&case(), &class("P90D", "suspensive"), "a", "hash:why", now, &key(), None).unwrap();
         let v = decode(&issued);
 
         let appeal = util::parse_timestamp(v["appealDeadline"].as_str().unwrap()).unwrap();
@@ -246,7 +256,7 @@ mod tests {
     fn non_suspensive_ban_executes_at_decision() {
         let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
         let issued =
-            ban_verdict(&case(), &class("P90D", "non-suspensive"), "a", "hash:why", now, &key()).unwrap();
+            ban_verdict(&case(), &class("P90D", "non-suspensive"), "a", "hash:why", now, &key(), None).unwrap();
         let v = decode(&issued);
         assert_eq!(util::parse_timestamp(v["executeAfter"].as_str().unwrap()).unwrap(), now);
         assert_eq!(
@@ -259,7 +269,7 @@ mod tests {
     fn permanent_class_carries_no_expiry() {
         let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
         let issued =
-            ban_verdict(&case(), &class("permanent", "non-suspensive"), "a", "hash:why", now, &key()).unwrap();
+            ban_verdict(&case(), &class("permanent", "non-suspensive"), "a", "hash:why", now, &key(), None).unwrap();
         assert!(decode(&issued).get("banExpires").is_none());
     }
 

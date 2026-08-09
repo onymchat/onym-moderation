@@ -1167,6 +1167,14 @@ struct Decision {
     /// in between. The panel always supplies it.
     #[serde(default)]
     claim_revision: Option<i64>,
+    /// Required for moderator-issued bans so the accused receives working
+    /// appeal and new-holder routes with the signed verdict.
+    #[serde(default)]
+    appeal_url: Option<String>,
+    #[serde(default)]
+    new_holder_url: Option<String>,
+    #[serde(default)]
+    authority_contact: Option<String>,
 }
 
 /// The moderator's decision. This is the one place human judgment
@@ -1230,13 +1238,27 @@ async fn decide(
             )))
         }
         None => {
-            decisions::apply(
+            decisions::apply_with_appeal_routes(
                 &state,
                 &case_id,
                 disposition,
                 &decision.reasoning,
                 decider,
                 OffsetDateTime::now_utc(),
+                match disposition {
+                    decisions::Disposition::Ban => Some(decisions::AppealRoutes {
+                        appeal_url: decision.appeal_url.ok_or_else(|| {
+                            Error::BadRequest("appealUrl is required for a human ban".into())
+                        })?,
+                        new_holder_url: decision.new_holder_url.ok_or_else(|| {
+                            Error::BadRequest("newHolderUrl is required for a human ban".into())
+                        })?,
+                        authority_contact: decision.authority_contact.ok_or_else(|| {
+                            Error::BadRequest("authorityContact is required for a human ban".into())
+                        })?,
+                    }),
+                    _ => None,
+                },
             )
             .await?
         }

@@ -169,7 +169,16 @@ button.sign{
   background:var(--ink);color:var(--bg);border:1.5px solid var(--ink);
   border-radius:8px;padding:10px 18px;
 }
-button.sign:hover{opacity:.85}
+form button:not(.linkish){
+  align-self:flex-start;font:inherit;font-size:14px;font-weight:600;cursor:pointer;
+  background:var(--ink);color:var(--bg);border:1.5px solid var(--ink);
+  border-radius:8px;padding:10px 18px;
+}
+form button:not(.linkish):hover,button.sign:hover{opacity:.85}
+form button.secondary,button.sign.secondary{
+  background:transparent;color:var(--ink);border-color:var(--hair);
+}
+.actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:2px}
 
 /* sign-in */
 .gate{min-height:100svh;display:grid;place-items:center;padding:20px}
