@@ -1422,6 +1422,25 @@ impl Store {
         Ok(out)
     }
 
+    /// Banned cases belonging to one accused identity. This is used by
+    /// the authenticated recovery lookup; it intentionally returns no
+    /// reporter or evidence fields.
+    pub fn banned_cases_for_accused(&self, accused: &str) -> Result<Vec<CaseRecord>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {} FROM cases
+             WHERE accused = ?1 AND disposition = 'ban'
+             ORDER BY opened_at DESC, case_id",
+            Self::CASE_COLUMNS
+        ))?;
+        let rows = statement.query_map(params![accused], Self::case_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Open cases still waiting for a first-instance decision, soonest
     /// deadline first.
     ///

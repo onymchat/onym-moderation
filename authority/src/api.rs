@@ -36,6 +36,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/reports", post(file_report))
         .route("/v1/cases/:case_id/respond", post(respond))
         .route("/v1/cases/:case_id/appeal", post(appeal))
+        .route("/v1/cases/mine", get(list_my_cases))
         .route("/v1/cases/:case_id/status", get(query_status))
         .route("/v1/cases/:case_id/decide", post(decide))
         .route("/v1/verdicts/:verdict_ref/requeue", post(requeue_verdict))
@@ -999,6 +1000,19 @@ async fn appeal(
 
 // ─── query-status ────────────────────────────────────────────────────
 
+/// Return the signed-in accused identity's banned cases without requiring
+/// the user to recover a case ID from an old install. The credential is
+/// verified before the identity is used in the query; the response omits
+/// reporter, evidence, and event data.
+async fn list_my_cases(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<String>>, Error> {
+    let accused = authorize_identity_lookup(&headers)?;
+    let cases = state.store.banned_cases_for_accused(&accused)?;
+    Ok(Json(cases.into_iter().map(|case| case.case_id).collect()))
+}
+
 /// Stage and deadlines, per the confidentiality policy. The reporter's
 /// identity is deliberately absent: it is visible to the authority,
 /// never to the accused unless the reporter consents (§5.4 constraint 4).
@@ -1361,6 +1375,31 @@ fn authorize_case_party(
     // distinguishable refusal would confirm that a named person is
     // under investigation.
     Err(Error::NotFound(format!("case {case_id}")))
+}
+
+/// Authenticate a case-list lookup by the identity's own fresh signature.
+/// A valid identity may discover only cases where it is the accused; the
+/// endpoint never accepts a bare public key as authorization.
+fn authorize_identity_lookup(headers: &HeaderMap) -> Result<String, Error> {
+    let credential = |name: &'static str| headers.get(name).and_then(|value| value.to_str().ok());
+    let (Some(key), Some(timestamp), Some(signature)) = (
+        credential("x-onym-key"),
+        credential("x-onym-timestamp"),
+        credential("x-onym-signature"),
+    ) else {
+        return Err(Error::NotFound("no cases".into()));
+    };
+    let now = OffsetDateTime::now_utc();
+    let fresh = util::parse_timestamp(timestamp)
+        .map(|signed_at| {
+            (now - signed_at).whole_seconds().abs() <= STATUS_CREDENTIAL_MAX_AGE_SECONDS
+        })
+        .unwrap_or(false);
+    let message = format!("list-cases:{timestamp}");
+    if fresh && verify_signature(key, message.as_bytes(), signature).is_ok() {
+        return Ok(key.to_string());
+    }
+    Err(Error::NotFound("no cases".into()))
 }
 
 fn verify_signature(key_reference: &str, message: &[u8], signature: &str) -> Result<(), Error> {
