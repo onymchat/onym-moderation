@@ -47,6 +47,40 @@ false accusation.
 
 A signed statement and counter-evidence, at any point during the
 response window, as many times as the bounds in
-[confidentiality](./confidentiality.md) allow. Silence is not a
+[confidentiality](./confidentiality) allow. Silence is not a
 confession, and answering early does not shorten the window — the time
 was promised, not the opportunity.
+
+## What the windows mean
+
+Each class publishes its own response window, decision deadline, ban
+term and appeal period. What those words mean is the same for all three
+and is written here once, so that a term cannot say one thing under one
+class and something else under another.
+
+**The response window is time, not an opportunity.** It runs from when
+notice reaches your interface, and a ban cannot issue before it has
+elapsed — not even if you answer on the first day, and not even if the
+case looks obvious. You may keep adding to your answer until it closes.
+
+**The decision deadline ends the case.** If this authority has not
+reached a decision by then, the case is dismissed by default and any
+procedural mark clears. An authority that goes quiet costs you nothing
+that outlives it.
+
+**Evidence joined later re-notices you.** If a further report is
+attached to an open case, you are served with the new allegations and
+your response window restarts against them. The decision deadline does
+not move — otherwise a case could be walked forward indefinitely by
+adding to it.
+
+**Suspensive or not** decides whether appealing pauses the sanction. A
+timely appeal against a suspensive sanction pauses it while the appeal
+is heard; a non-suspensive one stays in force, and a successful appeal
+issues a fresh verdict clearing the marks rather than editing the
+original.
+
+The three classes:
+[`csam`](./csam) ·
+[`credible-violence`](./credible-violence) ·
+[`unsolicited-pornography`](./unsolicited-pornography).

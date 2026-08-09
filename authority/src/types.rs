@@ -180,6 +180,30 @@ mod manifest_tests {
             );
         }
 
+        // Each class's definition is its own document, named for the
+        // class. One page with `#csam` style fragments does not work:
+        // the manifest's URLs are what a consent screen links to, and a
+        // fragment addresses an HTML element, so a reader following the
+        // link would land at the top of a multi-class page. Pinning the
+        // correspondence here is what stops a class from ending up
+        // pointing at another class's terms.
+        for class in &manifest.violation_classes {
+            let definition = class.definition.as_str();
+            let expected = format!("/policy/{}", class.class_id);
+            assert!(
+                definition.ends_with(&expected),
+                "class {:?} points at {definition:?}, which is not its own document \
+                 ({expected}); a reader following that link does not arrive at these terms",
+                class.class_id
+            );
+            assert!(
+                !definition.contains('#'),
+                "class {:?} points at a fragment ({definition:?}); the documents are Markdown \
+                 and a fragment resolves to nothing in one",
+                class.class_id
+            );
+        }
+
         // A permanent ban is valid only while an independent appellate
         // can hear an appeal against it (reference policy §6, §8). The
         // two fields therefore travel together: publishing `permanent`

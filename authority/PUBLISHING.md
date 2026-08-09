@@ -32,13 +32,21 @@ Two in particular deserve a careful read:
   naming none, and this service deletes nothing on a timer. If Onym
   wants to commit to a retention period, the deletion has to be built
   first and the document changed second.
-- **`published/classes.md`** is what the manifest's `definition` URLs resolve to,
-  and it is the text an accused person is judged against. It restates
-  the reference policy's canonical rules verbatim rather than
-  paraphrasing them, because `src/policy.rs` hands a model those exact
-  words — a definition here that drifted from that text would mean the
-  class someone consented to and the rule the model applied are two
-  different things.
+- **The three class documents** — `published/csam.md`,
+  `credible-violence.md`, `unsolicited-pornography.md` — are what the
+  manifest's `definition` URLs resolve to, and they are the text an
+  accused person is judged against. Each restates the reference
+  policy's canonical rule verbatim rather than paraphrasing it, because
+  `src/policy.rs` hands a model those exact words: a definition that
+  drifted from that text would mean the class someone consented to and
+  the rule that was applied are two different things.
+
+  One document per class, rather than one document with three anchors.
+  The manifest's URLs are what a consent screen links to, and a
+  fragment cannot address a position in Markdown — a reader following
+  the `csam` link would have landed at the top of a four-class page.
+  A test pins the correspondence, so a class cannot end up pointing at
+  another class's terms.
 
 Routing: these need to be served under `authority.onym.app/policy/`.
 The authority service itself serves only `/manifest.json` and `/v1/*`,

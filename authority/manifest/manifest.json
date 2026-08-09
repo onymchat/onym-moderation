@@ -7,7 +7,7 @@
   "violationClasses": [
     {
       "classId": "csam",
-      "definition": "https://authority.onym.app/policy/classes#csam",
+      "definition": "https://authority.onym.app/policy/csam",
       "responseWindow": "P3D",
       "decisionDeadline": "P7D",
       "banTerm": "P365D",
@@ -17,7 +17,7 @@
     },
     {
       "classId": "credible-violence",
-      "definition": "https://authority.onym.app/policy/classes#credible-violence",
+      "definition": "https://authority.onym.app/policy/credible-violence",
       "responseWindow": "P7D",
       "decisionDeadline": "P14D",
       "banTerm": "P365D",
@@ -26,7 +26,7 @@
     },
     {
       "classId": "unsolicited-pornography",
-      "definition": "https://authority.onym.app/policy/classes#unsolicited-pornography",
+      "definition": "https://authority.onym.app/policy/unsolicited-pornography",
       "responseWindow": "P7D",
       "decisionDeadline": "P14D",
       "banTerm": "P90D",
