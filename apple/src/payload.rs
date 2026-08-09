@@ -96,6 +96,16 @@ mod tests {
         assert_ne!(enrollment(Some(b"t"), "u", "ts"), gate_check(Some(b"t"), "u", None, "ts"));
     }
 
+    /// A recovery presentation can be replayed against neither session
+    /// endpoint, and binds the grant: a different grant ref is a
+    /// different signature.
+    #[test]
+    fn recovery_payloads_are_domain_separated_and_grant_bound() {
+        assert_ne!(recovery(Some(b"t"), "u", "g", "ts"), gate_check(Some(b"t"), "u", Some("g"), "ts"));
+        assert_ne!(recovery(Some(b"t"), "u", "g", "ts"), enrollment(Some(b"t"), "u", "ts"));
+        assert_ne!(recovery(Some(b"t"), "u", "g1", "ts"), recovery(Some(b"t"), "u", "g2", "ts"));
+    }
+
     #[test]
     fn gate_payload_covers_mandate_ref() {
         assert_ne!(

@@ -604,6 +604,13 @@ impl Store {
     /// table is the move ledger — the write log records only bit
     /// writes, and the clearing write that follows an adoption lands
     /// there on the reversal's own authority.
+    ///
+    /// Returns `false` when the grant was already redeemed — including
+    /// the race where two fresh sessions clear the `grant_redeemed`
+    /// pre-check and arrive here together: the redemption `INSERT` is
+    /// the single serialization point (`ON CONFLICT DO NOTHING`), and
+    /// the loser makes no move and reports the same "already redeemed"
+    /// refusal rather than a primary-key 500.
     pub fn adopt_binding(
         &self,
         grant_ref: &str,
@@ -611,26 +618,22 @@ impl Store {
         from: &str,
         to: &str,
         now: &str,
-    ) -> Result<Vec<String>, Error> {
+    ) -> Result<bool, Error> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| Error::Internal(format!("begin adoption: {e}")))?;
-        let cases = {
-            let mut statement =
-                tx.prepare("SELECT DISTINCT case_id FROM verdicts WHERE device_binding = ?1")?;
-            let rows = statement.query_map(params![from], |row| row.get::<_, String>(0))?;
-            let mut cases = Vec::new();
-            for row in rows {
-                cases.push(row?);
-            }
-            cases
-        };
-        tx.execute(
+        let redeemed = tx.execute(
             "INSERT INTO recoveries (grant_ref, case_id, from_binding, to_binding, recovered_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(grant_ref) DO NOTHING",
             params![grant_ref, case_id, from, to, now],
         )?;
+        if redeemed == 0 {
+            // Someone else redeemed this grant; the transaction rolls
+            // back on drop, moving nothing.
+            return Ok(false);
+        }
         tx.execute(
             "UPDATE verdicts SET device_binding = ?2 WHERE device_binding = ?1",
             params![from, to],
@@ -641,7 +644,7 @@ impl Store {
         )?;
         tx.commit()
             .map_err(|e| Error::Internal(format!("commit adoption: {e}")))?;
-        Ok(cases)
+        Ok(true)
     }
 
     /// Every verdict for a device, newest **decided** first.
