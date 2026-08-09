@@ -1,14 +1,18 @@
 //! The moderator's web panel.
 //!
-//! Its queue is **appeals**, not cases. Triage decides in the first
-//! instance; a human reads the file when someone says the machine got
-//! it wrong. That mirrors where the contract puts human judgment —
-//! notice, response, and then an appeal path that can reverse — rather
-//! than putting a person in front of every report.
+//! It has two queues, and which one is the job depends on the
+//! deployment. Under autonomous triage the classifier decides in the
+//! first instance and a human reads the file on appeal; with triage off
+//! a human decides every case, and **awaiting decision** is the whole
+//! workload. The page says which it is rather than assuming, because
+//! telling a moderator that something else decides first is a way of
+//! describing their work as somebody else's problem.
 //!
 //! Everything is server-rendered. This screen shows disclosed evidence
-//! from real cases, so it is behind a session cookie and deliberately
-//! has no client-side dependencies to pull that content into.
+//! from real cases, so it is behind a session cookie, has no
+//! client-side dependencies to pull that content into, and fetches
+//! nothing over the network — `panel.css` is inlined into every page
+//! rather than linked.
 
 use std::sync::Arc;
 
@@ -124,42 +128,57 @@ async fn index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result
         state.config.triage.as_ref().map(|t| t.mode),
         Some(crate::config::TriageMode::Autonomous)
     );
-    let mut body = String::new();
+    let mut body = chrome(&state, "queue");
+    body.push_str("<main class=wrap>");
     body.push_str(&format!(
-        "<h1>{}</h1><p class=sub>{}</p>",
-        escape(&state.config.manifest.component_id),
+        "<h1>Awaiting decision</h1><p class=sub>{}</p>",
         if automated {
-            "Triage decides in the first instance; you read the file when someone says it got it \
-             wrong. Appeals are your queue — but open cases are listed below them, because a \
-             classifier that reaches no decision leaves the case for you."
+            "Sorted by decision deadline. Triage decides in the first instance, so what reaches \
+             this queue is what it declined to decide — plus anything whose response window has \
+             not closed, which cannot be decided yet either way."
         } else {
-            "No classifier is running, so you decide every case. Both queues below are yours, \
-             and the first one has a clock: a case nobody decides is dismissed by default at its \
-             decision deadline."
+            "Sorted by decision deadline. No classifier is running, so every one of these is \
+             yours, and a case nobody decides is dismissed by default when its deadline passes. \
+             A case whose response window is still running cannot be decided — opening it is \
+             wasted reading."
         }
     ));
 
-    body.push_str(&format!("<h2>Awaiting decision ({})</h2>", undecided.len()));
+    body.push_str(&format!(
+        "<h2 class=k style=\"margin-top:22px\">{}</h2>",
+        match undecided.len() {
+            1 => "1 case".to_string(),
+            n => format!("{n} cases"),
+        }
+    ));
     if undecided.is_empty() {
-        body.push_str("<p class=empty>Nothing open.</p>");
+        body.push_str(
+            "<div class=empty>Nothing open. A case appears here the moment a report opens one, \
+             with the time remaining until its decision deadline.</div>",
+        );
     } else {
         body.push_str(&decision_table(&undecided, now));
     }
 
-    body.push_str(&format!("<h2>Appeals awaiting review ({})</h2>", appeals.len()));
+    body.push_str("<h2>Appeals awaiting review</h2>");
     if appeals.is_empty() {
-        body.push_str("<p class=empty>Nothing waiting. </p>");
+        body.push_str(
+            "<div class=empty>No appeals are waiting. Appeals and new-holder claims appear here \
+             the moment one is filed, with the stage and disposition they are contesting.</div>",
+        );
     } else {
         body.push_str(&case_table(&appeals));
     }
 
-    body.push_str("<h2>Recent cases</h2>");
-    body.push_str(&case_table(&recent));
     body.push_str(
-        "<form method=post action=/admin/logout><button class=secondary>Sign out</button></form>",
+        "<section class=recent><h2>Recent cases \
+         <span class=sub style=\"display:inline;font-weight:400\">— reference, not work</span>\
+         </h2>",
     );
+    body.push_str(&case_table(&recent));
+    body.push_str("</section></main>");
 
-    Ok(Html(page("Moderation queue", &body)).into_response())
+    Ok(Html(page("Queue — moderation authority", &body)).into_response())
 }
 
 /// The work queue, with the clock showing.
@@ -172,8 +191,9 @@ async fn index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result
 /// replied.
 fn decision_table(cases: &[CaseRecord], now: OffsetDateTime) -> String {
     let mut out = String::from(
-        "<table><tr><th>Case</th><th>Class</th><th>Time left</th><th>Decision deadline</th>\
-         <th>Response window</th><th>Responded</th></tr>",
+        "<table class=queue><thead><tr><th>Case</th><th>Class</th><th>Time left</th>\
+         <th>Decision deadline</th><th>Response window</th><th>Accused responded</th>\
+         </tr></thead><tbody>",
     );
     for case in cases {
         let (remaining, urgency) = match util::parse_timestamp(&case.decision_deadline) {
@@ -181,26 +201,39 @@ fn decision_table(cases: &[CaseRecord], now: OffsetDateTime) -> String {
             // A deadline that will not parse is a corrupt case rather
             // than an urgent one, and saying "overdue" would send a
             // moderator to decide something the guards will refuse.
-            Err(_) => ("unreadable".to_string(), "error"),
+            Err(_) => ("unreadable".to_string(), "overdue"),
+        };
+        // A badge only where there is something to say. An ordinary
+        // deadline is plain text: if every row is highlighted, the
+        // highlight has stopped meaning anything.
+        let remaining = match urgency {
+            "" => escape(&remaining),
+            class => format!("<span class=\"badge {class}\">{}</span>", escape(&remaining)),
         };
         let window_closed = util::parse_timestamp(&case.response_deadline)
             .map(|deadline| now >= deadline)
             .unwrap_or(false);
         out.push_str(&format!(
-            "<tr><td><a href=\"/admin/cases/{id}\">{short}</a></td><td>{class}</td>\
-             <td class={urgency}>{remaining}</td><td>{deadline}</td><td>{window}</td>\
+            "<tr{held}><td class=id><a href=\"/admin/cases/{id}\">{short}</a></td>\
+             <td>{class}</td><td>{remaining}</td><td>{deadline}</td><td>{window}</td>\
              <td>{responded}</td></tr>",
+            // Not yet decidable, so the row recedes rather than
+            // disappears: it is still work, just not work for today.
+            held = if window_closed { "" } else { " class=held" },
             id = escape(&case.case_id),
             short = escape(case.case_id.get(..13).unwrap_or(&case.case_id)),
             class = escape(&case.class_id),
-            urgency = urgency,
-            remaining = escape(&remaining),
+            remaining = remaining,
             deadline = escape(&case.decision_deadline),
-            window = if window_closed { "closed" } else { "still running — a ban is refused" },
-            responded = if case.responded { "yes" } else { "no" },
+            window = if window_closed {
+                "closed"
+            } else {
+                "<span class=\"badge hold\">still running — a ban is refused</span>"
+            },
+            responded = if case.responded { "yes" } else { "not yet" },
         ));
     }
-    out.push_str("</table>");
+    out.push_str("</tbody></table>");
     out
 }
 
@@ -208,25 +241,40 @@ fn decision_table(cases: &[CaseRecord], now: OffsetDateTime) -> String {
 /// suggest the deadline is a race, and it is not — it is a date the
 /// case ends on.
 fn time_between(now: OffsetDateTime, deadline: OffsetDateTime) -> String {
+    // How far past, not merely that it is past. An hour overdue and a
+    // week overdue are different situations — the first is a case to
+    // decide now, the second is one the sweep has almost certainly
+    // already dismissed by default.
     if now >= deadline {
-        return "overdue".to_string();
+        let over = span(now - deadline);
+        return match over.as_str() {
+            "under an hour" => "overdue — under an hour".to_string(),
+            elapsed => format!("overdue — {elapsed} past"),
+        };
     }
-    let left = deadline - now;
+    span(deadline - now)
+}
+
+/// Whole days and hours, rounded down.
+fn span(left: time::Duration) -> String {
     let days = left.whole_days();
     let hours = left.whole_hours() - days * 24;
     match (days, hours) {
         (0, 0) => "under an hour".to_string(),
-        (0, h) => format!("{h}h"),
-        (d, 0) => format!("{d}d"),
-        (d, h) => format!("{d}d {h}h"),
+        (0, h) => format!("{h} h"),
+        (d, 0) => format!("{d} d"),
+        (d, h) => format!("{d} d {h} h"),
     }
 }
 
+/// The badge modifier for a deadline, or `""` for one far enough out
+/// that it needs no badge at all. Names match the stylesheet's
+/// `.badge.overdue` / `.badge.soon`.
 fn urgency_class(now: OffsetDateTime, deadline: OffsetDateTime) -> &'static str {
     if now >= deadline {
-        "error"
+        "overdue"
     } else if deadline - now < time::Duration::days(2) {
-        "urgent"
+        "soon"
     } else {
         ""
     }
@@ -234,12 +282,12 @@ fn urgency_class(now: OffsetDateTime, deadline: OffsetDateTime) -> &'static str 
 
 fn case_table(cases: &[CaseRecord]) -> String {
     let mut out = String::from(
-        "<table><tr><th>Case</th><th>Class</th><th>Stage</th><th>Disposition</th>\
-         <th>Appeal</th><th>Opened</th></tr>",
+        "<table class=queue><thead><tr><th>Case</th><th>Class</th><th>Stage</th>\
+         <th>Disposition</th><th>Appeal</th><th>Opened</th></tr></thead><tbody>",
     );
     for case in cases {
         out.push_str(&format!(
-            "<tr><td><a href=\"/admin/cases/{id}\">{short}</a></td><td>{class}</td>\
+            "<tr><td class=id><a href=\"/admin/cases/{id}\">{short}</a></td><td>{class}</td>\
              <td>{stage}</td><td>{disposition}</td><td>{appeal}</td><td>{opened}</td></tr>",
             id = escape(&case.case_id),
             short = escape(case.case_id.get(..13).unwrap_or(&case.case_id)),
@@ -269,7 +317,14 @@ async fn case_detail(
         .case(&case_id)?
         .ok_or_else(|| Error::NotFound(format!("case {case_id}")))?;
 
-    let mut body = format!("<h1>Case {}</h1>", escape(&case.case_id));
+    // The case file still renders its pre-design markup; only the queue
+    // has been implemented from `moderator/queue.html` so far. It gets
+    // the chrome and the shell so the two screens are one panel rather
+    // than two, and `panel.css` carries a short compatibility section
+    // keeping this legible under the new tokens until
+    // `moderator/case-*.html` lands.
+    let mut body = chrome(&state, "case");
+    body.push_str(&format!("<main class=wrap><h1>Case {}</h1>", escape(&case.case_id)));
     body.push_str(&format!(
         "<table class=facts>\
          <tr><th>Class</th><td>{class}</td></tr>\
@@ -317,9 +372,9 @@ async fn case_detail(
     body.push_str("</table>");
 
     body.push_str(&review_form(&case));
-    body.push_str("<p><a href=/admin>← queue</a></p>");
+    body.push_str("<p><a href=/admin>← queue</a></p></main>");
 
-    Ok(Html(page(&format!("Case {}", case.case_id), &body)).into_response())
+    Ok(Html(page(&format!("Case {} — moderation authority", case.case_id), &body)).into_response())
 }
 
 fn assessment_section(state: &AppState, case_id: &str) -> String {
@@ -724,14 +779,36 @@ fn escape(raw: &str) -> String {
     out
 }
 
+/// The document shell. `body` is everything inside `<body>` — the
+/// header chrome included — because the signed-in pages carry one and
+/// the sign-in gate deliberately does not.
 fn page(title: &str, body: &str) -> String {
     format!(
         "<!doctype html><html lang=en><head><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
-         <title>{title}</title><style>{STYLE}</style></head><body><main>{body}</main></body></html>",
+         <title>{title}</title><style>{STYLE}</style></head><body>{body}</body></html>",
         title = escape(title),
         body = body,
         STYLE = STYLE
+    )
+}
+
+/// Header for a signed-in page. `here` marks the current nav item.
+///
+/// Sign out is a POST rather than a link, styled to read as one. A
+/// session must not end on a GET: anything that can make the browser
+/// issue one — a prefetch, an image tag in disclosed evidence — could
+/// otherwise sign a moderator out mid-review.
+fn chrome(state: &AppState, here: &str) -> String {
+    let authority = escape(&state.config.manifest.component_id);
+    let queue_current = if here == "queue" { " aria-current=page" } else { "" };
+    format!(
+        "<header class=top><div class=wrap>\
+         <span class=brand>moderation authority <span>· {authority}</span></span>\
+         <nav><a href=/admin{queue_current}>Queue</a>\
+         <form method=post action=/admin/logout>\
+         <button class=linkish type=submit>Sign out</button></form>\
+         </nav></div></header>"
     )
 }
 
@@ -740,39 +817,24 @@ fn login_page(failed: bool) -> String {
     page(
         "Sign in",
         &format!(
-            "<h1>Moderation panel</h1>\
-             <p class=sub>This screen shows evidence disclosed inside cases. Do not open it \
-             where it can be read over your shoulder.</p>{error}\
-             <form method=post action=/admin/login>\
-             <label>Moderator token<br><input name=token type=password size=48 required></label><br>\
-             <button>Sign in</button></form>"
+            "<div class=gate><form method=post action=/admin/login class=panel>\
+             <div><h1 style=\"margin:0 0 6px\">Moderation panel</h1>\
+             <p class=sub>Cases decided here end with a signed verdict.</p></div>\
+             <div class=warnbox><div><b>This screen shows disclosed evidence.</b>\
+             Do not open it where it can be read over your shoulder.</div></div>{error}\
+             <label class=field>Moderator token\
+             <input class=addr name=token type=password autocomplete=current-password required>\
+             </label>\
+             <button class=sign>Sign in</button></form></div>"
         ),
     )
 }
 
-const STYLE: &str = "
-:root { color-scheme: light dark; }
-body { font: 15px/1.5 -apple-system, system-ui, sans-serif; margin: 0; padding: 2rem 1rem; }
-main { max-width: 60rem; margin: 0 auto; }
-h1 { font-size: 1.5rem; margin-bottom: .25rem; }
-h2 { font-size: 1.1rem; margin-top: 2rem; }
-.sub { opacity: .7; }
-.empty { opacity: .6; font-style: italic; }
-.error { color: #c0392b; font-weight: 600; }
-.urgent { color: #b9770e; font-weight: 600; }
-.mono, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
-table { border-collapse: collapse; width: 100%; margin: .5rem 0; }
-th, td { text-align: left; padding: .4rem .5rem; border-bottom: 1px solid rgba(128,128,128,.3); }
-th { font-weight: 600; opacity: .8; }
-table.facts th { width: 12rem; }
-pre.evidence { white-space: pre-wrap; word-break: break-word; padding: .75rem;
-  background: rgba(128,128,128,.12); border-radius: 6px; }
-input { padding: .4rem; margin: .25rem 0 .75rem; }
-button { padding: .5rem .9rem; border-radius: 6px; border: 0; background: #c0392b; color: #fff;
-  font-size: .95rem; cursor: pointer; }
-button.secondary { background: rgba(128,128,128,.35); color: inherit; }
-a { color: inherit; }
-";
+/// The panel stylesheet, kept as a real CSS file so it stays diffable
+/// against the design it came from rather than living inside a Rust
+/// string literal. Inlined into every page: this screen holds disclosed
+/// evidence and pulls nothing over the network.
+const STYLE: &str = include_str!("panel.css");
 
 fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
     if lhs.len() != rhs.len() {
@@ -1389,13 +1451,20 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let page = String::from_utf8(body.to_vec()).unwrap();
 
-        assert!(page.contains("Awaiting decision (2)"), "the queue is named and counted");
-        assert!(page.contains("1d 6h"), "time remaining is shown: {page}");
-        assert!(page.contains("class=urgent"), "a deadline inside two days is marked");
+        assert!(page.contains("<h1>Awaiting decision</h1>"), "the queue leads the page");
+        assert!(page.contains("2 cases"), "and is counted: {page}");
+        assert!(page.contains("1 d 6 h"), "time remaining is shown: {page}");
         assert!(
-            page.contains("you decide every case"),
+            page.contains("class=\"badge soon\""),
+            "a deadline inside two days is badged, not merely coloured"
+        );
+        assert!(
+            page.contains("No classifier is running"),
             "with no classifier the page must not claim triage decides first"
         );
+        // Sign out ends a session, so it must not be reachable by a GET
+        // that disclosed evidence could trigger.
+        assert!(page.contains("<form method=post action=/admin/logout>"), "sign out is a POST");
         // A case whose response window is still running cannot be
         // banned yet, and saying so stops a moderator opening it,
         // reading the file and being refused.
@@ -1403,22 +1472,50 @@ mod tests {
         assert!(page.contains("closed"));
     }
 
+    /// The page pulls nothing over the network. It renders evidence a
+    /// stranger wrote, so a linked stylesheet, font or image would be a
+    /// request a hostile document could observe or a network could
+    /// block — and the panel would then be unstyled at exactly the
+    /// moment it is showing the most sensitive thing it has.
+    #[tokio::test]
+    async fn the_panel_fetches_nothing() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        state.store.put_case(&open_case_due("c1", "2026-08-20T00:00:00Z", "2026-08-04T00:00:00Z")).unwrap();
+
+        let response = index(State(state.clone()), signed_in(&state)).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let page = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(page.contains("<style>"), "the stylesheet is inlined");
+        for offender in ["<link", "<script", "<img", "src=", "@import", "url(http"] {
+            assert!(!page.contains(offender), "panel must not reference {offender}: {page}");
+        }
+        // And the design's tokens actually shipped, rather than the
+        // markup arriving with the old stylesheet behind it.
+        assert!(page.contains("--overdue"), "panel.css is the sheet being served");
+    }
+
     #[test]
     fn time_remaining_reads_as_a_date_rather_than_a_race() {
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
         let at = |s: &str| util::parse_timestamp(s).unwrap();
 
-        assert_eq!(time_between(now, at("2026-08-13T00:00:00Z")), "3d");
-        assert_eq!(time_between(now, at("2026-08-13T05:00:00Z")), "3d 5h");
-        assert_eq!(time_between(now, at("2026-08-10T05:00:00Z")), "5h");
+        assert_eq!(time_between(now, at("2026-08-13T00:00:00Z")), "3 d");
+        assert_eq!(time_between(now, at("2026-08-13T05:00:00Z")), "3 d 5 h");
+        assert_eq!(time_between(now, at("2026-08-10T05:00:00Z")), "5 h");
         assert_eq!(time_between(now, at("2026-08-10T00:30:00Z")), "under an hour");
-        assert_eq!(time_between(now, at("2026-08-09T00:00:00Z")), "overdue");
+
+        // Overdue says *how far* past. An hour and a week are different
+        // situations: the first is a case to decide now, the second is
+        // one the sweep has almost certainly already dismissed.
+        assert_eq!(time_between(now, at("2026-08-09T13:00:00Z")), "overdue — 11 h past");
+        assert_eq!(time_between(now, at("2026-08-09T00:00:00Z")), "overdue — 1 d past");
         // Exactly at the deadline is past it: the case is dismissed by
         // default at that instant, not a moment after.
-        assert_eq!(time_between(now, now), "overdue");
+        assert_eq!(time_between(now, now), "overdue — under an hour");
 
         assert_eq!(urgency_class(now, at("2026-08-30T00:00:00Z")), "");
-        assert_eq!(urgency_class(now, at("2026-08-11T00:00:00Z")), "urgent");
-        assert_eq!(urgency_class(now, at("2026-08-01T00:00:00Z")), "error");
+        assert_eq!(urgency_class(now, at("2026-08-11T00:00:00Z")), "soon");
+        assert_eq!(urgency_class(now, at("2026-08-01T00:00:00Z")), "overdue");
     }
 }
