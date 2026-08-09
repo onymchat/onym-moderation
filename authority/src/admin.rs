@@ -39,6 +39,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/login", post(login))
         .route("/admin/logout", post(logout))
         .route("/admin/audit", get(audit_log))
+        .route("/admin/recovery", get(recovery_queue))
+        .route("/admin/recovery/:claim_id", get(recovery_claim_detail))
+        .route("/admin/recovery/:claim_id/decide", post(recovery_claim_decide))
         .route("/admin/cases/:case_id", get(case_detail))
         .route("/admin/cases/:case_id/decide", post(initial_decision))
         .route("/admin/cases/:case_id/review", post(review))
@@ -148,6 +151,199 @@ async fn audit_log(
     body.push_str("</main>");
 
     Ok(Html(page("Audit log — moderation authority", &body)).into_response())
+}
+
+// ─── Device recovery claims ──────────────────────────────────────────
+
+async fn recovery_queue(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    if !authenticated(&state, &headers) {
+        return Ok(Html(login_page(false)).into_response());
+    }
+
+    let claims = state.store.open_recovery_claims()?;
+    let mut body = chrome(&state, "recovery");
+    body.push_str(
+        "<main class=wrap><h1>Recovery claims</h1><p class=sub>People holding a marked device \
+         whose identity no longer resolves — a reinstall, or a device that changed hands. \
+         Each claim carries the holder's contact and their account; deciding one issues (or \
+         refuses) a signed grant the device can redeem at the interface.</p>",
+    );
+    if claims.is_empty() {
+        body.push_str("<div class=empty>No open recovery claims.</div>");
+    } else {
+        body.push_str(
+            "<table class=queue><thead><tr><th>Filed</th><th>Claim</th><th>Grantee</th>\
+             <th>Contact</th></tr></thead><tbody>",
+        );
+        for claim in claims {
+            body.push_str(&format!(
+                "<tr><td class=at>{filed}</td>\
+                 <td class=id><a href=\"/admin/recovery/{id}\">{short}</a></td>\
+                 <td class=id>{grantee}</td><td class=detail>{contact}</td></tr>",
+                filed = escape(&claim.filed_at),
+                id = escape(&claim.claim_id),
+                short = escape(claim.claim_id.get(..14).unwrap_or(&claim.claim_id)),
+                grantee = escape(claim.grantee.get(..21).unwrap_or(&claim.grantee)),
+                contact = escape(&claim.contact),
+            ));
+        }
+        body.push_str("</tbody></table>");
+    }
+    body.push_str("</main>");
+
+    Ok(Html(page("Recovery claims — moderation authority", &body)).into_response())
+}
+
+async fn recovery_claim_detail(
+    State(state): State<Arc<AppState>>,
+    Path(claim_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    if !authenticated(&state, &headers) {
+        return Ok(Html(login_page(false)).into_response());
+    }
+    let claim = state
+        .store
+        .recovery_claim(&claim_id)?
+        .ok_or_else(|| Error::NotFound(format!("claim {claim_id}")))?;
+
+    let mut body = chrome(&state, "recovery");
+    body.push_str(&format!(
+        "<main class=wrap><h1>Recovery claim {id}</h1>\
+         <table class=queue><tbody>\
+         <tr><td>Filed</td><td class=at>{filed}</td></tr>\
+         <tr><td>State</td><td class=ev-name>{claim_state}</td></tr>\
+         <tr><td>Grantee</td><td class=id>{grantee}</td></tr>\
+         <tr><td>Contact</td><td class=detail>{contact}</td></tr>\
+         </tbody></table>\
+         <h2>Holder's account</h2><p class=detail>{statement}</p>",
+        id = escape(claim.claim_id.get(..14).unwrap_or(&claim.claim_id)),
+        filed = escape(&claim.filed_at),
+        claim_state = escape(&claim.state),
+        grantee = escape(&claim.grantee),
+        contact = escape(&claim.contact),
+        statement = escape(&claim.statement),
+    ));
+
+    if claim.state == "open" {
+        body.push_str(&format!(
+            "<h2>Decision</h2>\
+             <p class=sub>Verify the holder through their contact before granting. A grant \
+             authorizes one thing: moving the named case's verdict record to the grantee's \
+             enrollment. The interface refuses it while any record still bans the device, so \
+             a ban that should stand must be left standing (or reversed through the case \
+             itself) — not worked around here.</p>\
+             <form method=post action=\"/admin/recovery/{id}/decide\">\
+             <label>Case — the case whose record marks this device.<br>\
+             <input class=addr name=case_id placeholder=\"case-…\"></label>\
+             <label>Reasoning — how the holder's account was verified, or why it was not.<br>\
+             <input name=reasoning size=70 required></label>\
+             <div class=actions><button class=\"sign primary\" name=outcome value=grant>Issue grant</button>\
+             <button class=\"sign secondary\" name=outcome value=refuse>Refuse</button></div></form>",
+            id = escape(&claim.claim_id),
+        ));
+    } else {
+        body.push_str(&format!(
+            "<h2>Decision</h2><table class=queue><tbody>\
+             <tr><td>Decided</td><td class=at>{decided}</td></tr>\
+             <tr><td>Case</td><td class=id>{case}</td></tr>\
+             <tr><td>Reasoning</td><td class=detail>{reasoning}</td></tr>\
+             </tbody></table>",
+            decided = escape(claim.decided_at.as_deref().unwrap_or("—")),
+            case = match claim.case_id.as_deref() {
+                Some(case_id) => format!(
+                    "<a href=\"/admin/cases/{0}\">{0}</a>",
+                    escape(case_id)
+                ),
+                None => "—".into(),
+            },
+            reasoning = escape(claim.reasoning.as_deref().unwrap_or("—")),
+        ));
+    }
+    body.push_str("<p><a href=/admin/recovery>← recovery claims</a></p></main>");
+
+    Ok(Html(page("Recovery claim — moderation authority", &body)).into_response())
+}
+
+#[derive(Deserialize)]
+struct RecoveryDecisionForm {
+    outcome: String,
+    #[serde(default)]
+    case_id: String,
+    reasoning: String,
+}
+
+async fn recovery_claim_decide(
+    State(state): State<Arc<AppState>>,
+    Path(claim_id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<RecoveryDecisionForm>,
+) -> Result<Response, Error> {
+    if !authenticated(&state, &headers) {
+        return Ok(Html(login_page(false)).into_response());
+    }
+    let claim = state
+        .store
+        .recovery_claim(&claim_id)?
+        .ok_or_else(|| Error::NotFound(format!("claim {claim_id}")))?;
+    let reasoning = form.reasoning.trim();
+    if reasoning.is_empty() {
+        return Err(Error::BadRequest("reasoning is required".into()));
+    }
+    let now = state.now();
+    let stamp = crate::util::format_timestamp(now);
+
+    match form.outcome.as_str() {
+        "grant" => {
+            let case_id = form.case_id.trim();
+            let case = state
+                .store
+                .case(case_id)?
+                .ok_or_else(|| Error::BadRequest(format!("no case {case_id:?}")))?;
+            // A grant against an undecided case would race the case
+            // itself; and the interface will refuse a record that
+            // still bans, so granting one here only strands the
+            // claimant. Say so now, to the person who can fix it.
+            if case.disposition.is_none() {
+                return Err(Error::CaseState(
+                    "the case is still open; decide it before granting recovery".into(),
+                ));
+            }
+            let issued = crate::recovery::issue_grant(
+                &case.case_id,
+                &claim.grantee,
+                &state.config.manifest.component_id,
+                now,
+                &state.signing_key,
+            )?;
+            if !state.store.grant_recovery_claim(
+                &claim_id,
+                &case.case_id,
+                reasoning,
+                &issued.raw,
+                &issued.grant_ref,
+                &stamp,
+            )? {
+                return Err(Error::CaseState("the claim is no longer open".into()));
+            }
+            tracing::info!(%claim_id, grant_ref = %issued.grant_ref, "recovery grant issued");
+        }
+        "refuse" => {
+            if !state.store.refuse_recovery_claim(&claim_id, reasoning, &stamp)? {
+                return Err(Error::CaseState("the claim is no longer open".into()));
+            }
+        }
+        other => {
+            return Err(Error::BadRequest(format!(
+                "unknown outcome {other:?} (expected grant | refuse)"
+            )))
+        }
+    }
+
+    Ok(Redirect::to(&format!("/admin/recovery/{claim_id}")).into_response())
 }
 
 // ─── Queue ───────────────────────────────────────────────────────────
@@ -923,10 +1119,12 @@ fn chrome(state: &AppState, here: &str) -> String {
     let authority = escape(&state.config.manifest.component_id);
     let queue_current = if here == "queue" { " aria-current=page" } else { "" };
     let audit_current = if here == "audit" { " aria-current=page" } else { "" };
+    let recovery_current = if here == "recovery" { " aria-current=page" } else { "" };
     format!(
         "<header class=top><div class=wrap>\
          <span class=brand>moderation authority <span>· {authority}</span></span>\
          <nav><a href=/admin{queue_current}>Queue</a>\
+         <a href=/admin/recovery{recovery_current}>Recovery</a>\
          <a href=/admin/audit{audit_current}>Audit log</a>\
          <form method=post action=/admin/logout>\
          <button class=linkish type=submit>Sign out</button></form>\

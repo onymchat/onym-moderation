@@ -22,6 +22,7 @@ mod delivery;
 mod error;
 mod policy;
 mod profiles;
+mod recovery;
 mod state;
 mod store;
 mod triage;
