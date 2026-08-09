@@ -107,6 +107,9 @@ async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
         "manifestHash": util::sha256_hex(&state.config.manifest_raw),
         "interfaceConfigured": state.delivery.configured(),
         "canDecide": state.config.moderator_token.is_some(),
+        "appealEmail": std::env::var("AUTHORITY_APPEAL_EMAIL")
+            .ok()
+            .filter(|email| !email.trim().is_empty()),
         "undeliverableVerdicts": stuck.len(),
         "undeliverable": detail,
     }))

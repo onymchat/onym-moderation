@@ -483,6 +483,9 @@ Optional:
                                whose response window has closed (default: 300)
   AUTHORITY_ADMIN_TOKEN        Bearer token for the moderator panel at /admin, where
                                appeals are reviewed. Unset closes it.
+  AUTHORITY_APPEAL_EMAIL       Public email address for manual appeals when a user
+                               cannot recover the original device identity. Returned
+                               by /health; omit it to expose no email.
 
 Automated assessment (a model decides; a human reviews on appeal):
   AUTHORITY_TRIAGE_MODE        off | advisory | autonomous (default: off)
