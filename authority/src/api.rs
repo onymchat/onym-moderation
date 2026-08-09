@@ -1695,6 +1695,18 @@ mod tests {
         })
     }
 
+    /// A human ban decision with the appeal routes #23 made
+    /// mandatory — the shape every moderator ban must send.
+    fn ban_decision() -> serde_json::Value {
+        json!({
+            "disposition": "ban",
+            "reasoning": "hash:f",
+            "appealUrl": "https://authority.test/appeal",
+            "newHolderUrl": "https://authority.test/new-holder",
+            "authorityContact": "appeals@authority.test",
+        })
+    }
+
     /// A registered accused, a registered reporter, and an open case.
     async fn open_case(harness: &Harness) -> String {
         register_mandate(harness, ACCUSED_SEED).await;
@@ -2097,7 +2109,7 @@ mod tests {
         let case_id = open_case(&harness).await;
 
         let (status, response) =
-            harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+            harness.decide(&case_id, ban_decision()).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(response["error"], "case_state");
     }
@@ -2117,7 +2129,7 @@ mod tests {
         harness.state.store.put_case(&case).unwrap();
 
         let (status, response) = harness
-            .decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"}))
+            .decide(&case_id, ban_decision())
             .await;
         assert_eq!(status, StatusCode::CONFLICT, "{response}");
         assert_eq!(response["error"], "case_state");
@@ -2151,7 +2163,7 @@ mod tests {
         // Still queued: name it, and say nothing about requeueing —
         // waiting is the right thing to do.
         let (status, response) =
-            harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+            harness.decide(&case_id, ban_decision()).await;
         assert_eq!(status, StatusCode::CONFLICT, "{response}");
         let message = response["message"].as_str().unwrap_or_default().to_string();
         assert!(message.contains(&stuck_ref), "{message}");
@@ -2161,7 +2173,7 @@ mod tests {
         // operator intervenes, so say so and name the route out.
         harness.state.store.mark_undeliverable(&stuck_ref).unwrap();
         let (status, response) =
-            harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+            harness.decide(&case_id, ban_decision()).await;
         assert_eq!(status, StatusCode::CONFLICT, "{response}");
         let message = response["message"].as_str().unwrap_or_default().to_string();
         assert!(message.contains(&stuck_ref), "{message}");
@@ -2217,7 +2229,7 @@ mod tests {
         }
 
         let (status, response) =
-            harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+            harness.decide(&case_id, ban_decision()).await;
         assert_eq!(status, StatusCode::CONFLICT, "{response}");
         let message = response["message"].as_str().unwrap_or_default().to_string();
         for reference in &stuck {
@@ -2266,7 +2278,7 @@ mod tests {
         harness.state.store.remove_mandate(&case.mandate_ref).unwrap();
 
         let (status, response) = harness
-            .decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"}))
+            .decide(&case_id, ban_decision())
             .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{response}");
         assert_eq!(harness.state.store.case(&case_id).unwrap().unwrap().stage, "open");
@@ -2289,7 +2301,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
 
         let (status, _) =
-            harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+            harness.decide(&case_id, ban_decision()).await;
         assert_eq!(status, StatusCode::CONFLICT, "the window still has days to run");
     }
 
@@ -2306,7 +2318,7 @@ mod tests {
         harness.state.store.put_case(&case).unwrap();
 
         let (status, response) =
-            harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+            harness.decide(&case_id, ban_decision()).await;
         assert_eq!(status, StatusCode::GONE);
         assert_eq!(response["error"], "window_closed");
     }
@@ -2321,7 +2333,7 @@ mod tests {
         harness.state.store.put_case(&case).unwrap();
 
         let (status, response) =
-            harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+            harness.decide(&case_id, ban_decision()).await;
         assert_eq!(status, StatusCode::OK, "{response}");
         assert_eq!(response["disposition"], "ban");
 
@@ -2413,7 +2425,7 @@ mod tests {
         let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
         case.response_deadline = "2020-01-01T00:00:00Z".into();
         harness.state.store.put_case(&case).unwrap();
-        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        harness.decide(&case_id, ban_decision()).await;
 
         let (status, _) = harness.post(&format!("/v1/cases/{case_id}/appeal"), claim(&case_id)).await;
         assert_eq!(status, StatusCode::OK);
@@ -2459,7 +2471,7 @@ mod tests {
         case.response_deadline = "2020-01-01T00:00:00Z".into();
         harness.state.store.put_case(&case).unwrap();
         let (status, response) = harness
-            .decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"}))
+            .decide(&case_id, ban_decision())
             .await;
         assert_eq!(status, StatusCode::OK, "{response}");
 
@@ -2502,7 +2514,7 @@ mod tests {
         let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
         case.response_deadline = "2020-01-01T00:00:00Z".into();
         harness.state.store.put_case(&case).unwrap();
-        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        harness.decide(&case_id, ban_decision()).await;
 
         let claim = |statement: &str| {
             serde_json::to_vec(&json!({
@@ -2963,7 +2975,7 @@ mod tests {
         let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
         case.response_deadline = "2020-01-01T00:00:00Z".into();
         harness.state.store.put_case(&case).unwrap();
-        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        harness.decide(&case_id, ban_decision()).await;
         let decided = harness.state.store.case(&case_id).unwrap().unwrap();
         assert_eq!(decided.stage, "decided");
 
@@ -3045,7 +3057,7 @@ mod tests {
         case.response_deadline = "2020-01-01T00:00:00Z".into();
         harness.state.store.put_case(&case).unwrap();
         let (status, response) = harness
-            .decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"}))
+            .decide(&case_id, ban_decision())
             .await;
         assert_eq!(status, StatusCode::OK, "{response}");
 
@@ -3250,7 +3262,7 @@ mod tests {
         let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
         case.response_deadline = "2020-01-01T00:00:00Z".into();
         harness.state.store.put_case(&case).unwrap();
-        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        harness.decide(&case_id, ban_decision()).await;
 
         let appeal = || {
             signed(
@@ -3295,7 +3307,7 @@ mod tests {
         let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
         case.response_deadline = "2020-01-01T00:00:00Z".into();
         harness.state.store.put_case(&case).unwrap();
-        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        harness.decide(&case_id, ban_decision()).await;
 
         let appeal = |statement: &str| {
             signed(
@@ -3363,7 +3375,7 @@ mod tests {
         let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
         case.response_deadline = "2020-01-01T00:00:00Z".into();
         harness.state.store.put_case(&case).unwrap();
-        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        harness.decide(&case_id, ban_decision()).await;
 
         let claim = serde_json::to_vec(&json!({
             "caseId": case_id,
@@ -3394,7 +3406,7 @@ mod tests {
         let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
         case.response_deadline = "2020-01-01T00:00:00Z".into();
         harness.state.store.put_case(&case).unwrap();
-        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        harness.decide(&case_id, ban_decision()).await;
 
         // The accused appeals.
         let appeal = signed(
@@ -3429,7 +3441,7 @@ mod tests {
         let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
         case.response_deadline = "2020-01-01T00:00:00Z".into();
         harness.state.store.put_case(&case).unwrap();
-        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        harness.decide(&case_id, ban_decision()).await;
 
         let claim = serde_json::to_vec(&json!({
             "caseId": case_id,
@@ -3462,7 +3474,7 @@ mod tests {
         let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
         case.response_deadline = "2020-01-01T00:00:00Z".into();
         harness.state.store.put_case(&case).unwrap();
-        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        harness.decide(&case_id, ban_decision()).await;
 
         let appeal = signed(
             json!({"caseId": case_id, "kind": "appeal", "statement": "it was a quotation"}),
@@ -3496,7 +3508,7 @@ mod tests {
         let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
         case.response_deadline = "2020-01-01T00:00:00Z".into();
         harness.state.store.put_case(&case).unwrap();
-        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        harness.decide(&case_id, ban_decision()).await;
 
         let (status, _) =
             harness.decide(&case_id, json!({"disposition": "reverse", "reasoning": "hash:r"})).await;
@@ -3610,7 +3622,7 @@ mod tests {
         let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
         case.response_deadline = "2020-01-01T00:00:00Z".into();
         harness.state.store.put_case(&case).unwrap();
-        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        harness.decide(&case_id, ban_decision()).await;
 
         let appeal = |statement: &str| {
             signed(
@@ -3796,7 +3808,7 @@ mod tests {
         let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
         case.response_deadline = "2020-01-01T00:00:00Z".into();
         harness.state.store.put_case(&case).unwrap();
-        harness.decide(&case_id, json!({"disposition": "ban", "reasoning": "hash:f"})).await;
+        harness.decide(&case_id, ban_decision()).await;
 
         let appeal = |n: usize| {
             signed(
@@ -3833,4 +3845,196 @@ mod tests {
         );
     }
 
+    // ─── Device recovery claims ──────────────────────────────────────
+
+    fn recovery_claim_json(grantee_seed: [u8; 32]) -> Value {
+        json!({
+            "grantee": testing::key_reference(grantee_seed),
+            "contact": "holder@example.org",
+            "statement": "Bought this iPad second-hand last week; previous owner unknown.",
+            "timestamp": util::format_timestamp(OffsetDateTime::now_utc()),
+        })
+    }
+
+    async fn file_claim(harness: &Harness, grantee_seed: [u8; 32]) -> String {
+        let body = signed(recovery_claim_json(grantee_seed), "signature", &[grantee_seed]);
+        let (status, response) = harness.post("/v1/recovery-claims", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        response["claimId"].as_str().unwrap().to_string()
+    }
+
+    fn claim_status_request(claim_id: &str, seed: [u8; 32]) -> Request<Body> {
+        let timestamp = util::format_timestamp(OffsetDateTime::now_utc());
+        let message = format!("recovery-claim-status:{claim_id}:{timestamp}");
+        Request::get(format!("/v1/recovery-claims/{claim_id}"))
+            .header("x-onym-key", testing::key_reference(seed))
+            .header("x-onym-timestamp", timestamp)
+            .header("x-onym-signature", testing::sign(seed, message.as_bytes()))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_recovery_claim_is_filed_once_per_identity() {
+        let harness = Harness::new();
+        let claim_id = file_claim(&harness, STRANGER_SEED).await;
+        assert!(claim_id.starts_with("claim-"));
+
+        // Filing moves nothing and decides nothing.
+        let claim = harness.state.store.recovery_claim(&claim_id).unwrap().unwrap();
+        assert_eq!(claim.state, "open");
+        assert!(claim.grant_raw.is_none());
+
+        // A second open claim for the same key is spam, not signal.
+        let body = signed(recovery_claim_json(STRANGER_SEED), "signature", &[STRANGER_SEED]);
+        let (status, _) = harness.post("/v1/recovery-claims", body).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn a_recovery_claim_needs_the_grantees_signature_and_a_fresh_timestamp() {
+        let harness = Harness::new();
+
+        // Signed by a different key than the named grantee.
+        let body = signed(recovery_claim_json(STRANGER_SEED), "signature", &[ACCUSED_SEED]);
+        let (status, _) = harness.post("/v1/recovery-claims", body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Correctly signed, but stale.
+        let mut stale = recovery_claim_json(STRANGER_SEED);
+        stale["timestamp"] = json!("2026-08-01T00:00:00Z");
+        let body = signed(stale, "signature", &[STRANGER_SEED]);
+        let (status, _) = harness.post("/v1/recovery-claims", body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_recovery_claim_requires_contact_and_statement() {
+        let harness = Harness::new();
+        for (field, value) in [("contact", json!("   ")), ("statement", json!(""))] {
+            let mut claim = recovery_claim_json(STRANGER_SEED);
+            claim[field] = value;
+            let body = signed(claim, "signature", &[STRANGER_SEED]);
+            let (status, response) = harness.post("/v1/recovery-claims", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_status_answers_only_the_key_the_claim_names() {
+        let harness = Harness::new();
+        let claim_id = file_claim(&harness, STRANGER_SEED).await;
+
+        let (status, response) =
+            harness.send(claim_status_request(&claim_id, STRANGER_SEED)).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["state"], "open");
+        assert!(response["grant"].is_null());
+
+        // Another key, an unknown claim, and no credential all get the
+        // same not-found.
+        let (status, _) = harness.send(claim_status_request(&claim_id, ACCUSED_SEED)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) =
+            harness.send(claim_status_request("claim-none", STRANGER_SEED)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = harness
+            .send(
+                Request::get(format!("/v1/recovery-claims/{claim_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_granted_claim_serves_a_grant_that_verifies_against_the_operator_key() {
+        use ed25519_dalek::Verifier;
+
+        let harness = Harness::new();
+        let claim_id = file_claim(&harness, STRANGER_SEED).await;
+
+        // A decided case for the grant to name.
+        let case_id = open_case(&harness).await;
+        let mut case = harness.state.store.case(&case_id).unwrap().unwrap();
+        case.response_deadline = "2020-01-01T00:00:00Z".into();
+        harness.state.store.put_case(&case).unwrap();
+        let (status, response) = harness.decide(&case_id, ban_decision()).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+
+        // The moderator grants (through the store + signer, as the
+        // panel handler does — the handler's own auth is covered by
+        // the admin tests).
+        let issued = crate::recovery::issue_grant(
+            &case_id,
+            &testing::key_reference(STRANGER_SEED),
+            &harness.state.config.manifest.component_id,
+            OffsetDateTime::now_utc(),
+            &harness.state.signing_key,
+        )
+        .unwrap();
+        assert!(harness
+            .state
+            .store
+            .grant_recovery_claim(&claim_id, &case_id, "verified by phone", &issued.raw, &issued.grant_ref, "2026-08-09T15:00:00Z")
+            .unwrap());
+
+        // The claimant polls and receives the exact signed bytes.
+        let (status, response) =
+            harness.send(claim_status_request(&claim_id, STRANGER_SEED)).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["state"], "granted");
+        let served = util::base64_decode(response["grant"].as_str().unwrap()).unwrap();
+        assert_eq!(served, issued.raw, "the grant travels verbatim");
+
+        // And they verify against the operator key over the canonical
+        // grant bytes — the exact check the interface performs.
+        let grant: Value = serde_json::from_slice(&served).unwrap();
+        assert_eq!(grant["caseId"], json!(case_id));
+        assert_eq!(grant["grantee"], json!(testing::key_reference(STRANGER_SEED)));
+        let signing_bytes = canonical::grant_signing_bytes(&served).unwrap();
+        let raw_signature =
+            util::base64_decode(grant["signature"].as_str().unwrap()).unwrap();
+        let signature = ed25519_dalek::Signature::from_slice(&raw_signature).unwrap();
+        harness
+            .state
+            .signing_key
+            .verifying_key()
+            .verify(&signing_bytes, &signature)
+            .unwrap();
+
+        // Granting is on the case's event ledger.
+        let events = harness.state.store.recent_events(20).unwrap();
+        assert!(events
+            .iter()
+            .any(|(event_case, _, kind, detail)| event_case == &case_id
+                && kind == "recovery_grant_issued"
+                && detail.contains(&claim_id)));
+
+        // One decision per claim.
+        assert!(!harness
+            .state
+            .store
+            .grant_recovery_claim(&claim_id, &case_id, "again", &issued.raw, &issued.grant_ref, "2026-08-09T16:00:00Z")
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_refused_claim_reports_its_reasons_to_the_claimant() {
+        let harness = Harness::new();
+        let claim_id = file_claim(&harness, STRANGER_SEED).await;
+        assert!(harness
+            .state
+            .store
+            .refuse_recovery_claim(&claim_id, "could not verify the holder", "2026-08-09T15:00:00Z")
+            .unwrap());
+
+        let (status, response) =
+            harness.send(claim_status_request(&claim_id, STRANGER_SEED)).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["state"], "refused");
+        assert_eq!(response["reasoning"], "could not verify the holder");
+        assert!(response["grant"].is_null());
+    }
 }
