@@ -51,6 +51,15 @@ pub fn report_signing_bytes(raw: &[u8]) -> Result<Vec<u8>, Error> {
     canonical_bytes(raw, &["signature"])
 }
 
+/// The bytes this authority signs for a recovery grant, and a claimant
+/// for a recovery claim: every field except `signature`. Must stay
+/// byte-identical to `grant_signing_bytes` in `apple/src/canonical.rs`
+/// — the interface reconstructs them to verify the grant and to derive
+/// its single-use reference.
+pub fn grant_signing_bytes(raw: &[u8]) -> Result<Vec<u8>, Error> {
+    canonical_bytes(raw, &["signature"])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

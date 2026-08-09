@@ -37,6 +37,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/cases/:case_id/respond", post(respond))
         .route("/v1/cases/:case_id/appeal", post(appeal))
         .route("/v1/cases/mine", get(list_my_cases))
+        .route("/v1/recovery-claims", post(file_recovery_claim))
+        .route("/v1/recovery-claims/:claim_id", get(recovery_claim_status))
         .route("/v1/cases/:case_id/status", get(query_status))
         .route("/v1/cases/:case_id/decide", post(decide))
         .route("/v1/verdicts/:verdict_ref/requeue", post(requeue_verdict))
@@ -1011,6 +1013,128 @@ async fn list_my_cases(
     let accused = authorize_identity_lookup(&headers)?;
     let cases = state.store.banned_cases_for_accused(&accused)?;
     Ok(Json(cases.into_iter().map(|case| case.case_id).collect()))
+}
+
+// ─── Device recovery claims ──────────────────────────────────────────
+
+const MAX_RECOVERY_CONTACT_CHARS: usize = 200;
+const MAX_RECOVERY_STATEMENT_CHARS: usize = 4000;
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryClaimSubmission {
+    /// The claimant's *new* identity key — the one a grant would name.
+    grantee: String,
+    /// A real way to reach the claimant. A moderator may need to ask
+    /// questions before deciding, and a claim that cannot be answered
+    /// cannot be verified.
+    contact: String,
+    /// The claimant's own account of how they came to hold the marked
+    /// device — the proof of new-holder status a human weighs.
+    statement: String,
+    timestamp: String,
+    signature: String,
+}
+
+/// File a device-recovery claim (§6). The claimant is, by
+/// construction, not the mandated identity — their old key is exactly
+/// what they lost — so like a new-holder claim this is authenticated
+/// only to the *new* key, and bounded rather than trusted: one open
+/// claim per key, a capacity cap on the queue, and a human decides.
+/// Nothing about filing moves any record anywhere.
+async fn file_recovery_claim(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, Error> {
+    let submission: RecoveryClaimSubmission = serde_json::from_slice(&body)
+        .map_err(|e| Error::BadRequest(format!("malformed claim: {e}")))?;
+
+    let now = OffsetDateTime::now_utc();
+    let signed_at = util::parse_timestamp(&submission.timestamp)
+        .map_err(|e| Error::BadRequest(format!("timestamp: {e}")))?;
+    if (now - signed_at).whole_seconds().abs() > STATUS_CREDENTIAL_MAX_AGE_SECONDS {
+        return Err(Error::SignatureInvalid("claim timestamp is stale".into()));
+    }
+    let signing_bytes = canonical::grant_signing_bytes(&body)?;
+    verify_signature(&submission.grantee, &signing_bytes, &submission.signature)?;
+
+    let contact = submission.contact.trim();
+    let statement = submission.statement.trim();
+    if contact.is_empty() || contact.chars().count() > MAX_RECOVERY_CONTACT_CHARS {
+        return Err(Error::BadRequest(format!(
+            "contact is required, at most {MAX_RECOVERY_CONTACT_CHARS} characters"
+        )));
+    }
+    if statement.is_empty() || statement.chars().count() > MAX_RECOVERY_STATEMENT_CHARS {
+        return Err(Error::BadRequest(format!(
+            "statement is required, at most {MAX_RECOVERY_STATEMENT_CHARS} characters"
+        )));
+    }
+
+    let claim = crate::store::RecoveryClaim {
+        claim_id: format!("claim-{}", uuid::Uuid::new_v4()),
+        grantee: submission.grantee.clone(),
+        contact: contact.to_string(),
+        statement: statement.to_string(),
+        filed_at: util::format_timestamp(now),
+        state: "open".into(),
+        case_id: None,
+        decided_at: None,
+        reasoning: None,
+        grant_raw: None,
+    };
+    if !state.store.file_recovery_claim(&claim)? {
+        return Err(Error::CaseState(
+            "a recovery claim for this identity is already open, or intake is at capacity".into(),
+        ));
+    }
+    tracing::info!(claim_id = %claim.claim_id, "recovery claim filed");
+    Ok(Json(json!({
+        "claimId": claim.claim_id,
+        "state": "open",
+        "note": "a human reviews recovery claims; poll this claim with the same identity key",
+    })))
+}
+
+/// A claimant checking on their claim. Answered only to the key the
+/// claim names, with one refusal for a claim that does not exist and a
+/// claim that is not theirs. When granted, the response carries the
+/// signed grant bytes the device presents to the interface.
+async fn recovery_claim_status(
+    State(state): State<Arc<AppState>>,
+    Path(claim_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, Error> {
+    let credential = |name: &'static str| headers.get(name).and_then(|value| value.to_str().ok());
+    let (Some(key), Some(timestamp), Some(signature)) = (
+        credential("x-onym-key"),
+        credential("x-onym-timestamp"),
+        credential("x-onym-signature"),
+    ) else {
+        return Err(Error::NotFound(format!("claim {claim_id}")));
+    };
+    let now = OffsetDateTime::now_utc();
+    let fresh = util::parse_timestamp(timestamp)
+        .map(|signed_at| {
+            (now - signed_at).whole_seconds().abs() <= STATUS_CREDENTIAL_MAX_AGE_SECONDS
+        })
+        .unwrap_or(false);
+    let message = format!("recovery-claim-status:{claim_id}:{timestamp}");
+    if !fresh || verify_signature(key, message.as_bytes(), signature).is_err() {
+        return Err(Error::NotFound(format!("claim {claim_id}")));
+    }
+    let claim = state
+        .store
+        .recovery_claim(&claim_id)?
+        .filter(|claim| claim.grantee == key)
+        .ok_or_else(|| Error::NotFound(format!("claim {claim_id}")))?;
+    Ok(Json(json!({
+        "claimId": claim.claim_id,
+        "state": claim.state,
+        "decidedAt": claim.decided_at,
+        "reasoning": claim.reasoning,
+        "grant": claim.grant_raw.as_deref().map(util::base64_encode),
+    })))
 }
 
 /// Stage and deadlines, per the confidentiality policy. The reporter's

@@ -137,6 +137,22 @@ pub struct MandateRecord {
     pub manifest_hash: String,
 }
 
+/// A device-recovery claim awaiting or past a moderator's decision.
+#[derive(Debug, Clone)]
+pub struct RecoveryClaim {
+    pub claim_id: String,
+    pub grantee: String,
+    pub contact: String,
+    pub statement: String,
+    pub filed_at: String,
+    /// open | granted | refused
+    pub state: String,
+    pub case_id: Option<String>,
+    pub decided_at: Option<String>,
+    pub reasoning: Option<String>,
+    pub grant_raw: Option<Vec<u8>>,
+}
+
 /// One case, in the lifecycle of Moderation.md §10.
 ///
 /// `stage` is the state machine: `open` (notice served, response
@@ -370,6 +386,27 @@ impl Store {
                 token      TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL
+            );
+
+            -- Device-recovery claims: a holder whose marked device no
+            -- longer resolves an identity (reinstall, change of hands)
+            -- asks a human to authorize moving the case's record to
+            -- their new identity. The claim carries a real contact and
+            -- the claimant's own account of how they came to hold the
+            -- device; a moderator decides it. When granted, grant_raw
+            -- holds the exact signed grant bytes the device redeems at
+            -- the interface.
+            CREATE TABLE IF NOT EXISTS recovery_claims (
+                claim_id   TEXT PRIMARY KEY,
+                grantee    TEXT NOT NULL,
+                contact    TEXT NOT NULL,
+                statement  TEXT NOT NULL,
+                filed_at   TEXT NOT NULL,
+                state      TEXT NOT NULL,
+                case_id    TEXT,
+                decided_at TEXT,
+                reasoning  TEXT,
+                grant_raw  BLOB
             );
 
             CREATE TABLE IF NOT EXISTS verdicts (
@@ -1451,6 +1488,138 @@ impl Store {
     /// sorted by when they opened puts the most urgent one wherever it
     /// happens to fall, and the failure is silent: the report simply
     /// goes nowhere and nothing says so.
+    // ─── Recovery claims ─────────────────────────────────────────────
+
+    /// File a device-recovery claim. Refused (returns `false`) when the
+    /// grantee already has one open — a person needs one pending claim,
+    /// and a key is free to mint, so per-key multiplicity is spam — or
+    /// when intake is at capacity, which bounds what an unauthenticated
+    /// endpoint can make a human read.
+    pub fn file_recovery_claim(&self, claim: &RecoveryClaim) -> Result<bool, Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let open_for_grantee: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM recovery_claims WHERE grantee = ?1 AND state = 'open'",
+            params![claim.grantee],
+            |row| row.get(0),
+        )?;
+        let open_total: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM recovery_claims WHERE state = 'open'",
+            [],
+            |row| row.get(0),
+        )?;
+        if open_for_grantee > 0 || open_total >= Self::MAX_OPEN_RECOVERY_CLAIMS {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO recovery_claims (claim_id, grantee, contact, statement, filed_at, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'open')",
+            params![claim.claim_id, claim.grantee, claim.contact, claim.statement, claim.filed_at],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    const MAX_OPEN_RECOVERY_CLAIMS: i64 = 100;
+
+    pub fn recovery_claim(&self, claim_id: &str) -> Result<Option<RecoveryClaim>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let claim = conn
+            .query_row(
+                "SELECT claim_id, grantee, contact, statement, filed_at, state,
+                        case_id, decided_at, reasoning, grant_raw
+                 FROM recovery_claims WHERE claim_id = ?1",
+                params![claim_id],
+                Self::recovery_claim_from_row,
+            )
+            .optional()?;
+        Ok(claim)
+    }
+
+    pub fn open_recovery_claims(&self) -> Result<Vec<RecoveryClaim>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT claim_id, grantee, contact, statement, filed_at, state,
+                    case_id, decided_at, reasoning, grant_raw
+             FROM recovery_claims WHERE state = 'open'
+             ORDER BY filed_at, claim_id",
+        )?;
+        let rows = statement.query_map([], Self::recovery_claim_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Grant an open claim, recording the decision on the case's own
+    /// event ledger in the same transaction. Returns `false` if the
+    /// claim was not open.
+    pub fn grant_recovery_claim(
+        &self,
+        claim_id: &str,
+        case_id: &str,
+        reasoning: &str,
+        grant_raw: &[u8],
+        grant_ref: &str,
+        decided_at: &str,
+    ) -> Result<bool, Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let updated = tx.execute(
+            "UPDATE recovery_claims
+             SET state = 'granted', case_id = ?2, reasoning = ?3, grant_raw = ?4, decided_at = ?5
+             WHERE claim_id = ?1 AND state = 'open'",
+            params![claim_id, case_id, reasoning, grant_raw, decided_at],
+        )?;
+        if updated == 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                case_id,
+                decided_at,
+                "recovery_grant_issued",
+                format!("claim {claim_id}, grant {grant_ref}")
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Refuse an open claim. Returns `false` if it was not open.
+    pub fn refuse_recovery_claim(
+        &self,
+        claim_id: &str,
+        reasoning: &str,
+        decided_at: &str,
+    ) -> Result<bool, Error> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE recovery_claims
+             SET state = 'refused', reasoning = ?2, decided_at = ?3
+             WHERE claim_id = ?1 AND state = 'open'",
+            params![claim_id, reasoning, decided_at],
+        )?;
+        Ok(updated > 0)
+    }
+
+    fn recovery_claim_from_row(row: &rusqlite::Row) -> rusqlite::Result<RecoveryClaim> {
+        Ok(RecoveryClaim {
+            claim_id: row.get(0)?,
+            grantee: row.get(1)?,
+            contact: row.get(2)?,
+            statement: row.get(3)?,
+            filed_at: row.get(4)?,
+            state: row.get(5)?,
+            case_id: row.get(6)?,
+            decided_at: row.get(7)?,
+            reasoning: row.get(8)?,
+            grant_raw: row.get(9)?,
+        })
+    }
+
     pub fn cases_awaiting_decision(&self) -> Result<Vec<CaseRecord>, Error> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(&format!(

@@ -423,6 +423,20 @@ is not stored: it is neither a verdict reason nor evidence.
 Server-rendered at `/admin`, behind `AUTHORITY_ADMIN_TOKEN` and a
 session cookie (`HttpOnly`, `SameSite=Strict`, `Secure`).
 
+Besides the case queues below, `/admin/recovery` holds **device
+recovery claims**: a person holding a marked device whose enrolled
+identity no longer resolves — a reinstall, or hardware that changed
+hands — files a claim (`POST /v1/recovery-claims`) with a real contact
+and their account of how they hold the device. There is deliberately
+no self-serve path. A moderator verifies the holder through the
+contact and either refuses or issues a **recovery grant**: a document
+signed by the operator key, naming the case and the claimant's new
+identity, single-use, lapsing after 30 days. The claimant's app polls
+`GET /v1/recovery-claims/:id` (signed by the same key) and redeems the
+grant at the interface, which moves the case's verdict record to the
+new identity and reconciles — and refuses the grant while any record
+still bans the device, so a grant can never override a standing ban.
+
 It has **two** queues, and which one is the job depends on whether a
 classifier is running:
 
