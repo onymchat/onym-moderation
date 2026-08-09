@@ -272,9 +272,6 @@ impl Engine {
 
         let signing_bytes = canonical::grant_signing_bytes(grant_raw)?;
         let grant_ref = util::sha256_hex(&signing_bytes);
-        if self.store.grant_redeemed(&grant_ref)? {
-            return Err(Error::BadRequest("this grant has already been redeemed".into()));
-        }
 
         // Everything from here to a verified signature answers with
         // ONE refusal. Verification needs the case (the operator key
@@ -291,38 +288,42 @@ impl Engine {
         // verification circular, exactly as it would for a verdict.
         self.verify_grant_signature(&grant, &from_binding, &signing_bytes)?;
 
+        // Redemption state is checked only *after* the signature
+        // verifies, so "already redeemed" cannot be probed by anyone
+        // holding grant bytes without a valid operator signature — it
+        // would otherwise be a distinguishable answer where every other
+        // pre-verification refusal is the uniform one.
+        if self.store.grant_redeemed(&grant_ref)? {
+            return Err(Error::BadRequest("this grant has already been redeemed".into()));
+        }
+
         let Some(to_binding) = self.store.device_binding_for_user(user_key)? else {
             return Err(Error::BadRequest(
                 "this identity is not enrolled; enroll before presenting a grant".into(),
             ));
         };
 
-        // Nothing unresolved may ride the move or meet the clearing
-        // write. The source binding must be fully terminal — every case
-        // dismissed, reversed, or expired — because the move carries
-        // the *whole* binding, and a case still open would hand its
-        // notice (accused, evidence summary, deadlines) to a claimant
-        // who is not its party, while a ban still queued behind its
-        // executeAfter would execute onto the recovered device once the
-        // window passes. `intended.bits` cannot answer this: it folds a
-        // suspensive/queued ban as "not banned yet". `binding_state`
-        // counts a queued ban as unresolved, which is the whole point.
+        // The grant's *named case* must itself be terminal — dismissed,
+        // reversed, or expired. The move touches only that case, so an
+        // unrelated case on the source binding (the previous holder's,
+        // which the claimant can neither see nor resolve) must not block
+        // recovery: the check is scoped to `grant.case_id`. A case still
+        // open, or a ban not yet reversed or expired — queued bans
+        // included, which the folded `bits` would miss — refuses.
         //
-        // The destination need only be free of a ban of its own: the
-        // claimant's own open cases are theirs to see, but a live or
-        // queued ban on their binding means recovery would clear a
-        // device its own record still bans.
+        // The destination is checked binding-wide: the clearing write
+        // folds the grantee's whole binding, so a live or queued ban of
+        // *their own* means recovery would clear a device their own
+        // record still bans. Their open cases are theirs to see, so
+        // those do not block.
         //
-        // This check is read outside the `adopt_binding` transaction, so
-        // a verdict could in principle ingest between here and the move.
-        // The window is benign: the move is scoped to the grant's named
-        // case, which is terminal (reversed/expired) — the authority
-        // does not issue a new *governing* verdict on a reversed case,
-        // so nothing that would flip `binding_state` for *this* case can
-        // arrive in the gap. A verdict for some *other* case cannot ride
-        // along, because the move no longer touches it.
-        let source = self.binding_state(&from_binding, now)?;
-        let dest = self.binding_state(&to_binding, now)?;
+        // Read outside the `adopt_binding` transaction, but the window
+        // is benign: the case is terminal and the authority issues no
+        // new governing verdict on a reversed case, so nothing that
+        // would flip this arrives in the gap; unrelated cases are not
+        // consulted and are not moved.
+        let source = self.binding_state(&from_binding, Some(&grant.case_id), now)?;
+        let dest = self.binding_state(&to_binding, None, now)?;
         // A ban in force — the grant's case or the grantee's own —
         // answers with that ban's routes. An *open* case is a different
         // refusal: nothing is banned, the matter is simply undecided,
@@ -380,16 +381,16 @@ impl Engine {
         // Ordinary reconciliation now resolves the moved record and
         // performs the clearing write on the reversal's own authority,
         // against the bits already read in this session. The grant is
-        // already spent and the record already moved, so a failure here
-        // is not a lost grant: the next ordinary gate check on the new
-        // enrollment finishes the clear. Say exactly that, rather than
-        // let it read as "redeem again".
+        // already spent and the record already moved, so *any* failure
+        // here is not a lost grant: the next ordinary gate check on the
+        // new enrollment finishes the clear. Say exactly that for every
+        // post-move error, rather than let it read as "redeem again".
         match self.reconcile(device_check, device_token, user_key, bits, now).await {
             Ok(gate) => Ok(RecoveryResult::Recovered { gate }),
-            Err(Error::MarkWriteFailed(detail)) => {
+            Err(err) => {
                 tracing::warn!(
                     %grant_ref,
-                    "recovery moved the record but the clearing write failed: {detail}"
+                    "recovery moved the record but finishing it failed: {err}"
                 );
                 Err(Error::MarkWriteFailed(
                     "recovery is recorded and the grant is spent; this device will clear on \
@@ -397,7 +398,6 @@ impl Engine {
                         .into(),
                 ))
             }
-            Err(other) => Err(other),
         }
     }
 
@@ -408,9 +408,19 @@ impl Engine {
     /// behind its `executeAfter` counts as a ban here: a suspensive
     /// appeal window is unresolved, and recovery must refuse it rather
     /// than move it and let it execute onto the recovered device.
+    ///
+    /// `only_case` restricts the scan to one case. The source check
+    /// uses this — the move is scoped to the grant's named case, so an
+    /// *unrelated* case on the source binding (the previous holder's,
+    /// which the claimant is not party to and cannot resolve) must not
+    /// block recovery, nor have its ban's contact disclosed. The
+    /// destination check passes `None`: any ban on the grantee's own
+    /// binding is relevant, because the clearing write folds that whole
+    /// binding.
     fn binding_state(
         &self,
         binding: &str,
+        only_case: Option<&str>,
         now: OffsetDateTime,
     ) -> Result<BindingState, Error> {
         // Newest-first, so the first row seen for a case governs it —
@@ -423,6 +433,9 @@ impl Engine {
         let mut ban_route: Option<(String, Verdict)> = None;
         for stored in &verdicts {
             if stored.superseded {
+                continue;
+            }
+            if only_case.is_some_and(|case| case != stored.case_id) {
                 continue;
             }
             if !seen.insert(stored.case_id.clone()) {
@@ -1833,14 +1846,20 @@ mod tests {
                 "the mandate must not move"
             );
 
-            // The write log records only bit writes: the clearing
-            // write, authorized by the reversal on file — never a
-            // grant. The move itself is ledgered in `recoveries`.
+            // The write log carries two entries, both on the chain:
+            // the record move (no bits, authorized by the grant) and
+            // the clearing write (no bits set, authorized by the
+            // reversal). Neither sets a bit — the log's bits-only
+            // meaning is intact — and the chain still verifies.
             let log = engine.store.write_log(10).unwrap();
             assert!(log.iter().any(|entry| entry.authorized_by == "reverse-csam"
                 && !entry.banned
                 && !entry.case_open));
-            assert!(log.iter().all(|entry| !entry.authorized_by.starts_with("recovery-grant:")));
+            assert!(log.iter().any(|entry| entry.authorized_by.starts_with("recovery-move:")
+                && !entry.banned
+                && !entry.case_open
+                && entry.outcome.contains("no device bits written")));
+            assert!(engine.store.verify_write_log().unwrap().is_none(), "chain intact");
         }
 
         /// The mandate must NOT move — the regression an earlier
@@ -1897,6 +1916,26 @@ mod tests {
                 outcome.is_ok(),
                 "a later verdict for the recovered case must still ingest: {outcome:?}"
             );
+
+            // …and it must take EFFECT, not just validate: ingest routes
+            // a verdict for a recovered case to the recovered binding
+            // (`binding_for_ingest`), so it folds into the device the
+            // record now governs rather than the abandoned one.
+            let to_binding =
+                engine.store.device_binding_for_user(CLAIMANT).unwrap().unwrap();
+            assert_eq!(
+                engine.store.binding_for_ingest("case-csam").unwrap().as_deref(),
+                Some(to_binding.as_str()),
+                "a later verdict is routed to the recovered binding"
+            );
+            // Store it where ingest would, and confirm it folds there.
+            store_verdict_bound(&engine, "late-ban", {
+                let mut v = verdict("case-csam", Disposition::Ban, "csam");
+                v.decided_at = "2026-08-10T00:00:00Z".into();
+                v
+            }, &to_binding, "2026-08-10T00:00:00Z");
+            let intended = engine.intended_marks(&to_binding, now() + time::Duration::days(2)).unwrap().unwrap();
+            assert!(intended.bits.banned, "the re-ban reaches the recovered device");
             drop(apple);
         }
 
@@ -2098,15 +2137,17 @@ mod tests {
         /// and consumed. It must refuse: once the window passes the
         /// queued ban would execute onto the recovered device.
         #[tokio::test]
-        async fn a_queued_ban_on_the_source_refuses_and_keeps_the_grant() {
+        async fn a_queued_ban_on_the_grants_own_case_refuses_and_keeps_the_grant() {
             let key = operator();
             let (engine, apple) = engine_with_apple(BANNED).await;
-            seed_reversed_case(&engine, &key);
+            seed_consent(&engine, &key);
             let to_binding = enroll_claimant(&engine);
 
-            // A second case on the source binding whose ban is decided
-            // but does not execute until well after `now()`.
-            let mut queued = verdict("case-suspensive", Disposition::Ban, "csam");
+            // The GRANT'S case is itself a ban decided but not yet
+            // executed — a suspensive window. It folds as "not banned
+            // yet", but recovery must still refuse, or the queued ban
+            // would execute onto the recovered device.
+            let mut queued = verdict("case-csam", Disposition::Ban, "csam");
             queued.execute_after = Some("2026-09-01T00:00:00Z".into());
             store_verdict_bound(&engine, "ban-queued", queued, OLD_BINDING, "2026-08-08T00:00:00Z");
 
@@ -2114,27 +2155,61 @@ mod tests {
             let result =
                 engine.recover(Some("token"), CLAIMANT, &grant_bytes, now()).await.unwrap();
             assert!(matches!(result, RecoveryResult::MarkInForce { .. }), "{result:?}");
-            // Nothing moved onto the claimant, and the grant is intact.
             assert_eq!(engine.store.verdicts_for_device(&to_binding).unwrap().len(), 0);
             assert!(!engine.store.grant_redeemed(&grant_ref(&grant_bytes)).unwrap());
             drop(apple);
         }
 
-        /// An open case on the source binding must never ride the move:
-        /// its notice carries the accused, evidence summary, and
-        /// deadlines, and the claimant is not its party. Recovery
-        /// refuses rather than serve it.
+        /// The source check is scoped to the grant's own case: an
+        /// unrelated case on the source binding — the previous holder's,
+        /// which the claimant can neither see nor resolve — must NOT
+        /// block recovery of the granted (terminal) case. Since the move
+        /// is case-scoped, the unrelated records never travel either.
         #[tokio::test]
-        async fn an_open_case_on_the_source_refuses() {
+        async fn an_unrelated_case_on_the_source_does_not_block() {
             let key = operator();
             let (engine, _apple) = engine_with_apple(BANNED).await;
             seed_reversed_case(&engine, &key);
             let to_binding = enroll_claimant(&engine);
 
+            // A previous holder's open case AND a queued ban, both
+            // unrelated to the granted case-csam.
             store_verdict_bound(
                 &engine,
                 "open-other",
                 verdict("case-open", Disposition::OpenCase, "csam"),
+                OLD_BINDING,
+                "2026-08-08T12:00:00Z",
+            );
+            let mut queued = verdict("case-suspensive", Disposition::Ban, "csam");
+            queued.execute_after = Some("2026-09-01T00:00:00Z".into());
+            store_verdict_bound(&engine, "ban-queued", queued, OLD_BINDING, "2026-08-08T00:00:00Z");
+
+            let grant_bytes = grant("case-csam", CLAIMANT, "2026-08-09T00:00:00Z", &key);
+            let result =
+                engine.recover(Some("token"), CLAIMANT, &grant_bytes, now()).await.unwrap();
+            assert!(matches!(result, RecoveryResult::Recovered { .. }), "{result:?}");
+            // Only the granted case moved; the unrelated cases stayed.
+            assert_eq!(engine.store.verdicts_for_device(&to_binding).unwrap().len(), 2);
+            assert_eq!(
+                engine.store.binding_for_case("case-open").unwrap().as_deref(),
+                Some(OLD_BINDING)
+            );
+        }
+
+        /// A still-open GRANT case answers `caseUnsettled`, not a
+        /// mislabelled ban.
+        #[tokio::test]
+        async fn an_open_grant_case_answers_case_unsettled() {
+            let key = operator();
+            let (engine, _apple) = engine_with_apple(BANNED).await;
+            seed_consent(&engine, &key);
+            let to_binding = enroll_claimant(&engine);
+
+            store_verdict_bound(
+                &engine,
+                "open-csam",
+                verdict("case-csam", Disposition::OpenCase, "csam"),
                 OLD_BINDING,
                 "2026-08-08T12:00:00Z",
             );
