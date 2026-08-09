@@ -414,8 +414,34 @@ is not stored: it is neither a verdict reason nor evidence.
 ## The moderator panel
 
 Server-rendered at `/admin`, behind `AUTHORITY_ADMIN_TOKEN` and a
-session cookie (`HttpOnly`, `SameSite=Strict`, `Secure`). Its queue is
-appeals; it also lists recent cases for oversight.
+session cookie (`HttpOnly`, `SameSite=Strict`, `Secure`).
+
+It has **two** queues, and which one is the job depends on whether a
+classifier is running:
+
+- **Awaiting decision** — open cases with no verdict yet, soonest
+  decision deadline first, with the time remaining shown and anything
+  inside two days marked. Under autonomous triage this holds the cases
+  the model declined to decide. With triage off it is the entire
+  workload, and it has a clock: a case nobody decides is dismissed by
+  default at its deadline (§3.5), which is safe for the accused and
+  silent for everyone else. It also says whether each response window
+  has closed, because a ban before it has is refused — worth knowing
+  before opening the file rather than after.
+- **Appeals awaiting review** — appeals and new-holder claims.
+
+Recent cases are listed below both for oversight. The page states which
+mode it is in rather than assuming: telling a moderator that "triage
+decides in the first instance" when no classifier is configured
+describes their whole workload as somebody else's problem.
+
+**Something must be able to decide.** Autonomous triage needs neither
+token; otherwise a person does, and the only two routes in are
+`AUTHORITY_MODERATOR_TOKEN` (the JSON API) and `AUTHORITY_ADMIN_TOKEN`
+(this panel). With no classifier and neither token the service refuses
+to start, because it would otherwise accept reports, serve notice, run
+every window and dismiss every case — an authority that looks healthy
+and cannot reach a verdict.
 
 A case page shows the disclosed evidence, the classifier's per-category
 scores and what the class was judged on, the case history, and the

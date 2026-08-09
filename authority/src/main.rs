@@ -167,10 +167,46 @@ async fn main() {
         }
     }
 
+    // Who, if anyone, can actually decide a case.
+    //
+    // Autonomous triage decides without either token; the JSON API
+    // needs `AUTHORITY_MODERATOR_TOKEN` and the panel needs
+    // `AUTHORITY_ADMIN_TOKEN`. With no classifier and neither token,
+    // this service accepts reports, opens cases, serves notice, runs
+    // every response window — and then dismisses all of them by
+    // default, because nothing on earth can reach a verdict. That is an
+    // authority which looks healthy and is not one, which is the same
+    // failure the operator-key check above refuses to start over, so
+    // this refuses too.
+    let autonomous = matches!(
+        state.config.triage.as_ref().map(|t| t.mode),
+        Some(config::TriageMode::Autonomous)
+    );
+    let human_can_decide =
+        state.config.moderator_token.is_some() || state.config.admin_token.is_some();
+    if !autonomous && !human_can_decide {
+        eprintln!(
+            "Configuration error: nothing can decide a case.\n\n\
+             AUTHORITY_TRIAGE_MODE is not autonomous, so a person has to decide — but \
+             AUTHORITY_MODERATOR_TOKEN (the JSON API) and AUTHORITY_ADMIN_TOKEN (the panel at \
+             /admin) are both unset, and those are the only two ways in.\n\n\
+             Left running, this authority would accept reports, open cases, serve notice, run \
+             every response window, and dismiss all of them at their decision deadlines. Set one \
+             of the two tokens, or set AUTHORITY_TRIAGE_MODE=autonomous with a model profile in \
+             the manifest."
+        );
+        std::process::exit(1);
+    }
+    if !autonomous && state.config.admin_token.is_none() {
+        tracing::warn!(
+            "AUTHORITY_ADMIN_TOKEN is unset, so the panel at /admin is closed. With no \
+             classifier running, every case must be decided through the JSON API instead — and \
+             appeals have no other route at all."
+        );
+    }
     if state.config.moderator_token.is_none() {
         tracing::warn!(
-            "AUTHORITY_MODERATOR_TOKEN is unset — no case can be decided. Cases will still \
-             resolve, by the decision-deadline default (dismissal)."
+            "AUTHORITY_MODERATOR_TOKEN is unset — POST /v1/cases/:id/decide is closed."
         );
     }
     // Triage reads the evidence in a case. Where that inference runs

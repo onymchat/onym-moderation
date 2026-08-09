@@ -1398,6 +1398,32 @@ impl Store {
         Ok(out)
     }
 
+    /// Open cases still waiting for a first-instance decision, soonest
+    /// deadline first.
+    ///
+    /// With triage off — which is how this deployment runs — this is
+    /// the moderator's actual workload, and it has a clock on it: a
+    /// case nobody decides is dismissed by default at its decision
+    /// deadline (§3.5). The ordering is the point. "Recent cases"
+    /// sorted by when they opened puts the most urgent one wherever it
+    /// happens to fall, and the failure is silent: the report simply
+    /// goes nowhere and nothing says so.
+    pub fn cases_awaiting_decision(&self) -> Result<Vec<CaseRecord>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {} FROM cases
+              WHERE stage = 'open'
+              ORDER BY decision_deadline, case_id",
+            Self::CASE_COLUMNS
+        ))?;
+        let rows = statement.query_map([], Self::case_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn recent_cases(&self, limit: i64) -> Result<Vec<CaseRecord>, Error> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(&format!(
