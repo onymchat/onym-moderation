@@ -84,7 +84,7 @@ impl Store {
             .map_err(|e| Error::Internal(format!("set WAL: {e}")))?;
         conn.pragma_update(None, "foreign_keys", "ON").ok();
         let store = Self { conn: Mutex::new(conn) };
-        store.initialize_schema()?;
+        store.migrate()?;
         Ok(store)
     }
 
@@ -93,14 +93,27 @@ impl Store {
         let conn = Connection::open_in_memory()
             .map_err(|e| Error::Internal(format!("open in-memory store: {e}")))?;
         let store = Self { conn: Mutex::new(conn) };
-        store.initialize_schema()?;
+        store.migrate()?;
         Ok(store)
     }
 
-    /// Initialize the prerelease schema. There are no deployed
-    /// Interface databases yet, so schema changes currently require a
-    /// fresh database rather than carrying unexercised migrations.
-    fn initialize_schema(&self) -> Result<(), Error> {
+    /// Create the schema, then bring an existing store up to it.
+    ///
+    /// The first half is for a fresh database and the second is for
+    /// every one after that. `CREATE TABLE IF NOT EXISTS` is a **no-op**
+    /// against a table that already exists, so a column added to a
+    /// definition below never reaches a store an earlier build created:
+    /// the reads that select it then fail with `no such column`, and on
+    /// a deployment holding live verdicts the service comes back up
+    /// dead — `put_verdict` refusing every submission and `gate_check`
+    /// erroring, with marks frozen where they stand.
+    ///
+    /// This carried no upgrade path while no database existed to
+    /// upgrade. `moderation-data` is a named volume that survives
+    /// `docker compose up -d --build`, so the first deployment is the
+    /// moment that stops being true — and the second deployment is when
+    /// it would have been discovered.
+    fn migrate(&self) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             r#"
@@ -181,6 +194,131 @@ impl Store {
             "#,
         )
         .map_err(|e| Error::Internal(format!("initialize schema: {e}")))?;
+
+        // Columns added since the first released schema. New *tables*
+        // above are fine — `IF NOT EXISTS` creates those. It is only
+        // new columns in old tables that need this.
+        //
+        // Added nullable, though the definitions above say NOT NULL:
+        // SQLite cannot add a NOT NULL column without a default, and
+        // every default available here would be a lie about when the
+        // authority decided. The backfill below fills them instead, so
+        // an upgraded store ends up with the same data a fresh one
+        // holds — reached differently because it has to be.
+        for (table, column, definition) in [
+            ("verdicts", "decided_at", "TEXT"),
+            ("verdicts", "decided_at_seconds", "INTEGER"),
+            ("verdicts", "decided_at_nanos", "INTEGER"),
+        ] {
+            Self::add_column(&conn, table, column, definition)?;
+        }
+        Self::backfill_decided_at(&conn)?;
+
+        Ok(())
+    }
+
+    /// Add a column, treating "it is already there" as success.
+    ///
+    /// SQLite has no `ADD COLUMN IF NOT EXISTS`, and checking
+    /// `pragma_table_info` first would be a race with nothing; the
+    /// duplicate-column error is the check.
+    fn add_column(
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        definition: &str,
+    ) -> Result<(), Error> {
+        match conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), []) {
+            Ok(_) => {
+                tracing::info!(%table, %column, "added column to an existing store");
+                Ok(())
+            }
+            Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+            Err(e) => Err(Error::Internal(format!("migrate {table}.{column}: {e}"))),
+        }
+    }
+
+    /// Fill `decided_at*` on rows written before those columns existed.
+    ///
+    /// These are not bookkeeping. `verdicts_for_device` orders the
+    /// causal fold by them, so a row left at a placeholder does not
+    /// merely look wrong — it is folded in the wrong place. Zero would
+    /// sort every pre-upgrade verdict to the beginning of time, which
+    /// is precisely how a ban comes back after the reversal that lifted
+    /// it. Defaulting was never an option here.
+    ///
+    /// The value is read back out of the verdict's own signed bytes,
+    /// which is where it came from in the first place, and parsed by
+    /// the same function `put_verdict` uses so an upgraded row and a
+    /// freshly written one cannot disagree.
+    ///
+    /// A row whose `raw` will not parse falls back to `received_at`,
+    /// loudly. That is not an invented date: arrival order is exactly
+    /// how this row was folded before the upgrade, so the fallback
+    /// preserves the meaning it already had rather than inventing a new
+    /// one.
+    fn backfill_decided_at(conn: &Connection) -> Result<(), Error> {
+        let pending: Vec<(String, Vec<u8>, String)> = {
+            let mut statement = conn.prepare(
+                "SELECT verdict_ref, raw, received_at FROM verdicts WHERE decided_at IS NULL",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            out
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        tracing::info!(
+            count = pending.len(),
+            "backfilling decidedAt on verdicts stored before it was recorded"
+        );
+        for (verdict_ref, raw, received_at) in pending {
+            let signed = serde_json::from_slice::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|verdict| {
+                    verdict.get("decidedAt").and_then(|v| v.as_str()).map(str::to_string)
+                });
+            let decided_at = match signed.as_deref().map(util::parse_timestamp) {
+                Some(Ok(parsed)) => Some((signed.clone().unwrap_or_default(), parsed)),
+                _ => None,
+            };
+            let (text, parsed) = match decided_at {
+                Some(pair) => pair,
+                None => {
+                    let parsed = util::parse_timestamp(&received_at).map_err(|e| {
+                        Error::Internal(format!(
+                            "verdict {verdict_ref} has neither a readable decidedAt nor a \
+                             readable received_at ({e}); refusing to guess where it belongs in \
+                             the causal fold"
+                        ))
+                    })?;
+                    tracing::warn!(
+                        %verdict_ref,
+                        "verdict carries no readable decidedAt; folding it by arrival, which is \
+                         how it was already being folded before this upgrade"
+                    );
+                    (received_at.clone(), parsed)
+                }
+            };
+            conn.execute(
+                "UPDATE verdicts
+                    SET decided_at = ?2, decided_at_seconds = ?3, decided_at_nanos = ?4
+                  WHERE verdict_ref = ?1",
+                params![
+                    verdict_ref,
+                    text,
+                    parsed.unix_timestamp(),
+                    i64::from(parsed.nanosecond()),
+                ],
+            )?;
+        }
         Ok(())
     }
 
@@ -683,5 +821,172 @@ mod tests {
             .unwrap();
         }
         assert_eq!(store.verify_write_log().unwrap(), Some(1));
+    }
+
+    // ─── The upgrade path ────────────────────────────────────────────
+
+    /// A store as the first released build left it: `verdicts` without
+    /// any of the `decided_at*` columns added since.
+    fn old_shaped_store(path: &std::path::Path, rows: &[(&str, &str, &[u8], &str)]) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE verdicts (
+                verdict_ref    TEXT PRIMARY KEY,
+                case_id        TEXT NOT NULL,
+                mandate_ref    TEXT NOT NULL,
+                device_binding TEXT NOT NULL,
+                disposition    TEXT NOT NULL,
+                ban_expires    TEXT,
+                execute_after  TEXT,
+                executed       INTEGER NOT NULL DEFAULT 0,
+                superseded     INTEGER NOT NULL DEFAULT 0,
+                raw            BLOB NOT NULL,
+                received_at    TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+        for (verdict_ref, disposition, raw, received_at) in rows {
+            conn.execute(
+                "INSERT INTO verdicts
+                 (verdict_ref, case_id, mandate_ref, device_binding, disposition,
+                  ban_expires, execute_after, executed, superseded, raw, received_at)
+                 VALUES (?1, 'c1', 'm1', 'd1', ?2, NULL, NULL, 1, 0, ?3, ?4)",
+                params![verdict_ref, disposition, raw, received_at],
+            )
+            .unwrap();
+        }
+    }
+
+    fn verdict_bytes(decided_at: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "verdictVersion": 1,
+            "caseId": "c1",
+            "decidedAt": decided_at,
+        }))
+        .unwrap()
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("onym-apple-migrate-{name}-{}.sqlite", std::process::id()));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        path
+    }
+
+    /// The failure `CREATE TABLE IF NOT EXISTS` silently does not
+    /// cover. Against a store an earlier build created, adding a column
+    /// to the definition does nothing at all, and the first read that
+    /// selects it fails — which for this service means every verdict
+    /// submission 500s and every gate check errors, with marks frozen.
+    #[test]
+    fn an_old_store_gains_the_columns_added_since() {
+        let path = temp_path("columns");
+        old_shaped_store(
+            &path,
+            &[("v1", "ban", &verdict_bytes("2026-08-01T00:00:00Z"), "2026-08-01T00:00:00Z")],
+        );
+
+        let store = Store::open(path.to_str().unwrap()).expect("an old store must still open");
+
+        // The read that would have failed with `no such column`.
+        let verdicts = store.verdicts_for_device("d1").unwrap();
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].decided_at, "2026-08-01T00:00:00Z");
+
+        // And opening again is a no-op rather than an error: the
+        // duplicate-column error is the "already there" check.
+        let store = Store::open(path.to_str().unwrap()).expect("re-opening must be idempotent");
+        assert_eq!(store.verdicts_for_device("d1").unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The part a default could not have done. `verdicts_for_device`
+    /// orders the causal fold by `decided_at_seconds`, so a backfill
+    /// that put every pre-upgrade row at a placeholder would not merely
+    /// look wrong — it would fold them in the wrong place. Zero sorts
+    /// them all to the beginning of time, which is exactly how a ban
+    /// comes back after the reversal that lifted it.
+    ///
+    /// The arrangement is chosen so that a placeholder backfill gives
+    /// the *wrong* answer rather than a coincidentally right one. A ban
+    /// decided after the reversal, and delivered before it:
+    ///
+    /// - correct — order by decided: the ban is newest, and stands;
+    /// - with both timestamps zeroed: the seconds tie, so the ordering
+    ///   falls through to the disposition rank, which puts `dismiss`
+    ///   above `ban` and reports the ban as lifted.
+    ///
+    /// A device wrongly unbanned is the failure direction that matters,
+    /// and it is reachable purely by migrating carelessly.
+    #[test]
+    fn the_backfill_restores_the_order_the_authority_decided() {
+        let path = temp_path("order");
+        old_shaped_store(
+            &path,
+            &[
+                ("reversal", "dismiss", &verdict_bytes("2026-08-01T00:00:00Z"), "2026-08-02T00:00:00Z"),
+                ("ban", "ban", &verdict_bytes("2026-08-02T00:00:00Z"), "2026-08-01T00:00:00Z"),
+            ],
+        );
+
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        let verdicts = store.verdicts_for_device("d1").unwrap();
+        let order: Vec<&str> = verdicts.iter().map(|v| v.verdict_ref.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["ban", "reversal"],
+            "newest *decided* first — the ban was decided after the reversal, so it stands"
+        );
+        // Said as the outcome rather than the row order, since that is
+        // what a wrong backfill actually costs someone.
+        assert_eq!(verdicts[0].disposition, "ban");
+
+        // And the components really were derived, not defaulted.
+        let conn = store.conn.lock().unwrap();
+        let seconds: i64 = conn
+            .query_row("SELECT decided_at_seconds FROM verdicts WHERE verdict_ref = 'ban'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            seconds,
+            util::parse_timestamp("2026-08-02T00:00:00Z").unwrap().unix_timestamp()
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A row whose bytes will not yield a `decidedAt` falls back to
+    /// `received_at` rather than to a placeholder. That is not an
+    /// invented date: arrival order is how the row was already being
+    /// folded before the upgrade, so the fallback preserves the meaning
+    /// it had instead of inventing a new one.
+    #[test]
+    fn an_unreadable_verdict_falls_back_to_when_it_arrived() {
+        let path = temp_path("fallback");
+        old_shaped_store(
+            &path,
+            &[("broken", "ban", b"not json at all", "2026-08-03T00:00:00Z")],
+        );
+
+        let store = Store::open(path.to_str().unwrap()).expect("one bad row must not block boot");
+        let verdicts = store.verdicts_for_device("d1").unwrap();
+        assert_eq!(verdicts.len(), 1, "the row is kept, not dropped");
+        assert_eq!(verdicts[0].decided_at, "2026-08-03T00:00:00Z");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A fresh store has nothing to backfill and must not be touched by
+    /// the attempt.
+    #[test]
+    fn a_fresh_store_migrates_to_the_same_shape() {
+        let path = temp_path("fresh");
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        assert!(store.verdicts_for_device("d1").unwrap().is_empty());
+        drop(store);
+        Store::open(path.to_str().unwrap()).expect("re-opening a fresh store is a no-op");
+        let _ = std::fs::remove_file(&path);
     }
 }

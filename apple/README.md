@@ -39,6 +39,13 @@ Everything else — which verdict, which case, until when — lives in this
 service's store. The bits are a cache of its conclusions, which is why
 losing `/data` loses the meaning while Apple keeps the values.
 
+That store outlives the container it was created by, so the schema has
+an upgrade path rather than assuming a fresh database: `migrate()`
+creates the tables and then adds, to a store an earlier build left
+behind, whatever columns have been added since. A column omitted from
+that second list reaches new deployments only, and the first read that
+selects it kills every existing one.
+
 ## Endpoints
 
 Three serve the iOS client's `EnforcementBackendClient` seam:

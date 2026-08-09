@@ -120,6 +120,24 @@ Stop and raise these with the user rather than proceeding:
       -v /root:/backup alpine tar czf /backup/moderation-data.tgz -C /d .'
   ```
 
+- **The store survives a redeploy, so schema changes must migrate.**
+  `moderation-data` is a named volume; `docker compose up -d --build`
+  replaces the container and keeps the database. `CREATE TABLE IF NOT
+  EXISTS` is a no-op against a table that already exists, so a column
+  added to a definition never reaches a store an earlier build created
+  and every read that selects it fails — the service comes back up
+  refusing verdicts and erroring gate checks, with marks frozen.
+
+  Adding a column means adding it in **two** places in
+  `apple/src/store.rs`: the `CREATE TABLE` (for fresh databases) and
+  the `add_column` list in `migrate()` (for every existing one). If the
+  column is not nullable and no default is honest, backfill it — see
+  `backfill_decided_at`, and note that the values it fills decide the
+  causal fold, so a placeholder there silently reorders history rather
+  than merely looking wrong.
+
+  Take a backup before deploying a build that migrates.
+
 - **Logs**: `ssh root@$DROPLET_IP 'cd /opt/onym-moderation-apple && docker compose logs -f moderation'`
 - **Restart**: same directory, `docker compose restart moderation`.
 - **Rotating the DeviceCheck key**: replace `secrets/devicecheck.p8`,
