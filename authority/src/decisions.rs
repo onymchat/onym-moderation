@@ -590,6 +590,14 @@ mod tests {
         state
     }
 
+    fn routes() -> Option<AppealRoutes> {
+        Some(AppealRoutes {
+            appeal_url: "https://authority.test/appeal".into(),
+            new_holder_url: "https://authority.test/new-holder".into(),
+            authority_contact: "appeals@authority.test".into(),
+        })
+    }
+
     fn case(responded: bool, response_deadline: &str) -> CaseRecord {
         CaseRecord {
             case_id: "c1".into(),
@@ -618,7 +626,7 @@ mod tests {
         state.store.put_case(&case(false, "2026-08-20T00:00:00Z")).unwrap();
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
 
-        let result = apply(&state, "c1", Disposition::Ban, "hash:why", Decider::Human, now).await;
+        let result = apply_with_appeal_routes(&state, "c1", Disposition::Ban, "hash:why", Decider::Human, now, routes()).await;
         assert!(matches!(result, Err(Error::CaseState(_))));
         // And nothing was issued — a refused decision leaves no verdict.
         assert!(state.store.undelivered_verdicts().unwrap().is_empty());
@@ -650,7 +658,7 @@ mod tests {
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
         notice_served(&state, "c1");
 
-        apply(&state, "c1", Disposition::Ban, "hash:why", Decider::Human, now).await.unwrap();
+        apply_with_appeal_routes(&state, "c1", Disposition::Ban, "hash:why", Decider::Human, now, routes()).await.unwrap();
         assert_eq!(state.store.case("c1").unwrap().unwrap().disposition.as_deref(), Some("ban"));
     }
 
@@ -664,7 +672,7 @@ mod tests {
         state.store.put_case(&case(true, "2026-08-20T00:00:00Z")).unwrap();
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
 
-        let result = apply(&state, "c1", Disposition::Ban, "hash:why", Decider::Human, now).await;
+        let result = apply_with_appeal_routes(&state, "c1", Disposition::Ban, "hash:why", Decider::Human, now, routes()).await;
         assert!(matches!(result, Err(Error::CaseState(_))));
     }
 
@@ -678,7 +686,7 @@ mod tests {
         state.store.put_case(&overdue).unwrap();
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
 
-        let result = apply(&state, "c1", Disposition::Ban, "hash:why", Decider::Human, now).await;
+        let result = apply_with_appeal_routes(&state, "c1", Disposition::Ban, "hash:why", Decider::Human, now, routes()).await;
         assert!(matches!(result, Err(Error::WindowClosed(_))));
         assert!(state.store.undelivered_verdicts().unwrap().is_empty());
     }
@@ -715,7 +723,7 @@ mod tests {
         let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
         notice_served(&state, "c1");
 
-        apply(&state, "c1", Disposition::Ban, "hash:why", Decider::HumanAssisted, now)
+        apply_with_appeal_routes(&state, "c1", Disposition::Ban, "hash:why", Decider::HumanAssisted, now, routes())
             .await
             .unwrap();
         let events = state.store.events("c1").unwrap();

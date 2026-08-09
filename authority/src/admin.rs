@@ -1838,4 +1838,146 @@ mod tests {
         assert_eq!(urgency_class(now, at("2026-08-11T00:00:00Z")), "soon");
         assert_eq!(urgency_class(now, at("2026-08-01T00:00:00Z")), "overdue");
     }
+
+    // ─── Recovery claims ─────────────────────────────────────────────
+
+    fn open_claim(state: &AppState) -> String {
+        let claim = crate::store::RecoveryClaim {
+            claim_id: "claim-1".into(),
+            grantee: "onym:key:new-holder".into(),
+            contact: "holder@example.org".into(),
+            statement: "Bought this device second-hand.".into(),
+            filed_at: "2026-08-09T00:00:00Z".into(),
+            state: "open".into(),
+            case_id: None,
+            decided_at: None,
+            reasoning: None,
+            grant_raw: None,
+        };
+        assert!(state.store.file_recovery_claim(&claim).unwrap());
+        claim.claim_id
+    }
+
+    fn recovery_form(outcome: &str, case_id: &str) -> RecoveryDecisionForm {
+        RecoveryDecisionForm {
+            outcome: outcome.into(),
+            case_id: case_id.into(),
+            reasoning: "verified the holder by phone".into(),
+        }
+    }
+
+    /// A grant against a case nobody has decided would race the case
+    /// itself; the panel refuses it with the reason, not the interface
+    /// later with a stranded claimant.
+    #[tokio::test]
+    async fn granting_recovery_requires_a_decided_case() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        state.store.put_case(&reviewable_case(None, "none")).unwrap();
+        let claim_id = open_claim(&state);
+
+        let result = recovery_claim_decide(
+            State(state.clone()),
+            Path(claim_id.clone()),
+            signed_in(&state),
+            Form(recovery_form("grant", "c1")),
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::CaseState(_))), "{result:?}");
+        assert_eq!(state.store.recovery_claim(&claim_id).unwrap().unwrap().state, "open");
+    }
+
+    #[tokio::test]
+    async fn a_recovery_grant_is_signed_recorded_and_single_decision() {
+        use ed25519_dalek::Verifier;
+
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        state.store.put_case(&reviewable_case(Some("reversed"), "reversed")).unwrap();
+        let claim_id = open_claim(&state);
+
+        recovery_claim_decide(
+            State(state.clone()),
+            Path(claim_id.clone()),
+            signed_in(&state),
+            Form(recovery_form("grant", "c1")),
+        )
+        .await
+        .unwrap();
+
+        let claim = state.store.recovery_claim(&claim_id).unwrap().unwrap();
+        assert_eq!(claim.state, "granted");
+        assert_eq!(claim.case_id.as_deref(), Some("c1"));
+
+        // The stored grant is what the claimant's device will present:
+        // it must verify against this authority's operator key over
+        // the canonical bytes, name the grantee and the case.
+        let raw = claim.grant_raw.expect("grant bytes stored");
+        let grant: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(grant["grantee"], "onym:key:new-holder");
+        assert_eq!(grant["caseId"], "c1");
+        assert_eq!(grant["authority"], state.config.manifest.component_id);
+        let signing_bytes = crate::canonical::grant_signing_bytes(&raw).unwrap();
+        let signature = ed25519_dalek::Signature::from_slice(
+            &util::base64_decode(grant["signature"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        state.signing_key.verifying_key().verify(&signing_bytes, &signature).unwrap();
+
+        // On the case ledger, so the audit log shows the authorization.
+        let events = state.store.recent_events(10).unwrap();
+        assert!(events.iter().any(|(case_id, _, kind, detail)| case_id == "c1"
+            && kind == "recovery_grant_issued"
+            && detail.contains(&claim_id)));
+
+        // A decided claim cannot be decided again.
+        let again = recovery_claim_decide(
+            State(state.clone()),
+            Path(claim_id),
+            signed_in(&state),
+            Form(recovery_form("refuse", "")),
+        )
+        .await;
+        assert!(matches!(again, Err(Error::CaseState(_))), "{again:?}");
+    }
+
+    #[tokio::test]
+    async fn refusing_a_recovery_claim_records_the_reasons() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        let claim_id = open_claim(&state);
+
+        recovery_claim_decide(
+            State(state.clone()),
+            Path(claim_id.clone()),
+            signed_in(&state),
+            Form(recovery_form("refuse", "")),
+        )
+        .await
+        .unwrap();
+
+        let claim = state.store.recovery_claim(&claim_id).unwrap().unwrap();
+        assert_eq!(claim.state, "refused");
+        assert_eq!(claim.reasoning.as_deref(), Some("verified the holder by phone"));
+        assert!(claim.grant_raw.is_none());
+    }
+
+    /// The decide endpoint is a signed-in surface like every other
+    /// panel action: no session, no decision — and the claim is left
+    /// exactly as it was.
+    #[tokio::test]
+    async fn recovery_decisions_require_a_session() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        state.store.put_case(&reviewable_case(Some("reversed"), "reversed")).unwrap();
+        let claim_id = open_claim(&state);
+
+        recovery_claim_decide(
+            State(state.clone()),
+            Path(claim_id.clone()),
+            HeaderMap::new(),
+            Form(recovery_form("grant", "c1")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.store.recovery_claim(&claim_id).unwrap().unwrap().state, "open");
+    }
 }
