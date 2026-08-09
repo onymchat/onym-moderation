@@ -1,6 +1,6 @@
 //! HTTP surface.
 //!
-//! Three endpoints serve the iOS client's `EnforcementBackendClient`
+//! Four endpoints serve the iOS client's `EnforcementBackendClient`
 //! seam; one receives verdicts from the designated authority; two are
 //! for operators and auditors.
 
@@ -39,6 +39,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/enroll", post(enroll))
         .route("/v1/mandates/countersign", post(countersign))
         .route("/v1/gate-check", post(gate_check))
+        .route("/v1/recover", post(recover))
         .route("/v1/verdicts", post(receive_verdict))
         .route("/v1/write-log", get(write_log))
         .with_state(state)
@@ -390,6 +391,37 @@ fn claim_session(state: &AppState, timestamp: &str, signature: &str) -> Result<(
         return Err(Error::SignatureInvalid("session signature already used".into()));
     }
     Ok(())
+}
+
+/// A holder's claim that this device's banned mark is governed by a
+/// case whose record has cleared — the path back for a device whose
+/// original identity did not survive a reinstall. The engine verifies
+/// the device against Apple and answers on the stored verdicts'
+/// authority; this handler only authenticates the session.
+async fn recover(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<RecoveryRequest>,
+) -> Result<Json<RecoveryResult>, Error> {
+    let token = decode_optional_token(request.device_token.as_deref())?;
+    let signed = payload::recovery(
+        token.as_deref(),
+        &request.user_key,
+        &request.case_id,
+        &request.timestamp,
+    );
+    verify_user_signature(&request.user_key, &signed, &request.signature)?;
+    claim_session(&state, &request.timestamp, &request.signature)?;
+
+    let result = state
+        .engine
+        .recover(
+            request.device_token.as_deref(),
+            &request.user_key,
+            &request.case_id,
+            OffsetDateTime::now_utc(),
+        )
+        .await?;
+    Ok(Json(result))
 }
 
 fn decode_optional_token(raw: Option<&str>) -> Result<Option<Vec<u8>>, Error> {

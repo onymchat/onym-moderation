@@ -16,7 +16,7 @@ use time::OffsetDateTime;
 use crate::devicecheck::{Bits, DeviceCheck};
 use crate::error::Error;
 use crate::store::{Store, StoredVerdict};
-use crate::types::{BanState, CheckRequiredReason, GateCheckResult, Verdict};
+use crate::types::{BanState, CheckRequiredReason, GateCheckResult, RecoveryResult, Verdict};
 use crate::util;
 
 pub struct Engine {
@@ -148,6 +148,111 @@ impl Engine {
         }
 
         Ok(GateCheckResult::clear())
+    }
+
+    /// Answer a recovery claim: this session's holder says the device's
+    /// banned mark is governed by `case_id`, whose record has since
+    /// cleared, and asks that the record follow the device so ordinary
+    /// reconciliation can act on it.
+    ///
+    /// Recovery moves no mark by itself. It re-binds the stored,
+    /// signed verdicts to the claiming identity's enrollment and then
+    /// answers a normal gate check, so the write that clears the bits
+    /// is still authorized by the reversal (or expiry) already on
+    /// file — rule 2 above holds. When the record still bans the
+    /// device, nothing moves and the holder is routed to the
+    /// authority's declared new-holder claim instead.
+    ///
+    /// The claim is challenge-bound (§6): it is answered only for a
+    /// device whose banned bit Apple confirms is set, presented in the
+    /// same signed session. Requiring the marked device is what keeps
+    /// the case reference from being an unbind-anything capability —
+    /// and each case anchors at most one recovery, ever, so a leaked
+    /// reference cannot strand the genuine holder more than once nor
+    /// serve a second device.
+    pub async fn recover(
+        &self,
+        device_token: Option<&str>,
+        user_key: &str,
+        case_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<RecoveryResult, Error> {
+        let Some(device_check) = self.device_check.as_ref() else {
+            return Err(Error::BadRequest(
+                "attestation is unavailable; recovery cannot verify the device".into(),
+            ));
+        };
+        let Some(device_token) = device_token else {
+            return Err(Error::BadRequest("recovery requires a device token".into()));
+        };
+        let Some(bits) = device_check.query(device_token).await? else {
+            return Err(Error::BadRequest("Apple did not validate this device token".into()));
+        };
+        if !bits.banned {
+            return Err(Error::BadRequest(
+                "this device carries no banned mark; there is nothing to recover".into(),
+            ));
+        }
+
+        // One refusal for a case that does not exist, names no device,
+        // or was already redeemed — a distinguishable answer would let
+        // anyone holding a marked device probe case references.
+        let Some(from_binding) = self.store.recoverable_binding_for_case(case_id)? else {
+            return Err(Error::BadRequest("no recoverable record for that case reference".into()));
+        };
+        let Some(to_binding) = self.store.device_binding_for_user(user_key)? else {
+            return Err(Error::BadRequest(
+                "this identity is not enrolled; enroll before claiming recovery".into(),
+            ));
+        };
+
+        // What the record intends for the device the case named. A
+        // live ban means the record and the mark agree, and recovery is
+        // not the instrument for disagreeing with them — the declared
+        // new-holder path is.
+        let intended = self.intended_marks(&from_binding, now)?;
+        if let Some(intended) = intended.as_ref() {
+            if intended.bits.banned {
+                let (authority_contact, new_holder_url, appeal_url) = intended
+                    .ban
+                    .as_ref()
+                    .map(|(verdict_ref, verdict)| {
+                        let state = self.ban_state(verdict_ref, verdict);
+                        (state.authority_contact, state.new_holder_url, state.appeal_url)
+                    })
+                    .unwrap_or_else(|| ("the authority named in the case notice".into(), None, None));
+                return Ok(RecoveryResult::MarkInForce {
+                    authority_contact,
+                    new_holder_url,
+                    appeal_url,
+                });
+            }
+        }
+
+        if from_binding != to_binding {
+            let stamp = util::format_timestamp(now);
+            let moved = self.store.adopt_binding(&from_binding, &to_binding, &stamp)?;
+            // The adoption itself goes in the write log: a binding move
+            // changes what the next write is authorized by, and an
+            // audit that cannot see the move cannot follow the chain of
+            // custody from the verdict to the bits it cleared.
+            self.store.append_write_log(
+                &to_binding,
+                intended
+                    .as_ref()
+                    .map(|i| i.authorized_by.as_str())
+                    .unwrap_or("reconciliation"),
+                bits.case_open,
+                bits.banned,
+                &format!("adopted {} case(s) from {from_binding} for recovery", moved.len()),
+                &stamp,
+            )?;
+        }
+
+        // An ordinary gate check now resolves the moved record and
+        // performs the clearing write on the verdicts' own authority.
+        let gate = self.gate_check(Some(device_token), user_key, now).await?;
+        Ok(RecoveryResult::Recovered { gate })
     }
 
     /// Fold this device's verdicts into the marks they currently
@@ -509,6 +614,9 @@ mod tests {
             execute_after: banned.then(|| "2026-08-08T00:00:00Z".into()),
             reasoning: "reasoning-ref".into(),
             appeal_deadline: banned.then(|| "2026-09-07T00:00:00Z".into()),
+            appeal_url: None,
+            new_holder_url: None,
+            authority_contact: None,
             decided_at: "2026-08-08T00:00:00Z".into(),
             signature: "signature".into(),
             is_final: !banned,

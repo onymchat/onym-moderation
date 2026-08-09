@@ -55,6 +55,42 @@ pub struct GateCheckRequest {
     pub signature: String,
 }
 
+/// A holder's claim that this device's marks are governed by a case
+/// whose record has since cleared — the reinstall/new-identity path.
+/// The case reference is the capability: it is disclosed only to the
+/// case's parties and the authority, and the signature binds it.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryRequest {
+    #[serde(default)]
+    pub device_token: Option<String>,
+    pub user_key: String,
+    pub case_id: String,
+    pub timestamp: String,
+    pub signature: String,
+}
+
+/// The answer to a recovery claim. `Recovered` carries the gate result
+/// the reconciliation produced, so the client needs no second round
+/// trip. `MarkInForce` deliberately carries only the routes the holder
+/// needs to challenge the mark — not the verdict or its reasoning,
+/// which belong to the case's parties, and a recovery claimant has
+/// proved possession of a marked device, not party status.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase", tag = "status")]
+pub enum RecoveryResult {
+    #[serde(rename = "recovered")]
+    Recovered { gate: GateCheckResult },
+    #[serde(rename = "markInForce")]
+    MarkInForce {
+        authority_contact: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        new_holder_url: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        appeal_url: Option<String>,
+    },
+}
+
 /// Just the signature: the client appends it to its own copy of the
 /// mandate, so this round-trip cannot alter a consented field.
 #[derive(Debug, Clone, Serialize)]

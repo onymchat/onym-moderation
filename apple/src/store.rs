@@ -178,6 +178,18 @@ impl Store {
             CREATE INDEX IF NOT EXISTS verdicts_by_device
                 ON verdicts (device_binding);
 
+            -- One recovery per case, ever. A recovery moves a device's
+            -- verdict record to the binding of the identity that
+            -- claimed it; recording the case here is what makes the
+            -- claim single-use, so a case reference cannot be redeemed
+            -- again to move the record a second time.
+            CREATE TABLE IF NOT EXISTS recoveries (
+                case_id      TEXT PRIMARY KEY,
+                from_binding TEXT NOT NULL,
+                to_binding   TEXT NOT NULL,
+                recovered_at TEXT NOT NULL
+            );
+
             -- Append-only. Nothing in the service updates or deletes a
             -- row here; `previous_hash` chains them so removal shows.
             CREATE TABLE IF NOT EXISTS write_log (
@@ -530,6 +542,80 @@ impl Store {
             params![verdict_ref],
         )?;
         Ok(())
+    }
+
+    // ─── Recovery ────────────────────────────────────────────────────
+
+    /// The device binding a case's verdict record is bound to, if the
+    /// case can still anchor a recovery. A case with no verdicts here
+    /// and a case already redeemed answer the same `None`: the caller
+    /// must not be able to tell which of the two it hit.
+    pub fn recoverable_binding_for_case(&self, case_id: &str) -> Result<Option<String>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let redeemed: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM recoveries WHERE case_id = ?1",
+                params![case_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if redeemed.is_some() {
+            return Ok(None);
+        }
+        let mut statement = conn
+            .prepare("SELECT DISTINCT device_binding FROM verdicts WHERE case_id = ?1")?;
+        let rows = statement.query_map(params![case_id], |row| row.get::<_, String>(0))?;
+        let mut bindings = Vec::new();
+        for row in rows {
+            bindings.push(row?);
+        }
+        match bindings.len() {
+            0 => Ok(None),
+            1 => Ok(bindings.pop()),
+            // Marks reach only the device a verdict names, so one case
+            // binding two devices is a store the fold cannot answer
+            // for — refuse rather than pick one.
+            _ => Err(Error::Internal(format!(
+                "case {case_id} names {} device bindings",
+                bindings.len()
+            ))),
+        }
+    }
+
+    /// Move the whole verdict record bound to `from` onto `to`,
+    /// recording every case moved so none of them can anchor a second
+    /// recovery. The record moves together deliberately: marks belong
+    /// to the device, and moving one case's verdicts alone would let a
+    /// live ban stay behind on a binding nothing resolves any more.
+    pub fn adopt_binding(&self, from: &str, to: &str, now: &str) -> Result<Vec<String>, Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Internal(format!("begin adoption: {e}")))?;
+        let cases = {
+            let mut statement =
+                tx.prepare("SELECT DISTINCT case_id FROM verdicts WHERE device_binding = ?1")?;
+            let rows = statement.query_map(params![from], |row| row.get::<_, String>(0))?;
+            let mut cases = Vec::new();
+            for row in rows {
+                cases.push(row?);
+            }
+            cases
+        };
+        for case_id in &cases {
+            tx.execute(
+                "INSERT INTO recoveries (case_id, from_binding, to_binding, recovered_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![case_id, from, to, now],
+            )?;
+        }
+        tx.execute(
+            "UPDATE verdicts SET device_binding = ?2 WHERE device_binding = ?1",
+            params![from, to],
+        )?;
+        tx.commit()
+            .map_err(|e| Error::Internal(format!("commit adoption: {e}")))?;
+        Ok(cases)
     }
 
     /// Every verdict for a device, newest **decided** first.
