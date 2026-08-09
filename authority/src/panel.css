@@ -85,6 +85,9 @@ table.queue tr:last-child td{border-bottom:0}
 table.queue td.id a{font-family:inherit}
 /* row cannot be decided yet: de-emphasised, not hidden */
 table.queue tr.held td{color:var(--mut)}
+table.queue td.at{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:var(--mut);white-space:nowrap}
+table.queue td.ev-name{font-weight:600;white-space:nowrap}
+table.queue td.detail{max-width:52ch;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
 .badge{display:inline-block;font-size:12px;font-weight:600;border-radius:6px;padding:2px 8px;white-space:nowrap}
 .badge.overdue{color:var(--overdue);background:var(--overdue-bg)}
 .badge.soon{color:var(--soon);background:var(--soon-bg)}

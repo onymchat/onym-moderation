@@ -38,6 +38,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin", get(index))
         .route("/admin/login", post(login))
         .route("/admin/logout", post(logout))
+        .route("/admin/audit", get(audit_log))
         .route("/admin/cases/:case_id", get(case_detail))
         .route("/admin/cases/:case_id/decide", post(initial_decision))
         .route("/admin/cases/:case_id/review", post(review))
@@ -106,6 +107,47 @@ async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resul
     }
     let cleared = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Secure; Path=/admin; Max-Age=0");
     Ok(([(header::SET_COOKIE, cleared)], Redirect::to("/admin")).into_response())
+}
+
+// ─── Audit log ──────────────────────────────────────────────────────
+
+async fn audit_log(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    if !authenticated(&state, &headers) {
+        return Ok(Html(login_page(false)).into_response());
+    }
+
+    let events = state.store.recent_events(200)?;
+    let mut body = chrome(&state, "audit");
+    body.push_str(
+        "<main class=wrap><h1>Audit log</h1><p class=sub>Recent activity recorded by the \
+         authority, newest first. Case links open the authenticated case file.</p>",
+    );
+    if events.is_empty() {
+        body.push_str("<div class=empty>No audit events recorded.</div>");
+    } else {
+        body.push_str(
+            "<table class=queue><thead><tr><th>At</th><th>Case</th><th>Event</th><th>Detail</th>\
+             </tr></thead><tbody>",
+        );
+        for (case_id, at, kind, detail) in events {
+            body.push_str(&format!(
+                "<tr><td class=at>{at}</td><td class=id><a href=\"/admin/cases/{id}\">{short}</a></td>\
+                 <td class=ev-name>{kind}</td><td class=detail>{detail}</td></tr>",
+                at = escape(&at),
+                id = escape(&case_id),
+                short = escape(case_id.get(..13).unwrap_or(&case_id)),
+                kind = escape(&kind),
+                detail = escape(&detail),
+            ));
+        }
+        body.push_str("</tbody></table>");
+    }
+    body.push_str("</main>");
+
+    Ok(Html(page("Audit log — moderation authority", &body)).into_response())
 }
 
 // ─── Queue ───────────────────────────────────────────────────────────
@@ -880,10 +922,12 @@ fn page(title: &str, body: &str) -> String {
 fn chrome(state: &AppState, here: &str) -> String {
     let authority = escape(&state.config.manifest.component_id);
     let queue_current = if here == "queue" { " aria-current=page" } else { "" };
+    let audit_current = if here == "audit" { " aria-current=page" } else { "" };
     format!(
         "<header class=top><div class=wrap>\
          <span class=brand>moderation authority <span>· {authority}</span></span>\
          <nav><a href=/admin{queue_current}>Queue</a>\
+         <a href=/admin/audit{audit_current}>Audit log</a>\
          <form method=post action=/admin/logout>\
          <button class=linkish type=submit>Sign out</button></form>\
          </nav></div></header>"

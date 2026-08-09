@@ -1349,6 +1349,30 @@ impl Store {
         Ok(out)
     }
 
+    /// The most recent entries in the immutable case-event ledger, across
+    /// all cases. The admin panel uses this as its operational audit log;
+    /// reporter identity and evidence remain in their case-specific stores.
+    pub fn recent_events(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(String, String, String, String)>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT case_id, at, kind, detail
+             FROM case_events
+             ORDER BY sequence DESC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// The disclosed content of every report joined to a case — what
     /// the classifier reads and what a reviewer is shown.
     pub fn evidence_for_case(&self, case_id: &str) -> Result<Vec<String>, Error> {
