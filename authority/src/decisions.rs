@@ -80,6 +80,34 @@ pub enum Claim {
     NewHolder,
 }
 
+/// Routes that must accompany a human-issued ban so the accused can
+/// actually challenge it from the device UI.
+#[derive(Debug, Clone)]
+pub struct AppealRoutes {
+    pub appeal_url: String,
+    pub new_holder_url: String,
+    pub authority_contact: String,
+}
+
+impl AppealRoutes {
+    fn validate(self) -> Result<Self, Error> {
+        for (name, value) in [
+            ("appealUrl", &self.appeal_url),
+            ("newHolderUrl", &self.new_holder_url),
+        ] {
+            if !value.trim_start().starts_with("https://") {
+                return Err(Error::BadRequest(format!(
+                    "{name} must be a non-empty https URL"
+                )));
+            }
+        }
+        if self.authority_contact.trim().is_empty() {
+            return Err(Error::BadRequest("authorityContact is required".into()));
+        }
+        Ok(self)
+    }
+}
+
 pub async fn apply(
     state: &std::sync::Arc<AppState>,
     case_id: &str,
@@ -89,6 +117,30 @@ pub async fn apply(
     now: OffsetDateTime,
 ) -> Result<Issued, Error> {
     apply_inner(state, case_id, disposition, reasoning, decider, now, Context::default()).await
+}
+
+/// Human decision path with the appeal routes that will be delivered with
+/// the ban verdict. A ban without these routes would be an actionable dead
+/// end for the person it blocks.
+pub async fn apply_with_appeal_routes(
+    state: &std::sync::Arc<AppState>,
+    case_id: &str,
+    disposition: Disposition,
+    reasoning: &str,
+    decider: Decider,
+    now: OffsetDateTime,
+    routes: Option<AppealRoutes>,
+) -> Result<Issued, Error> {
+    apply_inner(
+        state,
+        case_id,
+        disposition,
+        reasoning,
+        decider,
+        now,
+        Context { appeal_routes: routes, ..Context::default() },
+    )
+    .await
 }
 
 /// As `apply`, naming the claim the reviewer answered and the claim
@@ -157,11 +209,12 @@ pub async fn apply_at_revision(
 /// read at, and which claim the decider answered. Both are `None` for
 /// the plain path — a moderator deciding from the page in front of
 /// them, with nothing pending.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 struct Context {
     expect_revision: Option<i64>,
     expect_claim_revision: Option<i64>,
     reviewed: Option<Claim>,
+    appeal_routes: Option<AppealRoutes>,
 }
 
 async fn apply_inner(
@@ -173,7 +226,7 @@ async fn apply_inner(
     now: OffsetDateTime,
     context: Context,
 ) -> Result<Issued, Error> {
-    let Context { expect_revision, expect_claim_revision, reviewed } = context;
+    let Context { expect_revision, expect_claim_revision, reviewed, appeal_routes } = context;
     let mut case = state
         .store
         .case(case_id)?
@@ -211,6 +264,16 @@ async fn apply_inner(
             )?
         }
         Disposition::Ban => {
+            let routes = if matches!(decider, Decider::Human | Decider::HumanAssisted) {
+                Some(appeal_routes.ok_or_else(|| {
+                    Error::BadRequest(
+                        "appeal URL, new-holder URL, and authority contact are required for a human ban"
+                            .into(),
+                    )
+                })?.validate()?)
+            } else {
+                appeal_routes
+            };
             require_open(&case)?;
             // Deadline first: a case past it is already dismissed by
             // default, and saying "notice has not been delivered"
@@ -237,6 +300,7 @@ async fn apply_inner(
                 reasoning,
                 now,
                 &state.signing_key,
+                routes.as_ref(),
             )?
         }
         Disposition::Reverse => {

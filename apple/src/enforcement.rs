@@ -354,10 +354,12 @@ impl Engine {
     fn ban_state(&self, verdict_ref: &str, verdict: &Verdict) -> BanState {
         BanState {
             verdict_ref: verdict_ref.to_string(),
-            authority_contact: format!("{} (see the authority's published manifest)", verdict.authority),
+            authority_contact: verdict.authority_contact.clone().unwrap_or_else(|| {
+                format!("{} (see the authority's published manifest)", verdict.authority)
+            }),
             ban_expires: verdict.ban_expires.clone(),
-            appeal_url: None,
-            new_holder_url: None,
+            appeal_url: verdict.appeal_url.clone(),
+            new_holder_url: verdict.new_holder_url.clone(),
             verdict: Some(verdict.clone()),
         }
     }

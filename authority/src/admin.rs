@@ -392,8 +392,14 @@ fn initial_decision_form(case: &CaseRecord) -> String {
          <form method=post action=\"/admin/cases/{id}/decide\">\
          <label>Reasoning — a content address of your findings against the consented class definition.\
          <br><input name=reasoning size=70 placeholder=\"sha256:… or https://…\" required></label><br>\
-         <button name=outcome value=ban>Ban</button>\
-         <button name=outcome value=dismiss class=secondary>Dismiss</button></form>",
+         <label>Appeal URL — where the accused files an appeal.<br>\
+         <input class=addr name=appeal_url type=url placeholder=\"https://…\" required></label>\
+         <label>New-holder URL — where a new device holder clears the mark.<br>\
+         <input class=addr name=new_holder_url type=url placeholder=\"https://…\" required></label>\
+         <label>Authority contact — human-readable appeal contact.<br>\
+         <input class=addr name=authority_contact placeholder=\"appeals@example.org\" required></label>\
+         <div class=actions><button class=\"sign primary\" name=outcome value=ban>Ban</button>\
+         <button class=\"sign secondary\" name=outcome value=dismiss formnovalidate>Dismiss</button></div></form>",
         id = escape(&case.case_id),
     )
 }
@@ -402,6 +408,12 @@ fn initial_decision_form(case: &CaseRecord) -> String {
 struct InitialDecisionForm {
     outcome: String,
     reasoning: String,
+    #[serde(default)]
+    appeal_url: String,
+    #[serde(default)]
+    new_holder_url: String,
+    #[serde(default)]
+    authority_contact: String,
 }
 
 async fn initial_decision(
@@ -419,13 +431,24 @@ async fn initial_decision(
         return Err(Error::BadRequest("initial decisions may only ban or dismiss".into()));
     }
 
-    decisions::apply(
+    let routes = if disposition == Disposition::Ban {
+        Some(decisions::AppealRoutes {
+            appeal_url: form.appeal_url,
+            new_holder_url: form.new_holder_url,
+            authority_contact: form.authority_contact,
+        })
+    } else {
+        None
+    };
+
+    decisions::apply_with_appeal_routes(
         &state,
         &case_id,
         disposition,
         &form.reasoning,
         Decider::Human,
         state.now(),
+        routes,
     )
     .await?;
 

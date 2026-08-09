@@ -189,6 +189,12 @@ pub struct Verdict {
     pub reasoning: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub appeal_deadline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appeal_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_holder_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_contact: Option<String>,
     pub decided_at: String,
     pub signature: String,
     #[serde(rename = "final")]
