@@ -197,6 +197,77 @@ mod manifest_tests {
              sanction the interface must clear, so it is a promise rather than a term"
         );
     }
+
+    /// `published/` is a **serving root**, not a folder of sources.
+    /// Caddy maps it onto `authority.onym.app/policy/`, so every file
+    /// in it is a public URL whether or not the manifest links to it.
+    ///
+    /// That is how a `README.md` saying "these are drafts and need
+    /// sign-off before publication" came to be served at
+    /// `/policy/README` — on the host where people go to read the terms
+    /// before consenting. Nothing listed it and nothing linked it; it
+    /// was reachable by guessing, which is the kind of thing found by
+    /// the wrong person rather than by us.
+    ///
+    /// So the directory must hold exactly the documents the manifest
+    /// points at. Both directions are checked: an extra file is
+    /// something published that nobody agreed to read, and a missing
+    /// one is a term that 404s at the moment someone tries to read it.
+    #[test]
+    fn the_published_directory_is_exactly_what_the_manifest_links_to() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let raw = std::fs::read(root.join("manifest").join("manifest.json")).expect("manifest");
+        let manifest: serde_json::Value = serde_json::from_slice(&raw).expect("manifest parses");
+
+        // Every `/policy/<name>` the manifest mentions, anywhere in the
+        // document — walking the JSON rather than naming the fields, so
+        // a link added later cannot be forgotten here.
+        const PREFIX: &str = "/policy/";
+        let mut linked = std::collections::BTreeSet::new();
+        let mut stack = vec![&manifest];
+        while let Some(value) = stack.pop() {
+            match value {
+                serde_json::Value::String(text) => {
+                    if let Some(at) = text.find(PREFIX) {
+                        let tail = &text[at + PREFIX.len()..];
+                        let name =
+                            tail.split(['#', '?']).next().unwrap_or("").trim_end_matches('/');
+                        if !name.is_empty() {
+                            linked.insert(name.to_string());
+                        }
+                    }
+                }
+                serde_json::Value::Array(items) => stack.extend(items.iter()),
+                serde_json::Value::Object(fields) => stack.extend(fields.values()),
+                _ => {}
+            }
+        }
+        assert!(!linked.is_empty(), "the manifest links to no policy documents at all");
+
+        let present: std::collections::BTreeSet<String> =
+            std::fs::read_dir(root.join("published"))
+                .expect("published/")
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".md"))
+                .map(|name| name.trim_end_matches(".md").to_string())
+                .collect();
+
+        let unpublishable: Vec<&String> = present.difference(&linked).collect();
+        assert!(
+            unpublishable.is_empty(),
+            "published/ holds {unpublishable:?}, which the manifest does not link to. That \
+             directory is served at /policy/, so anything in it is public. Notes about the \
+             documents belong in authority/PUBLISHING.md, outside the serving root."
+        );
+
+        let missing: Vec<&String> = linked.difference(&present).collect();
+        assert!(
+            missing.is_empty(),
+            "the manifest links to {missing:?}, which published/ does not hold; those terms 404 \
+             at the moment someone tries to read them before consenting"
+        );
+    }
 }
 
 // ─── Mandate (§5.3) ──────────────────────────────────────────────────
