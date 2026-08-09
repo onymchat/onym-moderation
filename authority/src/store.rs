@@ -1478,6 +1478,25 @@ impl Store {
         Ok(out)
     }
 
+    /// Cases that can be named by a recovery grant when the moderator did
+    /// not enter a case id. A grant still names one case internally; this
+    /// lookup deliberately refuses to guess when several records exist.
+    pub fn decided_cases_for_recovery(&self) -> Result<Vec<CaseRecord>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {} FROM cases
+             WHERE stage = 'decided' AND disposition IS NOT NULL
+             ORDER BY opened_at DESC, case_id",
+            Self::CASE_COLUMNS
+        ))?;
+        let rows = statement.query_map([], Self::case_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Open cases still waiting for a first-instance decision, soonest
     /// deadline first.
     ///
