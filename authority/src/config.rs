@@ -83,6 +83,11 @@ pub struct Config {
     /// Bearer token for the moderator web panel. The panel shows
     /// disclosed evidence, so an unset token closes it.
     pub admin_token: Option<String>,
+
+    /// Development-only escape hatch for exercising the ban UI without
+    /// waiting for a production-length response window. Off by default;
+    /// this must never be enabled on a public authority.
+    pub allow_early_ban_for_qa: bool,
 }
 
 /// How much authority a classifier has over a case.
@@ -301,6 +306,9 @@ impl Config {
                 .unwrap_or(300),
             triage: TriageConfig::from_env()?,
             admin_token: env::var("AUTHORITY_ADMIN_TOKEN").ok().filter(|v| !v.is_empty()),
+            allow_early_ban_for_qa: env::var("AUTHORITY_QA_ALLOW_EARLY_BAN")
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false),
         })
     }
 

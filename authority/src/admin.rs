@@ -39,6 +39,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/login", post(login))
         .route("/admin/logout", post(logout))
         .route("/admin/cases/:case_id", get(case_detail))
+        .route("/admin/cases/:case_id/decide", post(initial_decision))
         .route("/admin/cases/:case_id/review", post(review))
         .with_state(state)
 }
@@ -371,10 +372,64 @@ async fn case_detail(
     }
     body.push_str("</table>");
 
+    body.push_str(&initial_decision_form(&case));
     body.push_str(&review_form(&case));
     body.push_str("<p><a href=/admin>← queue</a></p></main>");
 
     Ok(Html(page(&format!("Case {} — moderation authority", case.case_id), &body)).into_response())
+}
+
+fn initial_decision_form(case: &CaseRecord) -> String {
+    if case.disposition.is_some() {
+        return String::new();
+    }
+
+    format!(
+        "<h2>Human decision</h2>\
+         <p class=sub>This is the initial case decision. Choose a disposition after reading the\
+         disclosed evidence. A ban is still subject to notice, response-window, and decision-deadline\
+         safeguards.</p>\
+         <form method=post action=\"/admin/cases/{id}/decide\">\
+         <label>Reasoning — a content address of your findings against the consented class definition.\
+         <br><input name=reasoning size=70 placeholder=\"sha256:… or https://…\" required></label><br>\
+         <button name=outcome value=ban>Ban</button>\
+         <button name=outcome value=dismiss class=secondary>Dismiss</button></form>",
+        id = escape(&case.case_id),
+    )
+}
+
+#[derive(Deserialize)]
+struct InitialDecisionForm {
+    outcome: String,
+    reasoning: String,
+}
+
+async fn initial_decision(
+    State(state): State<Arc<AppState>>,
+    Path(case_id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<InitialDecisionForm>,
+) -> Result<Response, Error> {
+    if !authenticated(&state, &headers) {
+        return Ok(Html(login_page(false)).into_response());
+    }
+
+    let disposition = Disposition::parse(&form.outcome)?;
+    if !matches!(disposition, Disposition::Ban | Disposition::Dismiss) {
+        return Err(Error::BadRequest("initial decisions may only ban or dismiss".into()));
+    }
+
+    decisions::apply(
+        &state,
+        &case_id,
+        disposition,
+        &form.reasoning,
+        Decider::Human,
+        state.now(),
+    )
+    .await?;
+
+    Ok(Redirect::to(&format!("/admin/cases/{case_id}")).into_response())
 }
 
 fn assessment_section(state: &AppState, case_id: &str) -> String {
