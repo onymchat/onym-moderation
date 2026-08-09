@@ -432,6 +432,10 @@ impl Config {
                                (generate: openssl rand -hex 32). Keep it separate from
                                operational secrets, and never rotate it while bans run —
                                verdicts already issued would stop verifying.
+                               The manifest's `operator` must name this key's public
+                               half. To print it without starting the service:
+                                 AUTHORITY_SIGNING_SEED=… onym-moderation-authority \
+                                     derive-operator-key
 
 Delivering verdicts to the interface:
   AUTHORITY_INTERFACE_URL      Base URL of the enforcement backend (e.g.

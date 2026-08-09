@@ -20,8 +20,22 @@ mandate:
    half of `AUTHORITY_SIGNING_SEED`. The service **refuses to start**
    when they disagree — verdicts signed by a key the manifest does not
    name are unverifiable, and a warning would produce an authority that
-   looks fine and issues nothing anyone can check. The value is in the
-   `authority starting` log line as `signing_key`.
+   looks fine and issues nothing anyone can check.
+
+   ```bash
+   # Generate the seed once, into your secret store. It signs every
+   # verdict, so rotating it later invalidates all of them.
+   openssl rand -hex 32
+
+   # Then derive the public half, without standing the service up:
+   AUTHORITY_SIGNING_SEED=<seed> onym-moderation-authority derive-operator-key
+   # → onym:key:…   ← this goes in `operator`
+   ```
+
+   Only the public key leaves that command; the seed stays where you
+   put it. The same value also appears as `signing_key` in the
+   `authority starting` log line, but by then you have had to boot
+   against a manifest that could not yet be right.
 
 2. **Publish every document it links to.** Every URL here is a term a
    user consents to before they can be reported or judged. A link that
