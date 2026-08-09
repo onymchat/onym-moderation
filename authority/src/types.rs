@@ -145,6 +145,58 @@ mod manifest_tests {
         let error = manifest.validate_class_terms().unwrap_err();
         assert!(error.contains("appealEffect"), "{error}");
     }
+
+    /// The manifest this deployment actually publishes, loaded the way
+    /// the service loads it.
+    ///
+    /// It is a file mounted into the container, so nothing else in the
+    /// build would notice it going malformed — and the failure would
+    /// be a service that refuses to start, discovered at deploy time.
+    /// Absence is a failure too: a test that cannot find what it checks
+    /// has not checked anything.
+    #[test]
+    fn the_published_manifest_loads_and_conforms() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("manifest")
+            .join("manifest.json");
+        let raw = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let manifest: AuthorityManifest = serde_json::from_slice(&raw)
+            .unwrap_or_else(|e| panic!("{} is not a valid authority manifest: {e}", path.display()));
+
+        manifest.validate_class_terms().expect("published class terms must validate");
+
+        // Every class must be one the canonical rules cover. An
+        // unmapped class is not an error in general — an authority may
+        // publish its own — but this manifest deliberately tracks the
+        // reference policy, and a class with no rule behind it is one a
+        // human reviewer has nothing exact to apply on appeal.
+        for class in &manifest.violation_classes {
+            assert!(
+                crate::policy::rule_for_class(&class.class_id).is_some(),
+                "class {:?} has no canonical rule; either add one or say so in the published \
+                 documents, because an appeal is decided against the rule",
+                class.class_id
+            );
+        }
+
+        // A permanent ban is valid only while an independent appellate
+        // can hear an appeal against it (reference policy §6, §8). The
+        // two fields therefore travel together: publishing `permanent`
+        // without `appellate` promises a sanction the interface is
+        // required to clear.
+        let permanent: Vec<&str> = manifest
+            .violation_classes
+            .iter()
+            .filter(|class| class.ban_term == "permanent")
+            .map(|class| class.class_id.as_str())
+            .collect();
+        assert!(
+            permanent.is_empty() || manifest.appellate.is_some(),
+            "classes {permanent:?} carry a permanent ban with no `appellate` declared; that is a \
+             sanction the interface must clear, so it is a promise rather than a term"
+        );
+    }
 }
 
 // ─── Mandate (§5.3) ──────────────────────────────────────────────────

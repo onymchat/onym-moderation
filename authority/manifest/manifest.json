@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "componentId": "onym:component:onym-authority",
+  "seat": "moderation",
+  "operator": "onym:key:0000000000000000000000000000000000000000000000000000000000000000",
+  "moderationProfileId": "onym:moderation-profile:consent-bound-v1",
+  "violationClasses": [
+    {
+      "classId": "csam",
+      "definition": "https://authority.onym.app/policy/classes#csam",
+      "responseWindow": "P3D",
+      "decisionDeadline": "P7D",
+      "banTerm": "P365D",
+      "appealWindow": "P30D",
+      "appealEffect": "non-suspensive",
+      "lawfulReporting": "https://authority.onym.app/policy/lawful-reporting"
+    },
+    {
+      "classId": "credible-violence",
+      "definition": "https://authority.onym.app/policy/classes#credible-violence",
+      "responseWindow": "P7D",
+      "decisionDeadline": "P14D",
+      "banTerm": "P365D",
+      "appealWindow": "P30D",
+      "appealEffect": "non-suspensive"
+    },
+    {
+      "classId": "unsolicited-pornography",
+      "definition": "https://authority.onym.app/policy/classes#unsolicited-pornography",
+      "responseWindow": "P7D",
+      "decisionDeadline": "P14D",
+      "banTerm": "P90D",
+      "appealWindow": "P30D",
+      "appealEffect": "suspensive"
+    }
+  ],
+  "evidenceRules": "https://authority.onym.app/policy/evidence-rules",
+  "reputationPolicy": "https://authority.onym.app/policy/reputation",
+  "newHolderAppeal": "https://authority.onym.app/policy/new-holder",
+  "confidentiality": "https://authority.onym.app/policy/confidentiality",
+  "statistics": "https://authority.onym.app/policy/transparency",
+  "validUntil": "2027-08-31T23:59:59Z"
+}
