@@ -582,33 +582,43 @@ impl Store {
         for row in rows {
             bindings.push(row?);
         }
-        if bindings.len() > 1 {
-            // A recovered case legitimately names two bindings for a
-            // while: its verdicts moved to the new one, and a later
-            // verdict the authority still signs for the old binding
-            // re-lands there (the mandate did not move). That is
-            // expected, not corruption — drop any binding a recovery
-            // has since superseded, and see whether one governing
-            // binding remains.
-            let mut superseded = conn.prepare(
-                "SELECT 1 FROM recoveries WHERE from_binding = ?1 LIMIT 1",
-            )?;
-            bindings.retain(|binding| {
-                !superseded
-                    .exists(params![binding])
-                    .unwrap_or(false)
-            });
-        }
         match bindings.len() {
             0 => Ok(None),
             1 => Ok(bindings.pop()),
+            // A case never splits across bindings: existing verdicts
+            // move together on recovery, and later verdicts are routed
+            // to the recovered binding at ingest (`binding_for_ingest`),
+            // so more than one is a genuine inconsistency.
             n => {
-                // More than one *live* binding after dropping recovered
-                // ones is a genuine inconsistency worth an alarm.
-                tracing::error!(%case_id, bindings = n, "case names more than one live device binding");
+                tracing::error!(%case_id, bindings = n, "case names more than one device binding");
                 Ok(None)
             }
         }
+    }
+
+    /// The binding an incoming verdict for `case_id` should be stored
+    /// under. Normally the mandate's own binding, but if the case has
+    /// been recovered onto a new enrollment, its verdicts live there
+    /// now — so a later verdict (a re-ban, a re-reversal) must follow,
+    /// or it would land on the abandoned binding and never reach the
+    /// device. Returns the most recent recovery target for the case, if
+    /// any; the caller falls back to the mandate binding.
+    ///
+    /// The signature/binding *check* at ingest still runs against the
+    /// mandate binding (the authority signs the original binding and
+    /// does not learn of the move); only where the verdict is *stored*
+    /// follows the record.
+    pub fn binding_for_ingest(&self, case_id: &str) -> Result<Option<String>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let recovered: Option<String> = conn
+            .query_row(
+                "SELECT to_binding FROM recoveries WHERE case_id = ?1
+                 ORDER BY recovered_at DESC, rowid DESC LIMIT 1",
+                params![case_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(recovered)
     }
 
     /// Move the stored verdicts bound to `from` onto `to`, and redeem
@@ -670,6 +680,24 @@ impl Store {
             "UPDATE verdicts SET device_binding = ?2 WHERE device_binding = ?1 AND case_id = ?3",
             params![from, to, case_id],
         )?;
+
+        // Record the move on the tamper-evident, /v1/write-log-exposed
+        // chain, in the same transaction so it is atomic with the move
+        // and cannot be dropped without breaking the chain. It writes
+        // no device bit — `case_open` and `banned` are both false — so
+        // it does not pollute the log's bits-only meaning; it is the
+        // one auditable trace of the record having moved, and it names
+        // the grant that authorized it.
+        Self::append_write_log_conn(
+            &tx,
+            to,
+            &format!("recovery-move:{grant_ref}"),
+            false,
+            false,
+            &format!("record for case {case_id} moved from {from}; no device bits written"),
+            now,
+        )?;
+
         tx.commit()
             .map_err(|e| Error::Internal(format!("commit adoption: {e}")))?;
         Ok(true)
@@ -753,6 +781,22 @@ impl Store {
         now: &str,
     ) -> Result<WriteLogEntry, Error> {
         let conn = self.conn.lock().unwrap();
+        Self::append_write_log_conn(&conn, device_binding, authorized_by, case_open, banned, outcome, now)
+    }
+
+    /// The chaining append, over any `Connection` — the locked handle
+    /// for `append_write_log`, or an open transaction so a caller can
+    /// fold a log row into the same atomic unit as the change it
+    /// records (recovery does this for the move).
+    fn append_write_log_conn(
+        conn: &rusqlite::Connection,
+        device_binding: &str,
+        authorized_by: &str,
+        case_open: bool,
+        banned: bool,
+        outcome: &str,
+        now: &str,
+    ) -> Result<WriteLogEntry, Error> {
         let previous_hash: String = conn
             .query_row(
                 "SELECT entry_hash FROM write_log ORDER BY sequence DESC LIMIT 1",

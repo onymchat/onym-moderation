@@ -289,6 +289,16 @@ async fn receive_verdict(
     })?;
 
     let now = util::format_timestamp(OffsetDateTime::now_utc());
+    // Where the verdict is *stored* follows the record: if this case
+    // was recovered onto a new enrollment, its verdicts live there now,
+    // and a later one must fold into the recovered device rather than
+    // the abandoned binding. The signature/binding check above still
+    // ran against the mandate's (original) binding — only storage moves.
+    let storage_binding = state
+        .engine
+        .store
+        .binding_for_ingest(&parsed.case_id)?
+        .unwrap_or_else(|| mandate.device_binding.clone());
     state.engine.store.put_verdict(
         &StoredVerdict {
             verdict_ref: verdict_ref.clone(),
@@ -299,7 +309,7 @@ async fn receive_verdict(
             // moment this request happened to arrive.
             decided_at: parsed.decided_at.clone(),
             mandate_ref: parsed.mandate_ref.clone(),
-            device_binding: mandate.device_binding.clone(),
+            device_binding: storage_binding,
             raw: verdict_bytes.clone(),
             disposition: match parsed.disposition {
                 Disposition::OpenCase => "open-case".into(),
@@ -695,6 +705,26 @@ mod tests {
         let request = recover_request(&user, grant_raw, "a-different-grant-ref", &now);
         let result = recover(State(Arc::clone(&state)), Json(request)).await;
         assert!(matches!(&result, Err(Error::SignatureInvalid(_))), "{result:?}");
+    }
+
+    #[test]
+    fn recovery_result_serializes_camelcase_fields() {
+        // The client decodes camelCase; a struct-variant field must not
+        // slip out snake_case. `rename_all_fields` is what guarantees it.
+        let value = serde_json::to_value(RecoveryResult::MarkInForce {
+            authority_contact: "appeals@a.org".into(),
+            new_holder_url: Some("https://a.org/nh".into()),
+            appeal_url: None,
+        })
+        .unwrap();
+        assert_eq!(value["status"], "markInForce");
+        assert_eq!(value["authorityContact"], "appeals@a.org");
+        assert_eq!(value["newHolderUrl"], "https://a.org/nh");
+        assert!(value.get("authority_contact").is_none());
+
+        let unsettled =
+            serde_json::to_value(RecoveryResult::CaseUnsettled { note: "n".into() }).unwrap();
+        assert_eq!(unsettled["status"], "caseUnsettled");
     }
 
     #[tokio::test]

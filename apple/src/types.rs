@@ -108,13 +108,15 @@ pub struct RecoveryGrant {
 /// which belong to the case's parties, and a recovery claimant has
 /// proved possession of a marked device, not party status.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase", tag = "status")]
+// `rename_all` renames the *variants* (the `status` tag values);
+// `rename_all_fields` is what renames the struct-variant *fields* —
+// without it `MarkInForce`'s fields would serialize snake_case, unlike
+// every other response the client decodes.
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "status")]
 pub enum RecoveryResult {
-    #[serde(rename = "recovered")]
     Recovered { gate: GateCheckResult },
     /// A ban still stands on one of the bindings — the grant's case, or
     /// the grantee's own. Carries that ban's routes.
-    #[serde(rename = "markInForce")]
     MarkInForce {
         authority_contact: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,7 +129,6 @@ pub enum RecoveryResult {
     /// be decided before the device can be recovered. A distinct answer
     /// so the client never labels an open case as a ban, nor shows the
     /// empty appeal/new-holder routes a ban would carry.
-    #[serde(rename = "caseUnsettled")]
     CaseUnsettled { note: String },
 }
 

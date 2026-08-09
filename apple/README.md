@@ -91,12 +91,24 @@ expiry), redemption re-binds *that case's* verdicts to the grantee's
 enrollment and ordinary reconciliation performs the clear — carried by
 the reversal verdict already on file, not by the grant. The move is
 scoped to the grant's named case, so the server's effect matches
-exactly what the moderator signed for; other terminal cases on the
-binding stay put. Recovery refuses outright — no move, grant
-unconsumed — if the source still carries *any* unresolved case (an
-open case, whose notice must never reach a non-party, or a ban not yet
-reversed or expired, **queued bans included**), or if the grantee's
-own binding carries a ban. Only a fully cleared record recovers.
+exactly what the moderator signed for; unrelated cases on the binding
+are neither moved nor consulted. Recovery refuses — no move, grant
+unconsumed — if **the grant's own case** is not terminal: still open
+(answered as `caseUnsettled`, not a mislabelled ban), or a ban not yet
+reversed or expired (**queued bans included** — the folded bit would
+miss a suspensive window). It also refuses if the grantee's own
+binding carries a ban, since the clearing write would otherwise clear
+a device their own record still bans. An unrelated case on the source
+— the previous holder's, which the claimant can neither see nor
+resolve — does **not** block, and its ban's contact is never disclosed.
+
+**The move is auditable.** The record move is appended to the
+hash-chained `write_log` (served at `/v1/write-log`) in the same
+transaction as the move itself — `case-open` and `banned` both false,
+so it never pollutes the log's bits-only meaning, `authorized_by =
+recovery-move:<grantRef>`. It is the one tamper-evident trace that a
+record changed hands, and the moderator's *authorization* of it is on
+the authority's own `recovery_grant_issued` case event.
 
 **The honest residual.** Because the presented token is not linked to
 the case, a grantee holding a valid grant for a cleared case can, by
@@ -118,9 +130,14 @@ physically holds.
 `deviceBinding` inside every verdict — always the original binding,
 since it does not know a device changed hands — and ingest refuses a
 verdict whose signed binding disagrees with its mandate row. Rewriting
-the mandate would make the case's *next* signed verdict fail ingest,
-so it stays; a later verdict that re-lands on the old binding is
-resolved through the `recoveries` table rather than read as a split.
+the mandate would make the case's *next* signed verdict fail that
+check outright, so the mandate stays put. Instead, ingest **routes**
+each incoming verdict for a recovered case to the recovered binding
+(`binding_for_ingest`, keyed on the `recoveries` table): the
+signature/binding check still runs against the mandate's original
+binding, but the verdict is *stored* where the record now lives, so a
+later re-ban or re-reversal folds into the recovered device rather than
+stranding on the abandoned binding.
 
 **What this endpoint does not do.** §6's *new-holder claim* over a
 device that is **still marked** is not served here: recovery refuses
