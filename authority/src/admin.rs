@@ -235,11 +235,12 @@ async fn recovery_claim_detail(
              authorizes one thing: moving the named case's verdict record to the grantee's \
              enrollment. The interface refuses it while any record still bans the device, so \
              a ban that should stand must be left standing (or reversed through the case \
-             itself) — not worked around here. Leave Case blank when this claim has only one \
-             decided case available; the authority will fill it in safely.</p>\
+             itself) — not worked around here. Leave Case blank to issue a separate, signed \
+             moderator unban for a freshly reinstalled device.</p>\
              <form method=post action=\"/admin/recovery/{id}/decide\">\
-             <label>Case (optional) — the case whose record marks this device.<br>\
-             <input class=addr name=case_id placeholder=\"Leave blank to resolve automatically\"></label>\
+             <label>Case (optional) — the case whose record marks this device. Leave blank for \
+             a case-free unban.<br>\
+             <input class=addr name=case_id placeholder=\"Blank = issue unban grant\"></label>\
              <label>Reasoning — how the holder's account was verified, or why it was not.<br>\
              <input name=reasoning size=70 required></label>\
              <div class=actions><button class=\"sign primary\" name=outcome value=grant>Issue grant</button>\
@@ -300,22 +301,30 @@ async fn recovery_claim_decide(
     match form.outcome.as_str() {
         "grant" => {
             let entered_case_id = form.case_id.trim();
-            let case = if entered_case_id.is_empty() {
-                let candidates = state.store.decided_cases_for_recovery()?;
-                match candidates.as_slice() {
-                    [case] => case.clone(),
-                    [] => return Err(Error::BadRequest(
-                        "no decided case is available; enter the case number".into(),
-                    )),
-                    _ => return Err(Error::BadRequest(
-                        "more than one decided case is available; enter the case number so the grant is not applied to the wrong record".into(),
-                    )),
+            if entered_case_id.is_empty() {
+                let issued = crate::recovery::issue_unban_grant(
+                    &claim_id,
+                    &claim.grantee,
+                    &state.config.manifest.component_id,
+                    now,
+                    &state.signing_key,
+                )?;
+                if !state.store.grant_recovery_claim(
+                    &claim_id,
+                    None,
+                    reasoning,
+                    &issued.raw,
+                    &issued.grant_ref,
+                    &stamp,
+                )? {
+                    return Err(Error::CaseState("the claim is no longer open".into()));
                 }
-            } else {
-                state.store.case(entered_case_id)?.ok_or_else(|| {
-                    Error::BadRequest(format!("no case {entered_case_id:?}"))
-                })?
-            };
+                tracing::info!(%claim_id, grant_ref = %issued.grant_ref, "case-free unban grant issued");
+                return Ok(Redirect::to(&format!("/admin/recovery/{claim_id}")).into_response());
+            }
+            let case = state.store.case(entered_case_id)?.ok_or_else(|| {
+                Error::BadRequest(format!("no case {entered_case_id:?}"))
+            })?;
             // A grant against an undecided case would race the case
             // itself; and the interface will refuse a record that
             // still bans, so granting one here only strands the
@@ -334,7 +343,7 @@ async fn recovery_claim_decide(
             )?;
             if !state.store.grant_recovery_claim(
                 &claim_id,
-                &case.case_id,
+                Some(&case.case_id),
                 reasoning,
                 &issued.raw,
                 &issued.grant_ref,
@@ -1974,7 +1983,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_grant_resolves_the_only_decided_case_when_case_is_blank() {
+    async fn recovery_grant_without_case_issues_a_case_free_unban() {
         let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
         state.store.put_case(&reviewable_case(Some("reversed"), "reversed")).unwrap();
         let claim_id = open_claim(&state);
@@ -1990,7 +1999,10 @@ mod tests {
 
         let claim = state.store.recovery_claim(&claim_id).unwrap().unwrap();
         assert_eq!(claim.state, "granted");
-        assert_eq!(claim.case_id.as_deref(), Some("c1"));
+        assert_eq!(claim.case_id, None);
+        let grant: serde_json::Value = serde_json::from_slice(&claim.grant_raw.unwrap()).unwrap();
+        assert_eq!(grant["grantType"], crate::recovery::UNBAN_GRANT_DOMAIN);
+        assert_eq!(grant["claimId"], claim_id);
     }
 
     /// The decide endpoint is a signed-in surface like every other

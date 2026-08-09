@@ -25,6 +25,11 @@ use crate::util;
 /// key over the same canonical form — from ever being presented as one
 /// another.
 pub const GRANT_DOMAIN: &str = "onym-recovery-grant-v1";
+/// A moderator-approved unban for a freshly reinstalled device. Unlike a
+/// case-bound recovery grant, this intentionally carries no case id: the
+/// fresh DeviceCheck token cannot be linked to the old binding after a
+/// reinstall.
+pub const UNBAN_GRANT_DOMAIN: &str = "onym-unban-grant-v1";
 
 /// The signed grant, exactly as the device presents it for redemption.
 #[derive(Serialize)]
@@ -46,6 +51,52 @@ pub struct IssuedGrant {
     /// The signed grant, serialized — the exact bytes the claimant's
     /// device will present to the interface.
     pub raw: Vec<u8>,
+}
+
+fn sign_unban_grant(
+    claim_id: &str,
+    grantee: &str,
+    authority: &str,
+    now: OffsetDateTime,
+    key: &SigningKey,
+) -> Result<IssuedGrant, Error> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct UnbanGrant<'a> {
+        grant_type: &'a str,
+        grant_version: u32,
+        claim_id: &'a str,
+        grantee: &'a str,
+        authority: &'a str,
+        issued_at: String,
+        signature: String,
+    }
+    let mut grant = UnbanGrant {
+        grant_type: UNBAN_GRANT_DOMAIN,
+        grant_version: 1,
+        claim_id,
+        grantee,
+        authority,
+        issued_at: util::format_timestamp(now),
+        signature: String::new(),
+    };
+    let unsigned = serde_json::to_vec(&grant)
+        .map_err(|e| Error::Internal(format!("encode unban grant: {e}")))?;
+    let signing_bytes = canonical::grant_signing_bytes(&unsigned)?;
+    grant.signature = util::base64_encode(&key.sign(&signing_bytes).to_bytes());
+    let raw = serde_json::to_vec(&grant)
+        .map_err(|e| Error::Internal(format!("encode unban grant: {e}")))?;
+    Ok(IssuedGrant { grant_ref: util::sha256_hex(&signing_bytes), raw })
+}
+
+pub fn issue_unban_grant(
+    claim_id: &str,
+    grantee: &str,
+    authority: &str,
+    now: OffsetDateTime,
+    key: &SigningKey,
+) -> Result<IssuedGrant, Error> {
+    sign_unban_grant(claim_id, grantee, authority, now, key)
 }
 
 /// Sign a grant with the operator key — the key the case's verdicts
@@ -97,5 +148,19 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&issued.raw).unwrap();
         assert_eq!(value["grantType"], "onym-recovery-grant-v1");
         assert_eq!(value["grantType"], GRANT_DOMAIN);
+    }
+
+    #[test]
+    fn issued_unban_grants_carry_no_case_id() {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let now = OffsetDateTime::from_unix_timestamp(1_765_000_000).unwrap();
+        let issued = issue_unban_grant(
+            "claim-1", "onym:key:g", "onym:component:a", now, &key,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&issued.raw).unwrap();
+        assert_eq!(value["grantType"], UNBAN_GRANT_DOMAIN);
+        assert_eq!(value["claimId"], "claim-1");
+        assert!(value.get("caseId").is_none());
     }
 }

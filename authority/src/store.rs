@@ -1478,25 +1478,6 @@ impl Store {
         Ok(out)
     }
 
-    /// Cases that can be named by a recovery grant when the moderator did
-    /// not enter a case id. A grant still names one case internally; this
-    /// lookup deliberately refuses to guess when several records exist.
-    pub fn decided_cases_for_recovery(&self) -> Result<Vec<CaseRecord>, Error> {
-        let conn = self.conn.lock().unwrap();
-        let mut statement = conn.prepare(&format!(
-            "SELECT {} FROM cases
-             WHERE stage = 'decided' AND disposition IS NOT NULL
-             ORDER BY opened_at DESC, case_id",
-            Self::CASE_COLUMNS
-        ))?;
-        let rows = statement.query_map([], Self::case_from_row)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    }
-
     /// Open cases still waiting for a first-instance decision, soonest
     /// deadline first.
     ///
@@ -1577,7 +1558,7 @@ impl Store {
     pub fn grant_recovery_claim(
         &self,
         claim_id: &str,
-        case_id: &str,
+        case_id: Option<&str>,
         reasoning: &str,
         grant_raw: &[u8],
         grant_ref: &str,
@@ -1594,15 +1575,17 @@ impl Store {
         if updated == 0 {
             return Ok(false);
         }
-        tx.execute(
-            "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                case_id,
-                decided_at,
-                "recovery_grant_issued",
-                format!("claim {claim_id}, grant {grant_ref}")
-            ],
-        )?;
+        if let Some(case_id) = case_id {
+            tx.execute(
+                "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    case_id,
+                    decided_at,
+                    "recovery_grant_issued",
+                    format!("claim {claim_id}, grant {grant_ref}")
+                ],
+            )?;
+        }
         tx.commit()?;
         Ok(true)
     }
