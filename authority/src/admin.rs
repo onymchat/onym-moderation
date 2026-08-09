@@ -111,14 +111,40 @@ async fn index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result
     }
 
     let appeals = state.store.cases_awaiting_appeal_review()?;
+    let undecided = state.store.cases_awaiting_decision()?;
     let recent = state.store.recent_cases(50)?;
+    let now = state.now();
 
+    // What the queues are depends on whether a classifier is running,
+    // and saying the wrong one is not cosmetic. With triage off a
+    // moderator decides every case in the first instance, and this page
+    // used to tell them the opposite while showing their whole workload
+    // as an undifferentiated "recent cases" list.
+    let automated = matches!(
+        state.config.triage.as_ref().map(|t| t.mode),
+        Some(crate::config::TriageMode::Autonomous)
+    );
     let mut body = String::new();
     body.push_str(&format!(
-        "<h1>{}</h1><p class=sub>Appeals are the queue. Triage decides in the first instance; \
-         you read the file when someone says it got it wrong.</p>",
-        escape(&state.config.manifest.component_id)
+        "<h1>{}</h1><p class=sub>{}</p>",
+        escape(&state.config.manifest.component_id),
+        if automated {
+            "Triage decides in the first instance; you read the file when someone says it got it \
+             wrong. Appeals are your queue — but open cases are listed below them, because a \
+             classifier that reaches no decision leaves the case for you."
+        } else {
+            "No classifier is running, so you decide every case. Both queues below are yours, \
+             and the first one has a clock: a case nobody decides is dismissed by default at its \
+             decision deadline."
+        }
     ));
+
+    body.push_str(&format!("<h2>Awaiting decision ({})</h2>", undecided.len()));
+    if undecided.is_empty() {
+        body.push_str("<p class=empty>Nothing open.</p>");
+    } else {
+        body.push_str(&decision_table(&undecided, now));
+    }
 
     body.push_str(&format!("<h2>Appeals awaiting review ({})</h2>", appeals.len()));
     if appeals.is_empty() {
@@ -134,6 +160,76 @@ async fn index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result
     );
 
     Ok(Html(page("Moderation queue", &body)).into_response())
+}
+
+/// The work queue, with the clock showing.
+///
+/// A separate table from `case_table` because it answers a different
+/// question. That one says what happened to a case; this one says how
+/// long you have, whether the accused's window has closed yet — a ban
+/// before it has is refused, so a case that is not yet answerable is
+/// worth distinguishing from one that is — and whether anyone has
+/// replied.
+fn decision_table(cases: &[CaseRecord], now: OffsetDateTime) -> String {
+    let mut out = String::from(
+        "<table><tr><th>Case</th><th>Class</th><th>Time left</th><th>Decision deadline</th>\
+         <th>Response window</th><th>Responded</th></tr>",
+    );
+    for case in cases {
+        let (remaining, urgency) = match util::parse_timestamp(&case.decision_deadline) {
+            Ok(deadline) => (time_between(now, deadline), urgency_class(now, deadline)),
+            // A deadline that will not parse is a corrupt case rather
+            // than an urgent one, and saying "overdue" would send a
+            // moderator to decide something the guards will refuse.
+            Err(_) => ("unreadable".to_string(), "error"),
+        };
+        let window_closed = util::parse_timestamp(&case.response_deadline)
+            .map(|deadline| now >= deadline)
+            .unwrap_or(false);
+        out.push_str(&format!(
+            "<tr><td><a href=\"/admin/cases/{id}\">{short}</a></td><td>{class}</td>\
+             <td class={urgency}>{remaining}</td><td>{deadline}</td><td>{window}</td>\
+             <td>{responded}</td></tr>",
+            id = escape(&case.case_id),
+            short = escape(case.case_id.get(..13).unwrap_or(&case.case_id)),
+            class = escape(&case.class_id),
+            urgency = urgency,
+            remaining = escape(&remaining),
+            deadline = escape(&case.decision_deadline),
+            window = if window_closed { "closed" } else { "still running — a ban is refused" },
+            responded = if case.responded { "yes" } else { "no" },
+        ));
+    }
+    out.push_str("</table>");
+    out
+}
+
+/// Whole days and hours, rounded down. Precision beyond that would
+/// suggest the deadline is a race, and it is not — it is a date the
+/// case ends on.
+fn time_between(now: OffsetDateTime, deadline: OffsetDateTime) -> String {
+    if now >= deadline {
+        return "overdue".to_string();
+    }
+    let left = deadline - now;
+    let days = left.whole_days();
+    let hours = left.whole_hours() - days * 24;
+    match (days, hours) {
+        (0, 0) => "under an hour".to_string(),
+        (0, h) => format!("{h}h"),
+        (d, 0) => format!("{d}d"),
+        (d, h) => format!("{d}d {h}h"),
+    }
+}
+
+fn urgency_class(now: OffsetDateTime, deadline: OffsetDateTime) -> &'static str {
+    if now >= deadline {
+        "error"
+    } else if deadline - now < time::Duration::days(2) {
+        "urgent"
+    } else {
+        ""
+    }
 }
 
 fn case_table(cases: &[CaseRecord]) -> String {
@@ -663,6 +759,7 @@ h2 { font-size: 1.1rem; margin-top: 2rem; }
 .sub { opacity: .7; }
 .empty { opacity: .6; font-style: italic; }
 .error { color: #c0392b; font-weight: 600; }
+.urgent { color: #b9770e; font-weight: 600; }
 .mono, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
 table { border-collapse: collapse; width: 100%; margin: .5rem 0; }
 th, td { text-align: left; padding: .4rem .5rem; border-bottom: 1px solid rgba(128,128,128,.3); }
@@ -1232,5 +1329,96 @@ mod tests {
         let case = state.store.case("c1").unwrap().unwrap();
         assert_eq!(case.appeal_state, "upheld");
         assert_eq!(case.disposition.as_deref(), Some("ban"), "the first review stands");
+    }
+
+    // ─── The decision queue ──────────────────────────────────────────
+
+    fn open_case_due(case_id: &str, decision_deadline: &str, response_deadline: &str) -> CaseRecord {
+        let mut case = reviewable_case(None, "none");
+        case.case_id = case_id.into();
+        // One open case per accused per class is enforced by a unique
+        // index, so distinct people — which is also what a queue of
+        // several open cases means in the first place.
+        case.accused = format!("onym:key:{case_id}");
+        case.stage = "open".into();
+        case.decision_deadline = decision_deadline.into();
+        case.response_deadline = response_deadline.into();
+        case
+    }
+
+    /// The ordering *is* the feature. A moderator working without a
+    /// classifier has a queue with a clock on it, and "recent cases"
+    /// sorted by when they opened puts the case about to expire
+    /// wherever it happens to fall.
+    #[test]
+    fn the_decision_queue_puts_the_soonest_deadline_first() {
+        let store = Store::in_memory().unwrap();
+        // Deliberately inserted newest-deadline-first, and opened in
+        // the opposite order to their deadlines, so neither insertion
+        // order nor `opened_at` could produce the right answer.
+        for (id, deadline) in [
+            ("c-late", "2026-08-30T00:00:00Z"),
+            ("c-soon", "2026-08-11T00:00:00Z"),
+            ("c-middle", "2026-08-20T00:00:00Z"),
+        ] {
+            store.put_case(&open_case_due(id, deadline, "2026-08-04T00:00:00Z")).unwrap();
+        }
+        // A decided case is not work, however old it is.
+        let mut decided = open_case_due("c-done", "2026-08-09T00:00:00Z", "2026-08-04T00:00:00Z");
+        decided.stage = "decided".into();
+        decided.disposition = Some("dismiss".into());
+        store.put_case(&decided).unwrap();
+
+        let queue: Vec<String> =
+            store.cases_awaiting_decision().unwrap().into_iter().map(|c| c.case_id).collect();
+        assert_eq!(queue, vec!["c-soon", "c-middle", "c-late"]);
+    }
+
+    /// Without a classifier the page has to say so. It used to tell a
+    /// moderator that "triage decides in the first instance" while
+    /// showing them every case they were personally responsible for as
+    /// undifferentiated background.
+    #[tokio::test]
+    async fn the_queue_is_rendered_with_the_time_remaining() {
+        let state = Arc::new(AppState::for_tests(Store::in_memory().unwrap()));
+        // The fixture clock is 2026-08-10.
+        state.store.put_case(&open_case_due("c-soon", "2026-08-11T06:00:00Z", "2026-08-04T00:00:00Z")).unwrap();
+        state.store.put_case(&open_case_due("c-late", "2026-08-30T00:00:00Z", "2026-08-20T00:00:00Z")).unwrap();
+
+        let response = index(State(state.clone()), signed_in(&state)).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let page = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(page.contains("Awaiting decision (2)"), "the queue is named and counted");
+        assert!(page.contains("1d 6h"), "time remaining is shown: {page}");
+        assert!(page.contains("class=urgent"), "a deadline inside two days is marked");
+        assert!(
+            page.contains("you decide every case"),
+            "with no classifier the page must not claim triage decides first"
+        );
+        // A case whose response window is still running cannot be
+        // banned yet, and saying so stops a moderator opening it,
+        // reading the file and being refused.
+        assert!(page.contains("still running — a ban is refused"), "{page}");
+        assert!(page.contains("closed"));
+    }
+
+    #[test]
+    fn time_remaining_reads_as_a_date_rather_than_a_race() {
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+        let at = |s: &str| util::parse_timestamp(s).unwrap();
+
+        assert_eq!(time_between(now, at("2026-08-13T00:00:00Z")), "3d");
+        assert_eq!(time_between(now, at("2026-08-13T05:00:00Z")), "3d 5h");
+        assert_eq!(time_between(now, at("2026-08-10T05:00:00Z")), "5h");
+        assert_eq!(time_between(now, at("2026-08-10T00:30:00Z")), "under an hour");
+        assert_eq!(time_between(now, at("2026-08-09T00:00:00Z")), "overdue");
+        // Exactly at the deadline is past it: the case is dismissed by
+        // default at that instant, not a moment after.
+        assert_eq!(time_between(now, now), "overdue");
+
+        assert_eq!(urgency_class(now, at("2026-08-30T00:00:00Z")), "");
+        assert_eq!(urgency_class(now, at("2026-08-11T00:00:00Z")), "urgent");
+        assert_eq!(urgency_class(now, at("2026-08-01T00:00:00Z")), "error");
     }
 }
