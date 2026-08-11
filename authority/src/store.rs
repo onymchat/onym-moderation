@@ -1774,7 +1774,12 @@ impl Store {
     /// outlives it). The hold is still required to exist: a referral
     /// reference for material never under preservation would be a
     /// record of something this authority did not do.
-    pub fn record_referral_reference(&self, case_id: &str, reference: &str) -> Result<(), Error> {
+    pub fn record_referral_reference(
+        &self,
+        case_id: &str,
+        reference: &str,
+        recorded_at: &str,
+    ) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
         let class_id: Option<String> = conn
             .query_row(
@@ -1797,9 +1802,7 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4) \
              ON CONFLICT(case_id) DO UPDATE SET \
                referral_ref = excluded.referral_ref, recorded_at = excluded.recorded_at",
-            params![case_id, class_id, reference, crate::util::format_timestamp(
-                time::OffsetDateTime::now_utc()
-            )],
+            params![case_id, class_id, reference, recorded_at],
         )?;
         Ok(())
     }
@@ -2357,24 +2360,33 @@ impl Store {
              WHERE c.stage = 'decided' \
                AND c.appeal_state != 'pending' \
                AND c.new_holder_state != 'pending' \
-               AND NOT EXISTS ( \
-                     SELECT 1 FROM preservation_holds h \
-                     WHERE h.subject_kind = 'case' AND h.subject_id = c.case_id \
-                       AND h.release_after > ?1)",
+             ",
         )?;
-        let rows = statement.query_map(params![now], |row| {
+        let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
             ))
         })?;
-        let mut out = Vec::new();
+        let mut candidates = Vec::new();
         for row in rows {
             let (case_id, decision_deadline, appeal_deadline) = row?;
             let anchor = appeal_deadline
                 .filter(|appeal| appeal.as_str() > decision_deadline.as_str())
                 .unwrap_or(decision_deadline);
+            candidates.push((case_id, anchor));
+        }
+        // Through `preserved`, not an inline join. The join carried only
+        // the date half of the predicate, so this list disagreed with
+        // `is_preserved` for an overdue unreferred case — harmless only
+        // because the delete re-checks, and directly against the "one
+        // gate to remember" this design rests on.
+        let mut out = Vec::new();
+        for (case_id, anchor) in candidates {
+            if Self::preserved(&conn, "case", &case_id, now)? {
+                continue;
+            }
             out.push((case_id, anchor));
         }
         Ok(out)
@@ -3495,7 +3507,7 @@ mod tests {
                 release_after: "2026-08-10T00:00:00Z".into(),
             })
             .unwrap();
-        store.record_referral_reference("c1", "NCMEC-12345").unwrap();
+        store.record_referral_reference("c1", "NCMEC-12345", "2026-08-10T00:00:00Z").unwrap();
 
         store.drop_hold("case", "c1").unwrap();
 
@@ -3512,7 +3524,7 @@ mod tests {
     #[test]
     fn a_referral_reference_needs_a_hold_to_record_against() {
         let store = Store::in_memory().unwrap();
-        assert!(store.record_referral_reference("c1", "NCMEC-12345").is_err());
+        assert!(store.record_referral_reference("c1", "NCMEC-12345", "2026-08-10T00:00:00Z").is_err());
         assert!(store.referral_reference("c1").unwrap().is_none());
     }
 

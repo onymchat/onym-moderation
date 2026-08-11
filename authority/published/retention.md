@@ -34,7 +34,14 @@ there is nothing left that needs it. The record of what the picture was
 the picture.
 
 **The sanction record outlives everything, and is never dropped while a
-mark is live.** A device's marks are two bits with no explanation
+mark is live.** It is also required to outlive the case record and the
+audit trail, and this authority refuses to start on a schedule that says
+otherwise: the mandate kept with a sanction is what the periods above are
+resolved from, so a shorter sanction tail would delete the terms under
+which the rest of the record was still due to go, and the record would
+then be kept indefinitely against the period on this page.
+
+A device's marks are two bits with no explanation
 attached. The verdict is the only thing that says what they mean and the
 only basis on which one can be lifted. Deleting it while a mark is in
 force would leave someone marked with no way to show why or to have it

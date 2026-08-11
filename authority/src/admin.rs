@@ -919,7 +919,7 @@ async fn record_referral(
         return Err(Error::BadRequest("a referral reference is required".into()));
     }
     let now = OffsetDateTime::now_utc();
-    state.store.record_referral_reference(&case_id, reference)?;
+    state.store.record_referral_reference(&case_id, reference, &util::format_timestamp(now))?;
     state.store.record_event(
         &case_id,
         &util::format_timestamp(now),

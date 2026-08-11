@@ -127,15 +127,24 @@ pub fn build(
     // existence alone would authorize an export during that window —
     // shipping originals out under a duty that had already ended.
     // `is_preserved` is the gate that answers the actual question.
-    let hold = store
-        .preservation_hold("case", case_id)?
-        .filter(|hold| hold.release_after.as_str() > util::format_timestamp(now).as_str())
-        .ok_or_else(|| {
-            Error::CaseState(format!(
-                "case {case_id} carries no live preservation hold; there is no published duty to \
-                 refer it under"
-            ))
-        })?;
+    // `is_preserved`, not a date compare — because those answer different
+    // questions and the difference is the whole point of the rule.
+    //
+    // A hold whose period has passed with no referral recorded is still
+    // live: the material is kept, the case stays queued, and the sweep
+    // warns every tick. Gating export on the date alone made the package
+    // unbuildable in exactly that state — so the operator could not
+    // produce the referral for the one case the hold-until-referred rule
+    // exists to protect, and nothing could ever take it off the queue.
+    if !store.is_preserved("case", case_id, &util::format_timestamp(now))? {
+        return Err(Error::CaseState(format!(
+            "case {case_id} carries no live preservation hold; there is no published duty to \
+             refer it under"
+        )));
+    }
+    let hold = store.preservation_hold("case", case_id)?.ok_or_else(|| {
+        Error::Internal(format!("case {case_id} is preserved but has no hold row"))
+    })?;
 
     let document = crate::casedoc::build(store, &case)?;
 
@@ -270,6 +279,42 @@ mod tests {
         verifying
             .verify(&signing_bytes, &Signature::from_bytes(&signature))
             .expect("a receiving body must be able to check provenance");
+    }
+
+    /// The state the hold-until-referred rule creates must still be
+    /// exportable.
+    ///
+    /// Past its date with nothing recorded, the hold stays live, the case
+    /// stays queued and the panel keeps offering the download — so gating
+    /// export on the date alone made the package unbuildable for exactly
+    /// the case the rule protects, with no way to ever take it off the
+    /// queue.
+    #[test]
+    fn an_overdue_unreferred_case_can_still_be_referred() {
+        let (store, accepted) = case_with_media();
+        // Well past the hold's release date, and no reference recorded.
+        let now = util::parse_timestamp("2030-01-01T00:00:00Z").unwrap();
+
+        let package =
+            build(&store, "c1", "onym:component:test-authority", &seeded_key(), now).unwrap();
+
+        assert_eq!(package.manifest.images.len(), 1);
+        assert_eq!(package.manifest.images[0].sha256, accepted.sha256);
+    }
+
+    /// And once the referral is recorded and the period has passed, the
+    /// hold is gone and there is nothing left to export.
+    #[test]
+    fn a_discharged_and_expired_duty_cannot_be_referred_again() {
+        let (store, _) = case_with_media();
+        store.record_referral_reference("c1", "REF-1", "2026-08-03T00:00:00Z").unwrap();
+        store.drop_hold("case", "c1").unwrap();
+        let now = util::parse_timestamp("2030-01-01T00:00:00Z").unwrap();
+
+        let error =
+            build(&store, "c1", "onym:component:test-authority", &seeded_key(), now).unwrap_err();
+
+        assert_eq!(error.code(), "case_state");
     }
 
     #[test]

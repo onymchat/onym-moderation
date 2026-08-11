@@ -209,6 +209,35 @@ impl AuthorityManifest {
                 .map_err(|error| format!("retention.{field} is invalid: {error}"))?;
         }
 
+        // The sanction record must outlive the case record and its audit
+        // trail.
+        //
+        // Not an aesthetic ordering: deleting the sanction record may
+        // drop the mandate row, and the mandate is how a case's consented
+        // schedule is resolved. A shorter sanction tail therefore removes
+        // the terms under which the record was still due to be deleted,
+        // and the record is then kept indefinitely against the very
+        // period this manifest publishes — announced by nothing louder
+        // than a warning. Rejecting the ordering at boot is cheaper than
+        // discovering it 400 days in.
+        let sanction = crate::util::parse_days(&retention.sanction_record)
+            .map_err(|error| format!("retention.sanctionRecord is invalid: {error}"))?;
+        for (field, value) in
+            [("caseRecord", &retention.case_record), ("auditRecord", &retention.audit_record)]
+        {
+            let other = crate::util::parse_days(value)
+                .map_err(|error| format!("retention.{field} is invalid: {error}"))?;
+            if sanction < other {
+                return Err(format!(
+                    "retention.sanctionRecord ({}) is shorter than retention.{field} ({}); the \
+                     sanction record carries the mandate a case's schedule is resolved from, so a \
+                     shorter tail would strand that case's record past the period this manifest \
+                     publishes",
+                    retention.sanction_record, value
+                ));
+            }
+        }
+
         for (class_id, terms) in &retention.preservation {
             if self.violation_class(class_id).is_none() {
                 return Err(format!(
@@ -369,6 +398,30 @@ mod manifest_tests {
 
         let error = manifest.validate_class_terms().unwrap_err();
         assert!(error.contains("no referral"), "{error}");
+    }
+
+    /// A sanction tail shorter than the case-record tail must not boot.
+    ///
+    /// The sanction record carries the mandate a case's schedule is
+    /// resolved from, so a shorter tail deletes the terms under which the
+    /// record was still due to go — leaving the content kept indefinitely
+    /// against the very period the manifest publishes.
+    #[test]
+    fn a_sanction_tail_shorter_than_the_record_tail_is_refused() {
+        let mut manifest = manifest();
+        manifest.retention = Some(RetentionSchedule {
+            policy: "https://authority.test/policy/retention".into(),
+            unreferenced_upload: "P1D".into(),
+            case_media: "P30D".into(),
+            case_record: "P400D".into(),
+            audit_record: "P400D".into(),
+            sanction_record: "P30D".into(),
+            preservation: Default::default(),
+        });
+
+        let error = manifest.validate_class_terms().unwrap_err();
+        assert!(error.contains("sanctionRecord"), "{error}");
+        assert!(error.contains("strand"), "{error}");
     }
 
     #[test]

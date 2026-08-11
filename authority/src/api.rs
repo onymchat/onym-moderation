@@ -2709,7 +2709,7 @@ mod tests {
             harness.post("/v1/reports", signed(report, "signature", &[REPORTER_SEED])).await;
         let case_id = response["caseId"].as_str().unwrap().to_string();
 
-        harness.state.store.record_referral_reference(&case_id, "REF-12345").unwrap();
+        harness.state.store.record_referral_reference(&case_id, "REF-12345", "2026-08-10T00:00:00Z").unwrap();
 
         assert!(harness.state.store.cases_awaiting_referral().unwrap().is_empty());
         assert_eq!(

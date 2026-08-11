@@ -288,6 +288,19 @@ pub fn retention_sweep(state: &AppState, now: OffsetDateTime) -> Result<usize, E
         {
             continue;
         }
+        // The record and its audit trail go first, while the mandate that
+        // resolves this case's schedule is still here to be read.
+        //
+        // `validate_retention` rejects a manifest whose sanction tail is
+        // shorter than these, so by the time a case reaches here both are
+        // provably due. Doing them in this order as well means a mandate
+        // that disappears for some other reason cannot strand the record:
+        // the alternative is a case whose terms can no longer be resolved
+        // and whose content is therefore kept forever, which is the
+        // failure the published schedule exists to rule out.
+        removed += state.store.delete_case_record(&case_id)?;
+        removed += state.store.delete_case_events(&case_id)?;
+
         let gone = state.store.delete_sanction_record(&case_id, &stamp)?;
         if gone > 0 {
             tracing::info!(%case_id, rows = gone, "deleted sanction record; no mark it justifies remains");
@@ -490,13 +503,133 @@ mod tests {
                 release_after: "2026-09-01T00:00:00Z".into(),
             })
             .unwrap();
-        store.record_referral_reference(&case.case_id, "REF-1").unwrap();
+        store.record_referral_reference(&case.case_id, "REF-1", "2026-08-10T00:00:00Z").unwrap();
         let state = crate::state::AppState::for_tests(store);
 
         retention_sweep(&state, util::parse_timestamp("2026-09-02T00:00:00Z").unwrap()).unwrap();
 
         assert!(state.store.preservation_hold("case", &case.case_id).unwrap().is_none());
         assert!(state.store.evidence_blob(&digest).unwrap().is_none());
+    }
+
+    /// The record and audit sweep, driven through `retention_sweep`
+    /// rather than by calling the store directly.
+    ///
+    /// The direct-call test could not see the interaction that mattered:
+    /// the sweep has to resolve each case's schedule from its mandate,
+    /// and the sanction loop may delete that mandate.
+    #[tokio::test]
+    async fn the_record_and_audit_sweep_runs_end_to_end() {
+        let store = Store::in_memory().unwrap();
+        let mut case = case_due("2026-08-05T00:00:00Z");
+        case.stage = "decided".into();
+        case.disposition = Some("dismiss".into());
+        store.put_case(&case).unwrap();
+        seed_mandate(&store, &case);
+        let report = serde_json::json!({
+            "reportVersion": 1, "reportId": "r1", "reporter": "onym:key:rep",
+            "reporterMandate": "m0", "accused": "onym:key:acc", "classId": "csam",
+            "evidence": [{"disclosedContent": "the material", "authenticityProof": "sig"}],
+            "filedAt": "2026-08-02T00:00:00Z",
+        });
+        store
+            .put_report("r1", "onym:key:rep", "onym:key:acc", "csam", Some("c1"), 1.0,
+                        &serde_json::to_vec(&report).unwrap(), "2026-08-02T00:00:00Z")
+            .unwrap();
+        store.record_event("c1", "2026-08-02T00:00:00Z", "case_opened", "").unwrap();
+        let state = crate::state::AppState::for_tests(store);
+
+        // Inside the consented 400-day tail: nothing goes.
+        retention_sweep(&state, util::parse_timestamp("2026-09-01T00:00:00Z").unwrap()).unwrap();
+        assert!(!state.store.evidence_for_case("c1").unwrap().is_empty());
+        assert!(!state.store.events("c1").unwrap().is_empty());
+
+        // Past it: content and audit trail go, through the sweep.
+        retention_sweep(&state, util::parse_timestamp("2027-10-01T00:00:00Z").unwrap()).unwrap();
+        assert!(state.store.evidence_for_case("c1").unwrap().is_empty());
+        assert!(state.store.events("c1").unwrap().is_empty());
+    }
+
+    /// A case must not survive its own schedule because the mandate that
+    /// resolves it was deleted first.
+    ///
+    /// `validate_retention` rejects the ordering that causes it, and the
+    /// sanction loop deletes the record before the mandate as well — so
+    /// even a mandate lost some other way cannot strand the content.
+    #[tokio::test]
+    async fn a_swept_sanction_record_does_not_strand_the_case_record() {
+        let store = Store::in_memory().unwrap();
+        let mut case = case_due("2026-08-05T00:00:00Z");
+        case.stage = "decided".into();
+        case.disposition = Some("dismiss".into());
+        store.put_case(&case).unwrap();
+        seed_mandate(&store, &case);
+        let report = serde_json::json!({
+            "reportVersion": 1, "reportId": "r1", "reporter": "onym:key:rep",
+            "reporterMandate": "m0", "accused": "onym:key:acc", "classId": "csam",
+            "evidence": [{"disclosedContent": "the material", "authenticityProof": "sig"}],
+            "filedAt": "2026-08-02T00:00:00Z",
+        });
+        store
+            .put_report("r1", "onym:key:rep", "onym:key:acc", "csam", Some("c1"), 1.0,
+                        &serde_json::to_vec(&report).unwrap(), "2026-08-02T00:00:00Z")
+            .unwrap();
+        // The sanction sweep works off verdicts, so the case needs the one
+        // that ended it.
+        store
+            .put_verdict_for_tests(
+                "c1",
+                "v-dismiss",
+                "dismiss",
+                br#"{"disposition":"dismiss"}"#,
+                "2026-08-05T00:00:00Z",
+            )
+            .unwrap();
+        let state = crate::state::AppState::for_tests(store);
+
+        // Far past every tail, so the sanction loop runs in the same tick.
+        retention_sweep(&state, util::parse_timestamp("2030-01-01T00:00:00Z").unwrap()).unwrap();
+
+        assert!(state.store.mandate("m1").unwrap().is_none(), "the mandate goes");
+        assert!(
+            state.store.evidence_for_case("c1").unwrap().is_empty(),
+            "and the content it resolved the terms for went with it, not after it"
+        );
+    }
+
+    /// The media eligibility list must agree with the single gate for an
+    /// overdue, unreferred case — the state the inline join could not see.
+    #[tokio::test]
+    async fn media_eligibility_agrees_with_the_hold_gate_when_a_referral_is_outstanding() {
+        let store = Store::in_memory().unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+        let mut case = case_due("2026-08-05T00:00:00Z");
+        case.stage = "decided".into();
+        case.disposition = Some("dismiss".into());
+        store.put_case(&case).unwrap();
+        seed_mandate(&store, &case);
+        store.attach_evidence_blobs(&case.case_id, &[digest.clone()]).unwrap();
+        store
+            .place_preservation_hold(&crate::store::PreservationHold {
+                subject_kind: "case".into(),
+                subject_id: case.case_id.clone(),
+                class_id: "csam".into(),
+                reason: "preservation".into(),
+                placed_at: "2026-08-01T00:00:00Z".into(),
+                // Deliberately a date in the past, unlike the 2099 used
+                // elsewhere: a future date cannot tell the two halves of
+                // the predicate apart.
+                release_after: "2026-09-01T00:00:00Z".into(),
+            })
+            .unwrap();
+
+        let now = "2027-01-01T00:00:00Z";
+        assert!(store.is_preserved("case", &case.case_id, now).unwrap());
+        let eligible = store.cases_eligible_for_media_retention(now).unwrap();
+        assert!(
+            !eligible.iter().any(|(id, _)| id == &case.case_id),
+            "the list must not offer a case the gate still preserves"
+        );
     }
 
     /// Retention takes the content and leaves the identity, so an
