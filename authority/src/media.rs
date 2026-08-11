@@ -407,3 +407,84 @@ mod tests {
         !crc
     }
 }
+
+
+/// The cross-implementation vector for the version 2 commitment.
+///
+/// The signer is Swift and the verifier is this crate. They agree on
+/// these bytes by construction — two encoders, two languages, one
+/// format that was never written down as a schema — so nothing else in
+/// either repository would notice them drifting apart. A shared vector
+/// is the only thing that turns that into a test failure instead of
+/// "every photo report is suddenly unauthenticated in production".
+///
+/// An identical copy lives in `onym-ios`. Changing one without the
+/// other must break both sides.
+#[cfg(test)]
+mod cross_implementation_fixture {
+    use super::*;
+    use ed25519_dalek::{Signature, VerifyingKey};
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Fixture {
+        preimage: String,
+        signer_public_key_hex: String,
+        signature_base64: String,
+    }
+
+    fn fixture() -> Fixture {
+        let raw = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/media-commitment-v2.json"
+        ))
+        .expect("the shared fixture must exist; deleting it removes the only drift detector");
+        serde_json::from_slice(&raw).expect("fixture is valid JSON")
+    }
+
+    /// The signature in the fixture verifies over the preimage bytes
+    /// exactly as `file_report` checks a real one — over the disclosed
+    /// string verbatim, with no reconstruction or re-encoding.
+    #[test]
+    fn the_fixture_signature_verifies_over_the_preimage_verbatim() {
+        use base64::Engine;
+        let fixture = fixture();
+        let key_bytes: [u8; 32] = hex::decode(&fixture.signer_public_key_hex)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let key = VerifyingKey::from_bytes(&key_bytes).unwrap();
+        let signature_bytes: [u8; 64] = base64::engine::general_purpose::STANDARD
+            .decode(&fixture.signature_base64)
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        key.verify_strict(fixture.preimage.as_bytes(), &Signature::from_bytes(&signature_bytes))
+            .expect("the vector's signature must verify over its exact preimage bytes");
+    }
+
+    /// And this crate reads the commitment the Swift signer produced.
+    #[test]
+    fn the_fixture_preimage_parses_as_a_media_commitment() {
+        let fixture = fixture();
+        let Disclosed::Media(items) = parse_disclosed(&fixture.preimage).unwrap() else {
+            panic!("the shared vector must be read as media evidence");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].mime_type, "image/jpeg");
+        assert_eq!(items[0].plaintext_byte_length, 421_337);
+        assert_eq!(items[0].width, Some(1200));
+        assert_eq!(items[0].height, Some(1600));
+        assert_eq!(items[0].plaintext_sha256, "1a".repeat(32));
+    }
+
+    /// The escaped slash is not cosmetic. The Swift encoder does not set
+    /// `withoutEscapingSlashes`, so a MIME type arrives as
+    /// `image\/jpeg` — and since the signature covers these bytes
+    /// verbatim, "tidying" it on either side invalidates every proof.
+    #[test]
+    fn the_media_type_slash_is_escaped_in_the_signed_bytes() {
+        assert!(fixture().preimage.contains(r"image\/jpeg"));
+    }
+}

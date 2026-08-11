@@ -1987,7 +1987,7 @@ mod tests {
             signed(photo_report_json(&mandate, "r-1", &content), "signature", &[REPORTER_SEED]);
 
         let (status, response) = harness.post("/v1/reports", body).await;
-        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(status, StatusCode::FAILED_DEPENDENCY);
         assert_eq!(response["error"], "media_missing");
     }
 
@@ -2010,7 +2010,7 @@ mod tests {
             signed(photo_report_json(&mandate, "r-1", &content), "signature", &[REPORTER_SEED]);
 
         let (status, response) = harness.post("/v1/reports", body).await;
-        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(status, StatusCode::FAILED_DEPENDENCY);
         assert_eq!(response["error"], "media_missing");
     }
 

@@ -130,9 +130,13 @@ impl Error {
                 StatusCode::FORBIDDEN
             }
             // The report is well-formed and the proof is fine; the
-            // bytes it names simply are not here yet. Retryable after
-            // an upload, which 422 would not suggest.
-            Error::MediaMissing(_) => StatusCode::CONFLICT,
+            // bytes it names simply are not here yet. Deliberately not
+            // 409: clients already read a conflict on this route as
+            // "these exact bytes are already on file", which is a
+            // terminal, benign state — the opposite of this one, which
+            // is fixed by uploading and re-filing. 424 says the request
+            // depended on something that did not happen.
+            Error::MediaMissing(_) => StatusCode::FAILED_DEPENDENCY,
             Error::MediaUnsupported(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Error::MediaTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Error::MediaClassRefused(_) => StatusCode::FORBIDDEN,
