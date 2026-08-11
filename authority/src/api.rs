@@ -103,86 +103,115 @@ fn verify_media_evidence(
     evidence: &[EvidenceItem],
     already_on_case: usize,
 ) -> Result<Vec<String>, Error> {
-    let mut digests = Vec::new();
+    // Three passes, in this order, and the order is the point.
+    //
+    // Everything here is attacker-chosen: the commitment is written by
+    // the accused, so its length is theirs to pick. Bounds therefore
+    // come first, before anything that costs a query. Refusals come
+    // second, so a refusal deletes every blob the filing named rather
+    // than only the ones seen before the first `return`. Resolution
+    // comes last.
+    let mut committed: Vec<(usize, media::MediaCommitment)> = Vec::new();
     for (index, item) in evidence.iter().enumerate() {
-        let media::Disclosed::Media(commitments) =
+        if let media::Disclosed::Media(commitments) =
             media::parse_disclosed(&item.disclosed_content)?
-        else {
-            continue;
+        {
+            for commitment in commitments {
+                committed.push((index, commitment));
+            }
+            // Bound as we go, so a preimage naming ten thousand blobs
+            // is refused while reading it rather than after.
+            if committed.len() > media::MAX_MEDIA_PER_FILING {
+                return Err(Error::BadRequest(format!(
+                    "this filing commits to more than {} media items",
+                    media::MAX_MEDIA_PER_FILING
+                )));
+            }
+        }
+    }
+    if committed.is_empty() {
+        return Ok(Vec::new());
+    }
+    // A ceiling across the case, not just this filing. Reports join an
+    // open case and responses accumulate on one, so the per-filing
+    // bound alone left a case able to gather hundreds of images, every
+    // one of them resolved on each document build.
+    if already_on_case + committed.len() > media::MAX_MEDIA_PER_CASE {
+        return Err(Error::BadRequest(format!(
+            "this case already rests on {already_on_case} images; the ceiling is {}",
+            media::MAX_MEDIA_PER_CASE
+        )));
+    }
+
+    // Refusals. Both delete every blob this filing named — bytes
+    // arrived before anything knew what they would be claimed as, so
+    // this authority is holding them, and the honest remedy is to hold
+    // them for this request rather than for the expiry window. Only
+    // blobs no case rests on: a digest a live case depends on is not
+    // this filing's to take.
+    let refusal = if CLASSES_REFUSING_MEDIA.contains(&class_id) {
+        Some(format!(
+            "class {class_id:?} does not accept media evidence at this authority"
+        ))
+    } else if state.config.triage.as_ref().is_some_and(|t| !t.profile.supports_images) {
+        // The pinned model cannot inspect an image, so this authority
+        // cannot adjudicate one. Refusing at intake — rather than
+        // taking the evidence and declining to decide later — is what
+        // stops image evidence becoming a way to end a case: a case
+        // that can never be decided is dismissed at its deadline, and
+        // anyone able to file against this accused could reach that by
+        // attaching a picture.
+        Some(format!(
+            "this authority's pinned model profile cannot review images, so it does not accept              image evidence; a text report for {class_id:?} is unaffected"
+        ))
+    } else {
+        None
+    };
+    if let Some(reason) = refusal {
+        let named: Vec<String> =
+            committed.iter().map(|(_, c)| c.plaintext_sha256.clone()).collect();
+        state.store.delete_unheld_evidence_blobs(&named)?;
+        return Err(Error::MediaClassRefused(reason));
+    }
+
+    let mut digests = Vec::new();
+    for (index, commitment) in committed {
+        if !media::ALLOWED_MEDIA_TYPES.contains(&commitment.mime_type.as_str()) {
+            return Err(Error::MediaUnsupported(format!(
+                "evidence item {index} commits to {:?}, which this authority does not accept",
+                commitment.mime_type
+            )));
+        }
+        // Dimensions are required for an image, not optional-and-checked
+        // -if-present. They are printed in the case document and in the
+        // panel as facts about the evidence, so a commitment that
+        // omitted them would have those numbers attributed to a
+        // signature that never covered them.
+        let (Some(width), Some(height)) = (commitment.width, commitment.height) else {
+            return Err(Error::AuthenticityUnverified(format!(
+                "evidence item {index} commits to an image without dimensions; they are shown                  as attested and must be signed"
+            )));
         };
+        let stored = state.store.evidence_blob(&commitment.plaintext_sha256)?.ok_or_else(|| {
+            Error::MediaMissing(format!(
+                "evidence item {index} names an image that has not been uploaded"
+            ))
+        })?;
 
-        if CLASSES_REFUSING_MEDIA.contains(&class_id) {
-            // Delete before refusing. The upload route has no class
-            // context, so these bytes were decoded, normalized and
-            // written before anything knew what they would be claimed
-            // as — this authority *is* holding them, and the honest
-            // remedy is to hold them for the length of this request
-            // rather than for the expiry window. Only blobs no case
-            // rests on: a digest shared with a live case is not this
-            // report's to take.
-            let mut named: Vec<String> = commitments
-                .iter()
-                .map(|c| c.plaintext_sha256.clone())
-                .collect();
-            named.append(&mut digests);
-            state.store.delete_unheld_evidence_blobs(&named)?;
-            return Err(Error::MediaClassRefused(format!(
-                "class {class_id:?} does not accept media evidence at this authority"
+        // Every field the accused signed must match what is on file. A
+        // mismatch is an authenticity failure, not a format one: the
+        // bytes may be a perfectly good image, just not the one this
+        // proof attests to.
+        let mismatch = stored.mime_type != commitment.mime_type
+            || stored.byte_length != commitment.plaintext_byte_length
+            || width != stored.width
+            || height != stored.height;
+        if mismatch {
+            return Err(Error::AuthenticityUnverified(format!(
+                "evidence item {index} does not match the image it commits to"
             )));
         }
-
-        // Bounded before any lookup. The commitment is written by the
-        // accused, so its length is attacker-chosen and must not be
-        // allowed to become work.
-        if digests.len() + commitments.len() > media::MAX_MEDIA_PER_FILING {
-            return Err(Error::BadRequest(format!(
-                "this filing commits to more than {} media items",
-                media::MAX_MEDIA_PER_FILING
-            )));
-        }
-        // And a ceiling across the case, not just this filing. A case
-        // holds up to 32 responses, each of which may carry its own
-        // filing's worth — so the per-filing bound alone left a case
-        // able to accumulate hundreds of images, every one of them
-        // resolved on each document build.
-        if already_on_case + digests.len() + commitments.len() > media::MAX_MEDIA_PER_CASE {
-            return Err(Error::BadRequest(format!(
-                "this case already rests on {already_on_case} images; the ceiling is {}",
-                media::MAX_MEDIA_PER_CASE
-            )));
-        }
-
-        for commitment in commitments {
-            if !media::ALLOWED_MEDIA_TYPES.contains(&commitment.mime_type.as_str()) {
-                return Err(Error::MediaUnsupported(format!(
-                    "evidence item {index} commits to {:?}, which this authority does not accept",
-                    commitment.mime_type
-                )));
-            }
-            let stored = state
-                .store
-                .evidence_blob(&commitment.plaintext_sha256)?
-                .ok_or_else(|| {
-                    Error::MediaMissing(format!(
-                        "evidence item {index} names an image that has not been uploaded"
-                    ))
-                })?;
-
-            // Every field the accused signed must match what is on
-            // file. A mismatch is an authenticity failure, not a format
-            // one: the bytes may be a perfectly good image, just not the
-            // one this proof attests to.
-            let mismatch = stored.mime_type != commitment.mime_type
-                || stored.byte_length != commitment.plaintext_byte_length
-                || commitment.width.is_some_and(|w| w != stored.width)
-                || commitment.height.is_some_and(|h| h != stored.height);
-            if mismatch {
-                return Err(Error::AuthenticityUnverified(format!(
-                    "evidence item {index} does not match the image it commits to"
-                )));
-            }
-            digests.push(stored.sha256);
-        }
+        digests.push(stored.sha256);
     }
     Ok(digests)
 }
@@ -607,7 +636,18 @@ async fn file_report(
     // bytes have to be here and be the ones named. The signature check
     // above already proved the accused wrote the commitment; this proves
     // the authority is holding what the commitment describes.
-    let media_digests = verify_media_evidence(&state, &report.class_id, &report.evidence, 0)?;
+    // Counted against the case this report will join, if one is open.
+    // Reports join rather than open a second case, so passing zero here
+    // left the case-wide ceiling dead on the path that actually
+    // accumulates: every joining report added its own filing's worth
+    // with nothing bounding the total.
+    let joining = state.store.open_case_for(&report.accused, &report.class_id)?;
+    let already_on_case = match &joining {
+        Some(case) => state.store.case_media_count(&case.case_id)?,
+        None => 0,
+    };
+    let media_digests =
+        verify_media_evidence(&state, &report.class_id, &report.evidence, already_on_case)?;
 
     let evidence_summary = report_evidence_summary(&report)?;
 
@@ -651,7 +691,7 @@ async fn file_report(
     // opened the case a moment ago, and the honest response is to join
     // theirs — the same thing we would have done had we looked a
     // moment later.
-    let case = match state.store.open_case_for(&report.accused, &report.class_id)? {
+    let case = match joining {
         Some(existing) => join_case(&state, &existing, &report, now, &evidence_summary)?,
         None => {
             // Consent has a horizon at both ends. The accused's
@@ -1860,6 +1900,20 @@ mod tests {
             Self { state: Arc::new(AppState::for_tests(Store::in_memory().unwrap())) }
         }
 
+        /// A harness whose pinned profile is a real published one, so
+        /// intake decisions that depend on the model's declared inputs
+        /// are exercised against terms that actually exist.
+        fn with_profile(profile_id: &str) -> Self {
+            Self {
+                state: Arc::new(AppState::for_tests_with_triage(
+                    Store::in_memory().unwrap(),
+                    profile_id,
+                    "http://127.0.0.1:1",
+                    crate::config::TriageMode::Autonomous,
+                )),
+            }
+        }
+
         async fn send(&self, request: Request<Body>) -> (StatusCode, Value) {
             let response = router(self.state.clone()).oneshot(request).await.unwrap();
             let status = response.status();
@@ -1992,6 +2046,23 @@ mod tests {
         format!(
             r#"{{"body":"","group_binding":"ab","media":[{{"blob_sha256":"cipher","height":{},"mime_type":"{}","plaintext_byte_length":{},"plaintext_sha256":"{}","width":{}}}],"message_id":"m-1","proof_version":2,"sent_at_millis":1}}"#,
             image.height, image.mime_type, image.byte_length, image.sha256, image.width
+        )
+    }
+
+    /// A v2 preimage committing to several images at once.
+    fn media_preimage_many(images: &[media::AcceptedImage]) -> String {
+        let entries: Vec<String> = images
+            .iter()
+            .map(|image| {
+                format!(
+                    r#"{{"blob_sha256":"cipher","height":{},"mime_type":"{}","plaintext_byte_length":{},"plaintext_sha256":"{}","width":{}}}"#,
+                    image.height, image.mime_type, image.byte_length, image.sha256, image.width
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"body":"","group_binding":"ab","media":[{}],"message_id":"m-1","proof_version":2,"sent_at_millis":1}}"#,
+            entries.join(",")
         )
     }
 
@@ -2191,6 +2262,156 @@ mod tests {
         // retry forever against a limit that is not about size.
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{response}");
         assert_eq!(response["error"], "media_quota_exceeded");
+    }
+
+    #[tokio::test]
+    async fn a_text_only_authority_refuses_image_evidence_at_intake() {
+        // Not merely "declines to decide later". A case that can never
+        // be decided is dismissed at its deadline, so accepting image
+        // evidence a text-only model cannot read would hand anyone able
+        // to file against this accused — the accused included, since
+        // they can sign their own disclosed content — a way to end the
+        // case.
+        let harness = Harness::with_profile("qwen3guard-8b");
+        let (mandate, accepted, content) = seed_photo(&harness).await;
+        let body =
+            signed(photo_report_json(&mandate, "r-1", &content), "signature", &[REPORTER_SEED]);
+
+        let (status, response) = harness.post("/v1/reports", body).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+        assert_eq!(response["error"], "media_class_refused");
+        assert!(harness.state.store.evidence_blob(&accepted.sha256).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_joining_report_cannot_push_a_case_past_its_media_ceiling() {
+        // Reports join an open case rather than opening a second one,
+        // so the case-wide ceiling has to be measured against the case
+        // being joined — measuring against zero left it dead on the
+        // one path that actually accumulates.
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let mandate = register_mandate(&harness, REPORTER_SEED).await;
+
+        // Four images per report, so the ceiling is reached before the
+        // separate cap on how many notices a case may emit.
+        let per_report = 4usize;
+        let mut images_on_case = 0usize;
+        let mut last_status = StatusCode::OK;
+        for round in 0..(media::MAX_MEDIA_PER_CASE / per_report + 2) {
+            let mut accepted = Vec::new();
+            for slot in 0..per_report {
+                let bytes = media::tiny_jpeg(20 + (round * per_report + slot) as u32, 16);
+                let image = media::accept_image(&bytes).unwrap();
+                harness.put_blob(&image.sha256, bytes, REPORTER_SEED).await;
+                accepted.push(image);
+            }
+            let content = media_preimage_many(&accepted);
+            let body = signed(
+                photo_report_json(&mandate, &format!("r-{round}"), &content),
+                "signature",
+                &[REPORTER_SEED],
+            );
+            let (status, _) = harness.post("/v1/reports", body).await;
+            last_status = status;
+            if status != StatusCode::OK {
+                break;
+            }
+            images_on_case += per_report;
+        }
+
+        assert_eq!(images_on_case, media::MAX_MEDIA_PER_CASE);
+        assert_eq!(last_status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_deletes_every_image_the_filing_named() {
+        // The refusal used to `return` inside the per-item loop, so a
+        // report carrying images on two evidence items left the second
+        // item's bytes on disk for the full expiry window.
+        let harness = Harness::new();
+        let (mandate, first, first_content) = seed_photo(&harness).await;
+        let second_bytes = media::tiny_jpeg(31, 17);
+        let second = media::accept_image(&second_bytes).unwrap();
+        harness.put_blob(&second.sha256, second_bytes, REPORTER_SEED).await;
+
+        let mut report = photo_report_json(&mandate, "r-1", &first_content);
+        report["classId"] = json!("csam");
+        let second_content = media_preimage(&second);
+        report["evidence"] = json!([
+            {
+                "disclosedContent": first_content,
+                "authenticityProof": testing::sign(ACCUSED_SEED, first_content.as_bytes()),
+            },
+            {
+                "disclosedContent": second_content,
+                "authenticityProof": testing::sign(ACCUSED_SEED, second_content.as_bytes()),
+            },
+        ]);
+
+        let (status, _) =
+            harness.post("/v1/reports", signed(report, "signature", &[REPORTER_SEED])).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(harness.state.store.evidence_blob(&first.sha256).unwrap().is_none());
+        assert!(
+            harness.state.store.evidence_blob(&second.sha256).unwrap().is_none(),
+            "every image the filing named, not only the first item's"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_commitment_is_bounded_before_it_becomes_work() {
+        // A signed preimage's length is attacker-chosen, and the
+        // refusal path costs two queries per digest. Bounding after
+        // refusing made a preimage naming thousands of blobs into
+        // thousands of queries per request.
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let mandate = register_mandate(&harness, REPORTER_SEED).await;
+        let entries: Vec<String> = (0..500)
+            .map(|i| {
+                format!(
+                    r#"{{"blob_sha256":"c","height":4,"mime_type":"image/jpeg","plaintext_byte_length":9,"plaintext_sha256":"{:064x}","width":3}}"#,
+                    i
+                )
+            })
+            .collect();
+        let content = format!(
+            r#"{{"body":"","group_binding":"ab","media":[{}],"message_id":"m","proof_version":2,"sent_at_millis":1}}"#,
+            entries.join(",")
+        );
+        let mut report = photo_report_json(&mandate, "r-1", &content);
+        report["classId"] = json!("csam");
+
+        let (status, response) =
+            harness.post("/v1/reports", signed(report, "signature", &[REPORTER_SEED])).await;
+
+        // Bounded, not refused for the class — the bound comes first.
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], "bad_request");
+    }
+
+    #[tokio::test]
+    async fn a_commitment_without_dimensions_does_not_authenticate_an_image() {
+        // Width and height are printed in the case document and the
+        // panel as facts about the evidence. A commitment omitting them
+        // would have those numbers attributed to a signature that never
+        // covered them.
+        let harness = Harness::new();
+        let (mandate, accepted, _) = seed_photo(&harness).await;
+        let content = format!(
+            r#"{{"body":"","group_binding":"ab","media":[{{"blob_sha256":"cipher","mime_type":"image/jpeg","plaintext_byte_length":{},"plaintext_sha256":"{}"}}],"message_id":"m-1","proof_version":2,"sent_at_millis":1}}"#,
+            accepted.byte_length, accepted.sha256
+        );
+        let body =
+            signed(photo_report_json(&mandate, "r-1", &content), "signature", &[REPORTER_SEED]);
+
+        let (status, response) = harness.post("/v1/reports", body).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+        assert_eq!(response["error"], "authenticity_unverified");
     }
 
     #[tokio::test]

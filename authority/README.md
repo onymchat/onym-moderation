@@ -623,10 +623,17 @@ Reference implementation. Known limits:
   `PUT /v1/evidence-blobs/{sha256}`, authenticated against the digest
   the accused signed in a version 2 proof preimage, normalized into a
   derivative, and sent to profiles whose published terms enable images.
-  A profile whose terms are text-only returns `no-decision` for a case
-  carrying images rather than classifying its captions. Video, album
-  and voice attachments are signed at send time but no authority
-  accepts them yet, so those cases still wait for a human.
+  A deployment whose pinned profile is text-only refuses image evidence
+  at intake rather than accepting it and declining to decide later —
+  the difference matters, because a case that can never be decided is
+  dismissed at its deadline, so accepting unreadable evidence would
+  hand anyone able to file against an accused a way to end the case.
+  For the same reason, a case carrying more images than the profile
+  takes is decided on as many as fit, with the rest named by digest in
+  the case document and listed on the assessment, rather than left
+  undecided. Video, album and voice attachments are signed at send time
+  but no authority accepts them yet, so those cases still wait for a
+  human.
 - **`csam` does not accept image evidence, and does briefly hold it.**
   The class is refused with `media_class_refused` and text reports for
   it are unaffected. The refusal is about readiness rather than about

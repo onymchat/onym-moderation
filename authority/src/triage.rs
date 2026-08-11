@@ -271,19 +271,12 @@ impl Triage {
             );
         }
 
-        // Guarded on the *report's* images alone. The accused's
-        // counter-evidence is handled below, because the two mean
-        // different things here: a model that cannot see the
-        // accusation cannot judge it, whereas a model that cannot see
-        // a rebuttal has merely been shown less than everything.
-        //
-        // Merging them let the accused end their own case. A case over
-        // the budget is never decided, and the deadline dismisses by
-        // default — so attaching one photo to a response immunised a
-        // pure-text case in front of a text-only profile, permanently.
-        if !document.images.is_empty()
-            && (!profile.supports_images || document.images.len() as u32 > profile.max_images)
-        {
+        // A model that cannot inspect an image at all cannot judge a
+        // case that rests on one, so this stays a refusal to decide.
+        // Intake now declines image evidence outright when the pinned
+        // profile is text-only, so reaching here means a case that
+        // predates that check — a backstop, not the main defence.
+        if !profile.supports_images && !document.images.is_empty() {
             return self.record(
                 state,
                 case,
@@ -294,27 +287,35 @@ impl Triage {
                     outcome: Outcome::NoDecision,
                     score: None,
                     labels: Vec::new(),
-                    note: if profile.supports_images {
-                        format!(
-                            "case {} carries {} images but profile {} takes at most {}; it will \
-                             not be decided on part of its evidence",
-                            case.case_id,
-                            document.images.len(),
-                            profile.id,
-                            profile.max_images
-                        )
-                    } else {
-                        format!(
-                            "case {} carries image evidence and profile {} cannot inspect \
-                             images; classifying only the text would misrepresent what was \
-                             reviewed",
-                            case.case_id, profile.id
-                        )
-                    },
+                    note: format!(
+                        "case {} carries image evidence and profile {} cannot inspect images; \
+                         classifying only the text would misrepresent what was reviewed",
+                        case.case_id, profile.id
+                    ),
                 },
                 now,
             );
         }
+
+        // Over the count, the case is decided on as much as the profile
+        // takes rather than not decided at all.
+        //
+        // Refusing was weaponisable, and by more than one door. Anyone
+        // who can file against this accused — including the accused
+        // themselves, who can sign their own disclosed content — could
+        // push a case past the budget and know it would sit undecided
+        // until the deadline dismissed it. A guard meant to stop a
+        // model judging what it cannot see was a way to guarantee
+        // acquittal, which is the same trap the digest-changed path
+        // below was already written to avoid.
+        //
+        // Truncation is not free: the model may decide having seen only
+        // some of the reported images. It is disclosed rather than
+        // silent — every image is named by digest in the case document,
+        // so the input digest covers it, and the note records exactly
+        // which were withheld — and a human sees all of them on appeal.
+        let budget = profile.max_images as usize;
+        let shown_reports = document.images.len().min(budget);
 
         // Counter-evidence fills whatever budget the report's images
         // leave, in filing order.
@@ -327,16 +328,23 @@ impl Triage {
         // the input digest covers its existence; the note below records
         // which ones were not shown; and the merits reach a human on
         // appeal, where the picture is in the panel.
-        let headroom = (profile.max_images as usize).saturating_sub(document.images.len());
-        let shown_responses = if profile.supports_images { headroom } else { 0 };
-        let withheld: Vec<&crate::casedoc::DocumentImage> =
-            document.response_images.iter().skip(shown_responses).collect();
+        let shown_responses = budget.saturating_sub(shown_reports);
+        let withheld: Vec<&crate::casedoc::DocumentImage> = document
+            .images
+            .iter()
+            .skip(shown_reports)
+            .chain(document.response_images.iter().skip(shown_responses))
+            .collect();
         let withheld_note = if withheld.is_empty() {
             String::new()
         } else {
+            // Single-line format string on purpose: a wrapped literal
+            // puts a run of indentation into the note, and this text is
+            // stored and read by a person reviewing an appeal.
             format!(
-                " {} counter-evidence image(s) were not shown to the model, above this                  profile's limit of {}: {}",
+                " {} image(s) were not shown to the model, above profile {}'s limit of {}: {}",
                 withheld.len(),
+                profile.id,
                 profile.max_images,
                 withheld.iter().map(|i| i.sha256.as_str()).collect::<Vec<_>>().join(", ")
             )
@@ -345,6 +353,7 @@ impl Triage {
         let derivatives = document
             .images
             .iter()
+            .take(shown_reports)
             .chain(document.response_images.iter().take(shown_responses))
             .map(|image| {
                 state
@@ -1191,6 +1200,44 @@ mod tests {
         assert!(assessment.note.contains("cannot inspect"), "{}", assessment.note);
     }
 
+    /// Attach several report photos to the open case.
+    fn attach_photos(
+        store: &crate::store::Store,
+        class_id: &str,
+        count: usize,
+    ) -> Vec<crate::media::AcceptedImage> {
+        let mut accepted = Vec::new();
+        let mut entries = Vec::new();
+        for slot in 0..count {
+            let bytes = crate::media::tiny_jpeg(20 + slot as u32, 12);
+            let image = crate::media::accept_image(&bytes).unwrap();
+            store
+                .put_evidence_blob(&image, &bytes, "2026-08-02T00:00:00Z", "onym:key:rep")
+                .unwrap();
+            store.attach_evidence_blobs("c1", &[image.sha256.clone()]).unwrap();
+            entries.push(format!(
+                r#"{{"blob_sha256":"cipher","height":{},"mime_type":"image/jpeg","plaintext_byte_length":{},"plaintext_sha256":"{}","width":{}}}"#,
+                image.height, image.byte_length, image.sha256, image.width
+            ));
+            accepted.push(image);
+        }
+        let content = format!(
+            r#"{{"body":"","group_binding":"ab","media":[{}],"message_id":"m-1","proof_version":2,"sent_at_millis":1}}"#,
+            entries.join(",")
+        );
+        let report = serde_json::json!({
+            "reportVersion": 1, "reportId": "r2", "reporter": "onym:key:rep",
+            "reporterMandate": "m0", "accused": "onym:key:acc", "classId": class_id,
+            "evidence": [{"disclosedContent": content, "authenticityProof": "sig"}],
+            "filedAt": "2026-08-03T00:00:00Z",
+        });
+        store
+            .put_report("r2", "onym:key:rep", "onym:key:acc", class_id, Some("c1"), 1.0,
+                        &serde_json::to_vec(&report).unwrap(), "2026-08-03T00:00:00Z")
+            .unwrap();
+        accepted
+    }
+
     /// Attach a photo to the accused's response.
     fn attach_response_photo(store: &crate::store::Store, size: u32) -> crate::media::AcceptedImage {
         let bytes = crate::media::tiny_jpeg(size, size);
@@ -1268,6 +1315,50 @@ mod tests {
             "the withheld image must be named on the assessment: {}",
             assessment.note
         );
+    }
+
+    /// Over the count, the case is decided on what fits — not left
+    /// undecided, which anyone able to file against the accused could
+    /// have reached on purpose.
+    #[tokio::test]
+    async fn a_report_over_the_image_budget_is_decided_on_what_fits() {
+        let (url, seen) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "unsafe\nS12"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "unsolicited-pornography", "2026-08-04T00:00:00Z");
+        // llama-guard-4-12b takes three; give the case four.
+        let images = attach_photos(&store, "unsolicited-pornography", 4);
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "llama-guard-4-12b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        assert_eq!(
+            state.store.case("c1").unwrap().unwrap().disposition.as_deref(),
+            Some("ban"),
+            "a case over the budget must still be decided"
+        );
+        let request = &seen.lock().unwrap()[0];
+        let parts = request["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.iter().filter(|p| p["type"] == "image_url").count(), 3);
+
+        let (raw, _) = state.store.assessment("c1").unwrap().unwrap();
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert!(
+            assessment.note.contains(&images[3].sha256),
+            "the withheld image must be named: {}",
+            assessment.note
+        );
+        // The note is read by a person in the panel; a wrapped literal
+        // would land in the record as a run of spaces.
+        assert!(!assessment.note.contains("  "), "note has a whitespace run: {}", assessment.note);
     }
 
     /// Budget order: the report's images first, then whatever
