@@ -44,10 +44,27 @@ pub const MAX_MEDIA_PER_REPORT: usize = 8;
 /// Decoded-pixel ceiling. A few hundred kilobytes of PNG can describe a
 /// billion pixels, so the byte-length limit alone does not bound the
 /// decode; this does.
-pub const MAX_IMAGE_PIXELS: u64 = 40_000_000;
+///
+/// Generous for evidence — a 24-megapixel frame is a high-end camera,
+/// and the iOS client re-encodes to 2048px on its longest edge before
+/// sending — and chosen low enough that the allocation it implies is
+/// something this service can afford several times over at once.
+pub const MAX_IMAGE_PIXELS: u64 = 24_000_000;
 
-/// Per-edge ceiling, so a 1 × 40,000,000 strip is refused too.
-pub const MAX_IMAGE_EDGE: u32 = 12_000;
+/// Per-edge ceiling, so a 1 × 24,000,000 strip is refused too. Above
+/// the square root of the pixel ceiling on purpose: a wide panorama
+/// within the pixel budget should pass, and the pixel budget is what
+/// actually bounds the decode.
+pub const MAX_IMAGE_EDGE: u32 = 8_192;
+
+/// Bytes the decoder may allocate: the pixel ceiling at four bytes per
+/// pixel, the widest layout it will produce.
+///
+/// This is the bound that does the real work, and it does it *before*
+/// the decode. The dimension checks after `decode()` are a restatement
+/// for the record — by then the memory has already been committed, so a
+/// header declaring a bomb has to be refused here or not at all.
+const MAX_DECODE_ALLOC: u64 = MAX_IMAGE_PIXELS * 4;
 
 /// Longest edge of the normalized derivative.
 pub const DERIVATIVE_MAX_EDGE: u32 = 1024;
@@ -212,7 +229,7 @@ pub fn accept_image(bytes: &[u8]) -> Result<AcceptedImage, Error> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_IMAGE_EDGE);
     limits.max_image_height = Some(MAX_IMAGE_EDGE);
-    limits.max_alloc = Some(MAX_IMAGE_PIXELS * 4);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
     reader.limits(limits);
 
     let decoded = reader

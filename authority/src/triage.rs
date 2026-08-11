@@ -1088,7 +1088,7 @@ mod tests {
         let bytes = crate::media::tiny_jpeg(20, 12);
         let accepted = crate::media::accept_image(&bytes).unwrap();
         store.put_evidence_blob(&accepted, &bytes, "2026-08-02T00:00:00Z", "onym:key:uploader").unwrap();
-        store.mark_evidence_blobs_referenced(&[accepted.sha256.clone()]).unwrap();
+        store.touch_evidence_blobs(&[accepted.sha256.clone()], "2026-08-01T00:00:00Z").unwrap();
         store.attach_evidence_blobs("c1", &[accepted.sha256.clone()]).unwrap();
         let content = format!(
             r#"{{"body":"","group_binding":"ab","media":[{{"blob_sha256":"cipher","height":{},"mime_type":"image/jpeg","plaintext_byte_length":{},"plaintext_sha256":"{}","width":{}}}],"message_id":"m-1","proof_version":2,"sent_at_millis":1}}"#,

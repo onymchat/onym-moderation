@@ -613,16 +613,24 @@ async fn case_detail(
 
     body.push_str("<h2>Disclosed evidence</h2>");
     let evidence = state.store.evidence_for_case(&case_id)?;
+    // The page's image budget, shared by the report evidence and the
+    // accused's response below.
+    let mut rendered_images = 0usize;
     if evidence.is_empty() {
         body.push_str("<p class=empty>No stored evidence.</p>");
     } else {
         for item in evidence {
-            body.push_str(&render_evidence_images(&state, &item, &case.class_id)?);
+            body.push_str(&render_evidence_images(
+                &state,
+                &item,
+                &case.class_id,
+                &mut rendered_images,
+            )?);
             body.push_str(&format!("<pre class=evidence>{}</pre>", escape(&item)));
         }
     }
 
-    body.push_str(&accused_response_section(&state, &case)?);
+    body.push_str(&accused_response_section(&state, &case, &mut rendered_images)?);
 
     body.push_str("<h2>History</h2><table><tr><th>At</th><th>Event</th><th>Detail</th></tr>");
     for (at, kind, detail) in state.store.events(&case_id)? {
@@ -726,7 +734,11 @@ async fn initial_decision(
 /// nothing more. Since the merits are reviewed by a human exactly once
 /// — on appeal — the answer to an accusation should be as legible as
 /// the accusation.
-fn accused_response_section(state: &AppState, case: &CaseRecord) -> Result<String, Error> {
+fn accused_response_section(
+    state: &AppState,
+    case: &CaseRecord,
+    rendered: &mut usize,
+) -> Result<String, Error> {
     let responses = state.store.responses(&case.case_id)?;
     let mut out = String::from("<h2>Accused response</h2>");
     if responses.is_empty() {
@@ -750,12 +762,20 @@ fn accused_response_section(state: &AppState, case: &CaseRecord) -> Result<Strin
             let Some(content) = item.get("disclosedContent").and_then(|v| v.as_str()) else {
                 continue;
             };
-            out.push_str(&render_evidence_images(state, content, &case.class_id)?);
+            out.push_str(&render_evidence_images(
+                state,
+                content,
+                &case.class_id,
+                rendered,
+            )?);
             out.push_str(&format!("<pre class=evidence>{}</pre>", escape(content)));
         }
     }
     Ok(out)
 }
+
+/// How many reported images one panel page will inline.
+const MAX_PANEL_IMAGES: usize = 12;
 
 /// Classes whose evidence a reviewer should choose to look at, rather
 /// than have appear because they opened a page.
@@ -783,15 +803,40 @@ fn render_evidence_images(
     state: &AppState,
     disclosed_content: &str,
     class_id: &str,
+    rendered: &mut usize,
 ) -> Result<String, Error> {
-    let Ok(crate::media::Disclosed::Media(commitments)) =
-        crate::media::parse_disclosed(disclosed_content)
-    else {
-        return Ok(String::new());
+    let commitments = match crate::media::parse_disclosed(disclosed_content) {
+        Ok(crate::media::Disclosed::Media(commitments)) => commitments,
+        Ok(crate::media::Disclosed::Text) => return Ok(String::new()),
+        Err(error) => {
+            // Say so rather than render nothing: a reviewer seeing an
+            // item with no picture should be able to tell "no image
+            // here" from "this authority could not read the claim".
+            return Ok(format!(
+                "<p class=empty>This item's media commitment could not be read ({}).</p>",
+                escape(error.code())
+            ));
+        }
     };
 
     let mut out = String::new();
     for commitment in commitments {
+        // The panel inlines every derivative as base64 into one
+        // document, and a case that joined several reports carries up
+        // to `MAX_MEDIA_PER_REPORT` images each. Triage is bounded by
+        // the profile's own maximum; this page had nothing, so a
+        // heavily joined case could build a document large enough to be
+        // its own denial of service against the reviewer. Counted
+        // across the whole page, not per item, because that is where
+        // the size actually accumulates.
+        if *rendered >= MAX_PANEL_IMAGES {
+            out.push_str(&format!(
+                "<p class=empty>Further images on this case are not shown: the page stops at \
+                 {MAX_PANEL_IMAGES}. Every one is listed by digest in the case document under \
+                 the assessment.</p>"
+            ));
+            break;
+        }
         let Some(stored) = state.store.evidence_blob(&commitment.plaintext_sha256)? else {
             out.push_str("<p class=empty>This image is no longer retained.</p>");
             continue;
@@ -822,6 +867,7 @@ fn render_evidence_images(
             stored.derivative_version,
             if blurred { " · click to reveal" } else { "" },
         ));
+        *rendered += 1;
     }
     Ok(out)
 }

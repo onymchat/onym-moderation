@@ -201,9 +201,9 @@ async fn put_evidence_blob(
     // filing real reports is never blocked by their own history; only
     // one accumulating bytes they never report is.
     if state.store.unreferenced_uploads_by(key)? >= MAX_UNREFERENCED_UPLOADS_PER_KEY {
-        return Err(Error::MediaTooLarge(format!(
-            "this key already holds {MAX_UNREFERENCED_UPLOADS_PER_KEY} uploads no report \
-             references; file or abandon those before uploading more"
+        return Err(Error::MediaQuotaExceeded(format!(
+            "this key already holds {MAX_UNREFERENCED_UPLOADS_PER_KEY} uploads no case rests \
+             on; file or abandon those before uploading more"
         )));
     }
 
@@ -583,10 +583,12 @@ async fn file_report(
             &stamp,
         )?;
     }
-    // Immediately after the report is on file, and before a case exists
-    // — this is what closes the sweep window described on the column.
+    // The report is on file; its case does not exist yet. Restart the
+    // uploads' expiry clock so they survive that gap — including the
+    // paths just below that return an error inside it, a lapsed
+    // manifest and an expired mandate.
     if !media_digests.is_empty() {
-        state.store.mark_evidence_blobs_referenced(&media_digests)?;
+        state.store.touch_evidence_blobs(&media_digests, &stamp)?;
     }
 
     // Further reports join an open case rather than opening a second
@@ -1006,7 +1008,7 @@ async fn respond(
         limit: MAX_RESPONSES_PER_CASE,
     })?;
     if !media_digests.is_empty() {
-        state.store.mark_evidence_blobs_referenced(&media_digests)?;
+        state.store.touch_evidence_blobs(&media_digests, &stamp)?;
         state.store.attach_evidence_blobs(&case_id, &media_digests)?;
     }
 
@@ -2129,14 +2131,19 @@ mod tests {
         let bytes = media::tiny_jpeg(200, 8);
         let accepted = media::accept_image(&bytes).unwrap();
         let (status, response) = harness.put_blob(&accepted.sha256, bytes, REPORTER_SEED).await;
-        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{response}");
-        assert_eq!(response["error"], "media_too_large");
+        // Not `media_too_large`: nothing is wrong with the image, and a
+        // client reading only the status would otherwise shrink it and
+        // retry forever against a limit that is not about size.
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{response}");
+        assert_eq!(response["error"], "media_quota_exceeded");
     }
 
     #[tokio::test]
-    async fn uploads_a_report_already_names_do_not_count_against_the_bound() {
-        // The bound is on uploads nobody reported. A reporter filing
-        // real reports must never be blocked by their own history.
+    async fn uploads_a_case_rests_on_do_not_count_against_the_bound() {
+        // The bound is on uploads no case rests on — keyed on the join
+        // table rather than on a flag set at filing time, so an upload
+        // whose case never opened keeps counting instead of vanishing
+        // from the budget the way the earlier flag let it.
         let harness = Harness::new();
         let (mandate, _, content) = seed_photo(&harness).await;
         let body =

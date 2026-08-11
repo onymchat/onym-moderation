@@ -283,26 +283,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_upload_a_report_already_names_is_not_swept() {
-        // The window this closes: a filing interrupted between storing
-        // the report and opening its case leaves the blob with no case
-        // id, and sweeping on that alone would delete bytes a stored
-        // report depends on.
+    async fn a_reports_uploads_survive_the_gap_before_its_case_opens() {
+        // The report goes on file before its case exists, and filing
+        // restarts the upload's clock — so the gap is protected for a
+        // full window rather than by a flag the sweep then skips.
         let store = Store::in_memory().unwrap();
-        let referenced = store_image(&store, "2026-08-01T00:00:00Z");
-        store.mark_evidence_blobs_referenced(&[referenced.clone()]).unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+        store.touch_evidence_blobs(&[digest.clone()], "2026-08-10T00:00:00Z").unwrap();
         let state = crate::state::AppState::for_tests(store);
 
-        retention_sweep(&state, util::parse_timestamp("2026-08-10T00:00:00Z").unwrap()).unwrap();
+        retention_sweep(&state, util::parse_timestamp("2026-08-10T06:00:00Z").unwrap()).unwrap();
 
-        assert!(state.store.evidence_blob(&referenced).unwrap().is_some());
+        assert!(state.store.evidence_blob(&digest).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn an_upload_whose_case_never_opened_still_expires() {
+        // The hole this closes: a flag set at filing time made a blob
+        // invisible to the expiry sweep, and a case that never opened
+        // left it invisible to case deletion too — retained forever and
+        // counted against no budget. Case opening genuinely can fail
+        // after the report is stored: a lapsed manifest and an expired
+        // mandate both return an error in exactly that span.
+        let store = Store::in_memory().unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+        store.touch_evidence_blobs(&[digest.clone()], "2026-08-01T00:00:00Z").unwrap();
+        let state = crate::state::AppState::for_tests(store);
+
+        let removed =
+            retention_sweep(&state, util::parse_timestamp("2026-08-03T00:00:00Z").unwrap())
+                .unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(state.store.evidence_blob(&digest).unwrap().is_none());
     }
 
     #[tokio::test]
     async fn a_decided_case_past_its_appeal_window_loses_original_and_derivative_together() {
         let store = Store::in_memory().unwrap();
         let digest = store_image(&store, "2026-08-01T00:00:00Z");
-        store.mark_evidence_blobs_referenced(&[digest.clone()]).unwrap();
+        store.touch_evidence_blobs(&[digest.clone()], "2026-08-01T00:00:00Z").unwrap();
 
         let mut case = case_due("2026-08-05T00:00:00Z");
         case.stage = "decided".into();
@@ -333,7 +353,7 @@ mod tests {
     async fn a_photo_two_cases_rest_on_survives_the_first_one_ending() {
         let store = Store::in_memory().unwrap();
         let digest = store_image(&store, "2026-08-01T00:00:00Z");
-        store.mark_evidence_blobs_referenced(&[digest.clone()]).unwrap();
+        store.touch_evidence_blobs(&[digest.clone()], "2026-08-01T00:00:00Z").unwrap();
 
         let mut finished = case_due("2026-08-05T00:00:00Z");
         finished.case_id = "finished".into();
@@ -372,7 +392,7 @@ mod tests {
     async fn a_dismissal_does_not_lose_its_evidence_the_moment_it_is_decided() {
         let store = Store::in_memory().unwrap();
         let digest = store_image(&store, "2026-08-01T00:00:00Z");
-        store.mark_evidence_blobs_referenced(&[digest.clone()]).unwrap();
+        store.touch_evidence_blobs(&[digest.clone()], "2026-08-01T00:00:00Z").unwrap();
 
         let mut case = case_due("2026-08-20T00:00:00Z");
         case.stage = "decided".into();
@@ -394,7 +414,7 @@ mod tests {
     async fn a_pending_appeal_keeps_the_evidence_it_is_about() {
         let store = Store::in_memory().unwrap();
         let digest = store_image(&store, "2026-08-01T00:00:00Z");
-        store.mark_evidence_blobs_referenced(&[digest.clone()]).unwrap();
+        store.touch_evidence_blobs(&[digest.clone()], "2026-08-01T00:00:00Z").unwrap();
 
         let mut case = case_due("2026-08-05T00:00:00Z");
         case.stage = "decided".into();

@@ -69,6 +69,14 @@ pub enum Error {
     #[error("media_too_large: {0}")]
     MediaTooLarge(String),
 
+    /// The uploader already holds as many unfiled uploads as this
+    /// authority will hold for one key. Deliberately not
+    /// `media_too_large`: nothing is wrong with the image, and a client
+    /// reading only the status would otherwise shrink it and retry
+    /// forever against a limit that is not about size.
+    #[error("media_quota_exceeded: {0}")]
+    MediaQuotaExceeded(String),
+
     /// The class does not accept media evidence at this authority.
     /// `csam` is refused deliberately: accepting the bytes would make
     /// this authority a custodian of illegal imagery before it has the
@@ -98,6 +106,7 @@ impl Error {
             Error::MediaMissing(_) => "media_missing",
             Error::MediaUnsupported(_) => "media_unsupported",
             Error::MediaTooLarge(_) => "media_too_large",
+            Error::MediaQuotaExceeded(_) => "media_quota_exceeded",
             Error::MediaClassRefused(_) => "media_class_refused",
             Error::NotFound(_) => "not_found",
             Error::Internal(_) => "internal_error",
@@ -139,6 +148,9 @@ impl Error {
             Error::MediaMissing(_) => StatusCode::FAILED_DEPENDENCY,
             Error::MediaUnsupported(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Error::MediaTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            // Retryable, but only after the caller files or abandons
+            // what it is already holding.
+            Error::MediaQuotaExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             Error::MediaClassRefused(_) => StatusCode::FORBIDDEN,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,

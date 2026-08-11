@@ -187,10 +187,24 @@ fn media_lines(
     images: &mut Vec<DocumentImage>,
     unresolved: &mut usize,
 ) -> Result<String, Error> {
-    let Ok(crate::media::Disclosed::Media(commitments)) =
-        crate::media::parse_disclosed(disclosed_content)
-    else {
-        return Ok(String::new());
+    // An `Err` here is not "no media". Collapsing the two would let a
+    // commitment this authority cannot read leave `unresolved` at zero,
+    // so a picture-only case would pass the triage guard and be scored
+    // on its caption — the same failure that guard exists to prevent,
+    // arriving by the one route it cannot see. Intake rejects
+    // unparseable content today, so this is latent; it is also exactly
+    // the kind of latent that stops being latent when the commitment
+    // format gains a version.
+    let commitments = match crate::media::parse_disclosed(disclosed_content) {
+        Ok(crate::media::Disclosed::Media(commitments)) => commitments,
+        Ok(crate::media::Disclosed::Text) => return Ok(String::new()),
+        Err(error) => {
+            *unresolved += 1;
+            return Ok(format!(
+                "[media of {label}: commitment could not be read: {}]\n",
+                error.code()
+            ));
+        }
     };
 
     let mut out = String::new();

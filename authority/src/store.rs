@@ -480,15 +480,20 @@ impl Store {
                 derivative         BLOB NOT NULL,
                 derivative_sha256  TEXT NOT NULL,
                 derivative_version INTEGER NOT NULL,
+                -- Doubles as the expiry clock. Filing a report that
+                -- names this blob pushes it forward, which is what
+                -- protects the gap between the report going on file and
+                -- its case opening — a gap that is not only a crash
+                -- window: a lapsed manifest or an expired mandate
+                -- returns an error in exactly that span.
+                --
+                -- A boolean "referenced" flag used to guard that gap,
+                -- and it was worse than nothing: a blob marked but never
+                -- attached became invisible to the expiry sweep (which
+                -- skipped marked rows) *and* to case deletion (which
+                -- only reaches attached rows), so it was retained
+                -- forever and counted against no budget.
                 uploaded_at        TEXT NOT NULL,
-                -- Set the moment a report naming this blob goes on file,
-                -- which happens *before* its case exists. Sweeping on
-                -- `case_id IS NULL` alone would have a window: a filing
-                -- interrupted between storing the report and opening the
-                -- case would leave the blob looking like a dangling
-                -- upload, and the sweep would delete bytes a stored
-                -- report depends on.
-                referenced         INTEGER NOT NULL DEFAULT 0,
                 -- The key that uploaded these bytes, so unreferenced
                 -- uploads can be bounded per uploader.
                 uploaded_by        TEXT NOT NULL DEFAULT ''
@@ -540,7 +545,6 @@ impl Store {
             ("cases", "claim_revision", "INTEGER NOT NULL DEFAULT 0"),
             ("assessments", "attempts", "INTEGER NOT NULL DEFAULT 0"),
             ("assessments", "document", "BLOB"),
-            ("evidence_blobs", "referenced", "INTEGER NOT NULL DEFAULT 0"),
             ("evidence_blobs", "uploaded_by", "TEXT NOT NULL DEFAULT ''"),
         ] {
             Self::add_column(&conn, table, column, definition)?;
@@ -1555,16 +1559,20 @@ impl Store {
         rows.next().transpose().map_err(Into::into)
     }
 
-    /// Mark uploads as belonging to a filed report.
+    /// Push an upload's expiry clock forward.
     ///
-    /// Done as the report goes on file, before its case exists, so the
-    /// sweep can never take bytes a stored report already depends on.
-    pub fn mark_evidence_blobs_referenced(&self, digests: &[String]) -> Result<(), Error> {
+    /// Called as a report naming these blobs goes on file, which happens
+    /// before its case exists. Restarting the clock — rather than
+    /// setting a flag the sweep then skips — means an upload waiting for
+    /// its case is protected for a full expiry window, and an upload
+    /// whose case never opens still expires like any other. There is no
+    /// state a blob can reach from which nothing collects it.
+    pub fn touch_evidence_blobs(&self, digests: &[String], at: &str) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
         for digest in digests {
             conn.execute(
-                "UPDATE evidence_blobs SET referenced = 1 WHERE sha256 = ?1",
-                params![digest],
+                "UPDATE evidence_blobs SET uploaded_at = ?1 WHERE sha256 = ?2",
+                params![at, digest],
             )?;
         }
         Ok(())
@@ -1594,7 +1602,9 @@ impl Store {
     pub fn unreferenced_uploads_by(&self, uploader: &str) -> Result<usize, Error> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM evidence_blobs WHERE uploaded_by = ?1 AND referenced = 0",
+            "SELECT COUNT(*) FROM evidence_blobs \
+             WHERE uploaded_by = ?1 \
+               AND sha256 NOT IN (SELECT sha256 FROM evidence_blob_cases)",
             params![uploader],
             |row| row.get(0),
         )?;
@@ -1610,7 +1620,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let removed = conn.execute(
             "DELETE FROM evidence_blobs \
-             WHERE referenced = 0 AND uploaded_at < ?1 \
+             WHERE uploaded_at < ?1 \
                AND sha256 NOT IN (SELECT sha256 FROM evidence_blob_cases)",
             params![uploaded_before],
         )?;
