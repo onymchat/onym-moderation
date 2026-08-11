@@ -1504,10 +1504,21 @@ impl Store {
     ) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR IGNORE INTO evidence_blobs \
+            // Upsert rather than ignore. A re-upload answers 200, and
+            // that answer has to mean the bytes are here *and* will
+            // stay: leaving `uploaded_at` stale let a client re-send at
+            // the edge of expiry, get an acknowledgement, and have the
+            // sweep delete the blob before the report naming it landed.
+            //
+            // `uploaded_by` deliberately stays with the original
+            // uploader. The budget is about who is parking bytes on
+            // this authority, and that should not transfer to whoever
+            // happened to re-send them last.
+            "INSERT INTO evidence_blobs \
              (sha256, mime_type, byte_length, width, height, bytes, derivative, \
               derivative_sha256, derivative_version, uploaded_at, uploaded_by) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+             ON CONFLICT(sha256) DO UPDATE SET uploaded_at = excluded.uploaded_at",
             params![
                 image.sha256,
                 image.mime_type,
@@ -1657,6 +1668,43 @@ impl Store {
         Ok(out)
     }
 
+    /// Delete these blobs unless some case still rests on them.
+    ///
+    /// Shared by retention and by the refusal path: a class that
+    /// declines media should not leave the bytes sitting for a day, and
+    /// neither caller may take a digest another live case depends on.
+    pub fn delete_unheld_evidence_blobs(&self, digests: &[String]) -> Result<usize, Error> {
+        let conn = self.conn.lock().unwrap();
+        Self::delete_unheld(&conn, digests)
+    }
+
+    fn delete_unheld(conn: &Connection, digests: &[String]) -> Result<usize, Error> {
+        let mut removed = 0;
+        for digest in digests {
+            let still_held: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM evidence_blob_cases WHERE sha256 = ?1",
+                params![digest],
+                |row| row.get(0),
+            )?;
+            if still_held == 0 {
+                removed +=
+                    conn.execute("DELETE FROM evidence_blobs WHERE sha256 = ?1", params![digest])?;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// How many images a case already rests on.
+    pub fn case_media_count(&self, case_id: &str) -> Result<usize, Error> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM evidence_blob_cases WHERE case_id = ?1",
+            params![case_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     /// Forget a finished case's media.
     ///
     /// Detaches this case, then deletes only the blobs no other case
@@ -1676,20 +1724,7 @@ impl Store {
             rows.collect::<Result<_, _>>()?
         };
         conn.execute("DELETE FROM evidence_blob_cases WHERE case_id = ?1", params![case_id])?;
-
-        let mut removed = 0;
-        for digest in candidates {
-            let still_held: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM evidence_blob_cases WHERE sha256 = ?1",
-                params![digest],
-                |row| row.get(0),
-            )?;
-            if still_held == 0 {
-                removed += conn
-                    .execute("DELETE FROM evidence_blobs WHERE sha256 = ?1", params![digest])?;
-            }
-        }
-        Ok(removed)
+        Self::delete_unheld(&conn, &candidates)
     }
 
     /// The disclosed content of every report joined to a case — what

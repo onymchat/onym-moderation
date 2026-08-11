@@ -271,6 +271,16 @@ impl Triage {
             );
         }
 
+        // Guarded on the *report's* images alone. The accused's
+        // counter-evidence is handled below, because the two mean
+        // different things here: a model that cannot see the
+        // accusation cannot judge it, whereas a model that cannot see
+        // a rebuttal has merely been shown less than everything.
+        //
+        // Merging them let the accused end their own case. A case over
+        // the budget is never decided, and the deadline dismisses by
+        // default — so attaching one photo to a response immunised a
+        // pure-text case in front of a text-only profile, permanently.
         if !document.images.is_empty()
             && (!profile.supports_images || document.images.len() as u32 > profile.max_images)
         {
@@ -306,9 +316,36 @@ impl Triage {
             );
         }
 
+        // Counter-evidence fills whatever budget the report's images
+        // leave, in filing order.
+        //
+        // The cost is real and worth naming: a model can now decide
+        // without having seen a rebuttal photo. It is the lesser evil —
+        // the alternative hands the accused a dismissal for attaching
+        // anything at all — and it is not silent. Every counter-evidence
+        // image is named by digest in the case document either way, so
+        // the input digest covers its existence; the note below records
+        // which ones were not shown; and the merits reach a human on
+        // appeal, where the picture is in the panel.
+        let headroom = (profile.max_images as usize).saturating_sub(document.images.len());
+        let shown_responses = if profile.supports_images { headroom } else { 0 };
+        let withheld: Vec<&crate::casedoc::DocumentImage> =
+            document.response_images.iter().skip(shown_responses).collect();
+        let withheld_note = if withheld.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " {} counter-evidence image(s) were not shown to the model, above this                  profile's limit of {}: {}",
+                withheld.len(),
+                profile.max_images,
+                withheld.iter().map(|i| i.sha256.as_str()).collect::<Vec<_>>().join(", ")
+            )
+        };
+
         let derivatives = document
             .images
             .iter()
+            .chain(document.response_images.iter().take(shown_responses))
             .map(|image| {
                 state
                     .store
@@ -400,7 +437,12 @@ impl Triage {
             );
         }
 
-        let assessed = profile.evaluate(&case.class_id, &output);
+        let mut assessed = profile.evaluate(&case.class_id, &output);
+        // Recorded on the assessment, not left to be derived from the
+        // profile's limit and the document's image list. An appeal
+        // reviewer should be told what the model was not shown, not
+        // have to work it out.
+        assessed.note.push_str(&withheld_note);
 
         self.record(state, case, profile, &output.text, &document, assessed, now)
     }
@@ -1147,6 +1189,129 @@ mod tests {
         let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
         assert_eq!(assessment.outcome, "no-decision");
         assert!(assessment.note.contains("cannot inspect"), "{}", assessment.note);
+    }
+
+    /// Attach a photo to the accused's response.
+    fn attach_response_photo(store: &crate::store::Store, size: u32) -> crate::media::AcceptedImage {
+        let bytes = crate::media::tiny_jpeg(size, size);
+        let accepted = crate::media::accept_image(&bytes).unwrap();
+        store
+            .put_evidence_blob(&accepted, &bytes, "2026-08-05T00:00:00Z", "onym:key:acc")
+            .unwrap();
+        store.attach_evidence_blobs("c1", &[accepted.sha256.clone()]).unwrap();
+        let content = format!(
+            r#"{{"body":"","group_binding":"ab","media":[{{"blob_sha256":"cipher","height":{},"mime_type":"image/jpeg","plaintext_byte_length":{},"plaintext_sha256":"{}","width":{}}}],"message_id":"m-r","proof_version":2,"sent_at_millis":9}}"#,
+            accepted.height, accepted.byte_length, accepted.sha256, accepted.width
+        );
+        let response = serde_json::json!({
+            "caseId": "c1",
+            "statement": "context you are missing",
+            "evidence": [{"disclosedContent": content, "authenticityProof": "sig"}],
+        });
+        let case = store.case("c1").unwrap().unwrap();
+        store
+            .put_response(&crate::store::ResponseFiling {
+                case: &case,
+                raw: &serde_json::to_vec(&response).unwrap(),
+                late: false,
+                filed_at: "2026-08-05T00:00:00Z",
+                event_kind: "response",
+                event_detail: "",
+                limit: 32,
+            })
+            .unwrap();
+        accepted
+    }
+
+    /// The accused must not be able to end their own case.
+    ///
+    /// A case over the image budget is never decided, and the deadline
+    /// dismisses by default — so while counter-evidence counted against
+    /// that budget, attaching one photo to a response immunised a
+    /// pure-text case in front of a text-only profile, permanently.
+    #[tokio::test]
+    async fn a_photo_in_the_response_cannot_immunise_a_text_case() {
+        let (url, seen) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Sexual Content or Sexual Acts"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "unsolicited-pornography", "2026-08-04T00:00:00Z");
+        // qwen3guard-8b takes no images at all.
+        let rebuttal = attach_response_photo(&store, 10);
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let case = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(
+            case.disposition.as_deref(),
+            Some("ban"),
+            "a rebuttal photo must not make a text case undecidable"
+        );
+
+        // The model was asked, and asked with text only.
+        let request = &seen.lock().unwrap()[0];
+        assert!(request["messages"][0]["content"].is_string());
+
+        // And the record says what it was not shown.
+        let (raw, _) = state.store.assessment("c1").unwrap().unwrap();
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert!(
+            assessment.note.contains(&rebuttal.sha256),
+            "the withheld image must be named on the assessment: {}",
+            assessment.note
+        );
+    }
+
+    /// Budget order: the report's images first, then whatever
+    /// counter-evidence fits.
+    #[tokio::test]
+    async fn counter_evidence_fills_the_budget_the_report_leaves() {
+        let (url, seen) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "unsafe\nS12"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "unsolicited-pornography", "2026-08-04T00:00:00Z");
+        let reported = attach_photo(&store, "unsolicited-pornography");
+        let rebuttal = attach_response_photo(&store, 14);
+        // llama-guard-4-12b takes three: one reported, so two spare.
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "llama-guard-4-12b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let request = &seen.lock().unwrap()[0];
+        let parts = request["messages"][0]["content"].as_array().unwrap();
+        let images: Vec<&str> = parts
+            .iter()
+            .filter(|p| p["type"] == "image_url")
+            .map(|p| p["image_url"]["url"].as_str().unwrap())
+            .collect();
+        assert_eq!(images.len(), 2, "the report's image and the rebuttal both fit");
+
+        let decoded = |url: &str| {
+            use base64::Engine;
+            let encoded = url.trim_start_matches("data:image/jpeg;base64,");
+            util::sha256_hex(
+                &base64::engine::general_purpose::STANDARD.decode(encoded).unwrap(),
+            )
+        };
+        // Report first, rebuttal second.
+        assert_eq!(decoded(images[0]), reported.derivative_sha256);
+        assert_eq!(decoded(images[1]), rebuttal.derivative_sha256);
     }
 
     /// Evidence the record commits to but cannot produce.

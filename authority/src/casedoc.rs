@@ -53,9 +53,19 @@ pub struct CaseDocument {
     pub digest: String,
     pub evidence_items: usize,
     pub response_items: usize,
-    /// Ordered derivatives to send alongside the text, empty for a
-    /// text-only case.
+    /// The report's images, in evidence order.
+    ///
+    /// Kept separate from the accused's counter-evidence because the
+    /// modality guard means something different about each. A model
+    /// that cannot see *these* cannot judge the allegation at all. One
+    /// merged list made the guard unable to tell an accusation it
+    /// could not read from a defence it could not read — and since a
+    /// case over the image budget is never decided, that let the
+    /// accused end their own case by attaching a photo to a response.
     pub images: Vec<DocumentImage>,
+    /// The accused's counter-evidence images, in filing order. Sent
+    /// only in whatever budget the report's images leave.
+    pub response_images: Vec<DocumentImage>,
     /// Media the record commits to but whose bytes are gone. A case
     /// with any must not be decided: the model would be answering about
     /// evidence nobody can produce.
@@ -77,6 +87,7 @@ pub fn build(store: &Store, case: &CaseRecord) -> Result<CaseDocument, Error> {
     let responses = store.responses(&case.case_id)?;
 
     let mut images: Vec<DocumentImage> = Vec::new();
+    let mut response_images: Vec<DocumentImage> = Vec::new();
     let mut unresolved_media = 0usize;
     let mut reported = String::new();
     for (index, item) in evidence.iter().enumerate() {
@@ -135,7 +146,7 @@ pub fn build(store: &Store, case: &CaseRecord) -> Result<CaseDocument, Error> {
                         store,
                         content,
                         &format!("counter-evidence {}", index + 1),
-                        &mut images,
+                        &mut response_images,
                         &mut unresolved_media,
                     )?);
                     response_text.push_str(&format!("{}\n", fence(content)));
@@ -165,6 +176,7 @@ pub fn build(store: &Store, case: &CaseRecord) -> Result<CaseDocument, Error> {
         evidence_items: evidence.len(),
         response_items,
         images,
+        response_images,
         unresolved_media,
     })
 }
@@ -505,9 +517,12 @@ mod tests {
         let doc = build(&store, &case()).unwrap();
 
         assert_eq!(doc.unresolved_media, 0);
-        assert_eq!(doc.images.len(), 2, "the report's photo and the accused's rebuttal");
+        // Separate lists: the guard means something different about
+        // each, and merging them let a rebuttal end the case.
+        assert_eq!(doc.images.len(), 1, "the report's photo");
         assert_eq!(doc.images[0].sha256, image.sha256);
-        assert_eq!(doc.images[1].sha256, rebuttal.sha256);
+        assert_eq!(doc.response_images.len(), 1, "the accused's rebuttal");
+        assert_eq!(doc.response_images[0].sha256, rebuttal.sha256);
         assert!(doc.text.contains("counter-evidence 1"));
         assert!(doc.text.contains(&rebuttal.derivative_sha256));
     }

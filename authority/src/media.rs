@@ -34,12 +34,17 @@ use serde::Deserialize;
 /// that would make holding the bytes in memory to hash them a problem.
 pub const MAX_EVIDENCE_BLOB_BYTES: usize = 4 * 1024 * 1024;
 
-/// Hard cap on committed media across one report, applied before any
+/// Hard cap on committed media in one filing — a report, or one
+/// response — applied before any
 /// database lookup. A signed preimage is attacker-authored — nothing
 /// stops the accused signing one naming a thousand blobs — so the count
 /// is bounded before it can become work. The pinned model profile's own
 /// maximum applies on top of this and is usually much smaller.
-pub const MAX_MEDIA_PER_REPORT: usize = 8;
+pub const MAX_MEDIA_PER_FILING: usize = 8;
+
+/// Hard cap across a whole case. A case holds many filings, so the
+/// per-filing bound alone does not bound the case.
+pub const MAX_MEDIA_PER_CASE: usize = 24;
 
 /// Decoded-pixel ceiling. A few hundred kilobytes of PNG can describe a
 /// billion pixels, so the byte-length limit alone does not bound the

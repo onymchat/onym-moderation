@@ -627,12 +627,21 @@ Reference implementation. Known limits:
   carrying images rather than classifying its captions. Video, album
   and voice attachments are signed at send time but no authority
   accepts them yet, so those cases still wait for a human.
-- **`csam` does not accept image evidence.** The class is refused with
-  `media_class_refused` and text reports for it are unaffected. Taking
-  the bytes would make this authority a custodian of illegal imagery
-  while its retention machinery is still the minimum below and it has
-  no statutory-reporting path — so the refusal is about readiness, not
-  about the report.
+- **`csam` does not accept image evidence, and does briefly hold it.**
+  The class is refused with `media_class_refused` and text reports for
+  it are unaffected. The refusal is about readiness rather than about
+  the report: adjudicating the class on imagery would mean retaining it
+  through a case and an appeal, and this authority has neither a
+  published retention schedule nor a statutory-reporting path.
+
+  Be precise about what that does *not* mean. Evidence bytes arrive on
+  their own content-addressed route, which carries no class, so an
+  image is decoded, normalized and written before any report names the
+  class it is claimed under. This authority therefore does receive it.
+  What it does not do is keep it: the refusal deletes the blob — the
+  original and the derivative — before it returns, unless another live
+  case rests on the same digest. Custody is bounded by the request, not
+  by the expiry window.
 - **Media retention is a sweep, not a published schedule.** Uploads
   nobody reported expire after 24 hours and are bounded per key while
   they wait. A decided case's images are deleted once the later of its
