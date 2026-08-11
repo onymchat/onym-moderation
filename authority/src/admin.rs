@@ -83,7 +83,7 @@ async fn login(
     };
     if !constant_time_eq(form.token.as_bytes(), expected.as_bytes()) {
         // No detail about which part was wrong.
-        return Ok((StatusCode::UNAUTHORIZED, Html(login_page(true))).into_response());
+        return Ok((StatusCode::UNAUTHORIZED, panel_response(login_page(true))).into_response());
     }
 
     let session = util::sha256_hex(uuid::Uuid::new_v4().as_bytes());
@@ -119,7 +119,7 @@ async fn audit_log(
     headers: HeaderMap,
 ) -> Result<Response, Error> {
     if !authenticated(&state, &headers) {
-        return Ok(Html(login_page(false)).into_response());
+        return Ok(panel_response(login_page(false)));
     }
 
     let events = state.store.recent_events(200)?;
@@ -150,7 +150,7 @@ async fn audit_log(
     }
     body.push_str("</main>");
 
-    Ok(Html(page("Audit log — moderation authority", &body)).into_response())
+    Ok(panel_response(page("Audit log — moderation authority", &body)))
 }
 
 // ─── Device recovery claims ──────────────────────────────────────────
@@ -160,7 +160,7 @@ async fn recovery_queue(
     headers: HeaderMap,
 ) -> Result<Response, Error> {
     if !authenticated(&state, &headers) {
-        return Ok(Html(login_page(false)).into_response());
+        return Ok(panel_response(login_page(false)));
     }
 
     let claims = state.store.open_recovery_claims()?;
@@ -194,7 +194,7 @@ async fn recovery_queue(
     }
     body.push_str("</main>");
 
-    Ok(Html(page("Recovery claims — moderation authority", &body)).into_response())
+    Ok(panel_response(page("Recovery claims — moderation authority", &body)))
 }
 
 async fn recovery_claim_detail(
@@ -203,7 +203,7 @@ async fn recovery_claim_detail(
     headers: HeaderMap,
 ) -> Result<Response, Error> {
     if !authenticated(&state, &headers) {
-        return Ok(Html(login_page(false)).into_response());
+        return Ok(panel_response(login_page(false)));
     }
     let claim = state
         .store
@@ -267,7 +267,7 @@ async fn recovery_claim_detail(
     }
     body.push_str("<p><a href=/admin/recovery>← recovery claims</a></p></main>");
 
-    Ok(Html(page("Recovery claim — moderation authority", &body)).into_response())
+    Ok(panel_response(page("Recovery claim — moderation authority", &body)))
 }
 
 #[derive(Deserialize)]
@@ -285,7 +285,7 @@ async fn recovery_claim_decide(
     Form(form): Form<RecoveryDecisionForm>,
 ) -> Result<Response, Error> {
     if !authenticated(&state, &headers) {
-        return Ok(Html(login_page(false)).into_response());
+        return Ok(panel_response(login_page(false)));
     }
     let claim = state
         .store
@@ -372,7 +372,7 @@ async fn recovery_claim_decide(
 
 async fn index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Response, Error> {
     if !authenticated(&state, &headers) {
-        return Ok(Html(login_page(false)).into_response());
+        return Ok(panel_response(login_page(false)));
     }
 
     let appeals = state.store.cases_awaiting_appeal_review()?;
@@ -439,7 +439,7 @@ async fn index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result
     body.push_str(&case_table(&recent));
     body.push_str("</section></main>");
 
-    Ok(Html(page("Queue — moderation authority", &body)).into_response())
+    Ok(panel_response(page("Queue — moderation authority", &body)))
 }
 
 /// The work queue, with the clock showing.
@@ -571,7 +571,7 @@ async fn case_detail(
     headers: HeaderMap,
 ) -> Result<Response, Error> {
     if !authenticated(&state, &headers) {
-        return Ok(Html(login_page(false)).into_response());
+        return Ok(panel_response(login_page(false)));
     }
     let case = state
         .store
@@ -647,7 +647,7 @@ async fn case_detail(
     body.push_str(&review_form(&case));
     body.push_str("<p><a href=/admin>← queue</a></p></main>");
 
-    Ok(Html(page(&format!("Case {} — moderation authority", case.case_id), &body)).into_response())
+    Ok(panel_response(page(&format!("Case {} — moderation authority", case.case_id), &body)))
 }
 
 fn initial_decision_form(case: &CaseRecord) -> String {
@@ -694,7 +694,7 @@ async fn initial_decision(
     Form(form): Form<InitialDecisionForm>,
 ) -> Result<Response, Error> {
     if !authenticated(&state, &headers) {
-        return Ok(Html(login_page(false)).into_response());
+        return Ok(panel_response(login_page(false)));
     }
 
     let disposition = Disposition::parse(&form.outcome)?;
@@ -1100,7 +1100,7 @@ async fn review(
     Form(form): Form<ReviewForm>,
 ) -> Result<Response, Error> {
     if !authenticated(&state, &headers) {
-        return Ok(Html(login_page(false)).into_response());
+        return Ok(panel_response(login_page(false)));
     }
     if form.reasoning.trim().is_empty() {
         return Err(Error::BadRequest("reasoning is required".into()));
@@ -1277,6 +1277,33 @@ fn escape(raw: &str) -> String {
 /// The document shell. `body` is everything inside `<body>` — the
 /// header chrome included — because the signed-in pages carry one and
 /// the sign-in gate deliberately does not.
+/// Every panel response, with the headers a `<meta>` tag cannot carry.
+///
+/// `frame-ancestors` is ignored in a meta-tag CSP, so the policy in the
+/// document says nothing about framing however complete it looks. The
+/// panel's forms decide cases and issue bans; they are POST-only and
+/// the session cookie is `SameSite=Strict`, which already stops a
+/// cross-site frame carrying it — but "the cookie policy happens to
+/// cover it" is a thinner guarantee than saying so outright.
+///
+/// The CSP is repeated as a real header for the same reason: a header
+/// is what the browser is obliged to honour.
+fn panel_response(html: String) -> Response {
+    (
+        [
+            (axum::http::header::X_FRAME_OPTIONS, "DENY"),
+            (axum::http::header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
+            (axum::http::header::REFERRER_POLICY, "no-referrer"),
+        ],
+        Html(html),
+    )
+        .into_response()
+}
+
+/// Shared by the header and the in-document copy, so they cannot drift.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src data:; \
+     style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+
 fn page(title: &str, body: &str) -> String {
     // The panel's rule that it fetches nothing, stated to the browser
     // rather than only to the reader. Evidence is untrusted text that a
@@ -1286,8 +1313,7 @@ fn page(title: &str, body: &str) -> String {
     // `data:` URIs, and no connections anywhere.
     format!(
         "<!doctype html><html lang=en><head><meta charset=utf-8>\
-         <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; \
-         img-src data:; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'\">\
+         <meta http-equiv=\"Content-Security-Policy\" content=\"{CONTENT_SECURITY_POLICY}\">\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <title>{title}</title><style>{STYLE}</style></head><body>{body}</body></html>",
         title = escape(title),

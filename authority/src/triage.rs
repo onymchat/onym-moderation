@@ -276,7 +276,7 @@ impl Triage {
         // Intake now declines image evidence outright when the pinned
         // profile is text-only, so reaching here means a case that
         // predates that check — a backstop, not the main defence.
-        if !profile.supports_images && !document.images.is_empty() {
+        if !profile.reviews_images() && !document.images.is_empty() {
             return self.record(
                 state,
                 case,
@@ -288,7 +288,7 @@ impl Triage {
                     score: None,
                     labels: Vec::new(),
                     note: format!(
-                        "case {} carries image evidence and profile {} cannot inspect images; \
+                        "case {} carries image evidence and profile {} cannot review images; \
                          classifying only the text would misrepresent what was reviewed",
                         case.case_id, profile.id
                     ),
@@ -1138,7 +1138,7 @@ mod tests {
     fn attach_photo(store: &crate::store::Store, class_id: &str) -> crate::media::AcceptedImage {
         let bytes = crate::media::tiny_jpeg(20, 12);
         let accepted = crate::media::accept_image(&bytes).unwrap();
-        store.put_evidence_blob(&accepted, &bytes, "2026-08-02T00:00:00Z", "onym:key:uploader").unwrap();
+        store.put_evidence_blob(&accepted, &bytes, "2026-08-02T00:00:00Z", "onym:key:uploader", usize::MAX).unwrap();
         store.touch_evidence_blobs(&[accepted.sha256.clone()], "2026-08-01T00:00:00Z").unwrap();
         store.attach_evidence_blobs("c1", &[accepted.sha256.clone()]).unwrap();
         let content = format!(
@@ -1197,7 +1197,7 @@ mod tests {
         assert!(!applied);
         let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
         assert_eq!(assessment.outcome, "no-decision");
-        assert!(assessment.note.contains("cannot inspect"), "{}", assessment.note);
+        assert!(assessment.note.contains("cannot review images"), "{}", assessment.note);
     }
 
     /// Attach several report photos to the open case.
@@ -1212,7 +1212,7 @@ mod tests {
             let bytes = crate::media::tiny_jpeg(20 + slot as u32, 12);
             let image = crate::media::accept_image(&bytes).unwrap();
             store
-                .put_evidence_blob(&image, &bytes, "2026-08-02T00:00:00Z", "onym:key:rep")
+                .put_evidence_blob(&image, &bytes, "2026-08-02T00:00:00Z", "onym:key:rep", usize::MAX)
                 .unwrap();
             store.attach_evidence_blobs("c1", &[image.sha256.clone()]).unwrap();
             entries.push(format!(
@@ -1243,7 +1243,7 @@ mod tests {
         let bytes = crate::media::tiny_jpeg(size, size);
         let accepted = crate::media::accept_image(&bytes).unwrap();
         store
-            .put_evidence_blob(&accepted, &bytes, "2026-08-05T00:00:00Z", "onym:key:acc")
+            .put_evidence_blob(&accepted, &bytes, "2026-08-05T00:00:00Z", "onym:key:acc", usize::MAX)
             .unwrap();
         store.attach_evidence_blobs("c1", &[accepted.sha256.clone()]).unwrap();
         let content = format!(

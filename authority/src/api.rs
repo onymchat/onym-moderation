@@ -102,6 +102,9 @@ fn verify_media_evidence(
     class_id: &str,
     evidence: &[EvidenceItem],
     already_on_case: usize,
+    // `filer`: the key filing this report or response. A refusal may
+    // delete only this key's own pending uploads.
+    filer: &str,
 ) -> Result<Vec<String>, Error> {
     // Three passes, in this order, and the order is the point.
     //
@@ -150,10 +153,10 @@ fn verify_media_evidence(
     // blobs no case rests on: a digest a live case depends on is not
     // this filing's to take.
     let refusal = if CLASSES_REFUSING_MEDIA.contains(&class_id) {
-        Some(format!(
+        Some(Error::MediaClassRefused(format!(
             "class {class_id:?} does not accept media evidence at this authority"
-        ))
-    } else if state.config.triage.as_ref().is_some_and(|t| !t.profile.supports_images) {
+        )))
+    } else if state.config.triage.as_ref().is_some_and(|t| !t.profile.reviews_images()) {
         // The pinned model cannot inspect an image, so this authority
         // cannot adjudicate one. Refusing at intake — rather than
         // taking the evidence and declining to decide later — is what
@@ -161,17 +164,23 @@ fn verify_media_evidence(
         // that can never be decided is dismissed at its deadline, and
         // anyone able to file against this accused could reach that by
         // attaching a picture.
-        Some(format!(
-            "this authority's pinned model profile cannot review images, so it does not accept              image evidence; a text report for {class_id:?} is unaffected"
-        ))
+        // Its own code, not the class refusal above. The class refuses
+        // nothing here — this deployment's pinned model does — and the
+        // two mean different things to a client: one says no authority
+        // will ever take images for this class, the other says another
+        // authority would.
+        Some(Error::MediaUnreviewable(format!(
+            "this authority's pinned model profile cannot review images, so it does not accept \
+             image evidence; a text report for {class_id:?} is unaffected"
+        )))
     } else {
         None
     };
     if let Some(reason) = refusal {
         let named: Vec<String> =
             committed.iter().map(|(_, c)| c.plaintext_sha256.clone()).collect();
-        state.store.delete_unheld_evidence_blobs(&named)?;
-        return Err(Error::MediaClassRefused(reason));
+        state.store.delete_own_unheld_evidence_blobs(filer, &named)?;
+        return Err(reason);
     }
 
     let mut digests = Vec::new();
@@ -189,7 +198,8 @@ fn verify_media_evidence(
         // signature that never covered them.
         let (Some(width), Some(height)) = (commitment.width, commitment.height) else {
             return Err(Error::AuthenticityUnverified(format!(
-                "evidence item {index} commits to an image without dimensions; they are shown                  as attested and must be signed"
+                "evidence item {index} commits to an image without dimensions; they are shown \
+                 as attested and must be signed"
             )));
         };
         let stored = state.store.evidence_blob(&commitment.plaintext_sha256)?.ok_or_else(|| {
@@ -296,7 +306,13 @@ async fn put_evidence_blob(
         )));
     }
 
-    state.store.put_evidence_blob(&accepted, &body, &util::format_timestamp(now), key)?;
+    state.store.put_evidence_blob(
+        &accepted,
+        &body,
+        &util::format_timestamp(now),
+        key,
+        MAX_UNREFERENCED_UPLOADS_PER_KEY,
+    )?;
 
     Ok(Json(json!({
         "sha256": accepted.sha256,
@@ -646,8 +662,13 @@ async fn file_report(
         Some(case) => state.store.case_media_count(&case.case_id)?,
         None => 0,
     };
-    let media_digests =
-        verify_media_evidence(&state, &report.class_id, &report.evidence, already_on_case)?;
+    let media_digests = verify_media_evidence(
+        &state,
+        &report.class_id,
+        &report.evidence,
+        already_on_case,
+        &report.reporter,
+    )?;
 
     let evidence_summary = report_evidence_summary(&report)?;
 
@@ -1081,6 +1102,7 @@ async fn respond(
         &case.class_id,
         &response.evidence,
         state.store.case_media_count(&case_id)?,
+        &case.accused,
     )?;
 
     let now = OffsetDateTime::now_utc();
@@ -2280,7 +2302,9 @@ mod tests {
         let (status, response) = harness.post("/v1/reports", body).await;
 
         assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
-        assert_eq!(response["error"], "media_class_refused");
+        // Its own code: the class refuses nothing here, this deployment
+        // does, and another authority would take the same report.
+        assert_eq!(response["error"], "media_unreviewable");
         assert!(harness.state.store.evidence_blob(&accepted.sha256).unwrap().is_none());
     }
 
@@ -2323,6 +2347,71 @@ mod tests {
 
         assert_eq!(images_on_case, media::MAX_MEDIA_PER_CASE);
         assert_eq!(last_status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_cannot_delete_someone_elses_pending_evidence() {
+        // The digests in a preimage are written by the sender of the
+        // photo, who therefore knows the digest of bytes somebody else
+        // is about to report them for. Unscoped, a refusal was a way to
+        // delete another party's upload before their report landed —
+        // and on a loop, to make sure no report about that photo could
+        // ever be filed.
+        let harness = Harness::new();
+        let (mandate, victim_upload, content) = seed_photo(&harness).await;
+
+        // The accused self-files under a class that declines media,
+        // naming the reporter's uploaded-but-unattached blob.
+        let mut self_report = json!({
+            "reportVersion": 1,
+            "reportId": "r-self",
+            "reporter": testing::key_reference(ACCUSED_SEED),
+            "reporterMandate": mandate,
+            "accused": testing::key_reference(ACCUSED_SEED),
+            "classId": "csam",
+            "evidence": [{
+                "disclosedContent": content,
+                "authenticityProof": testing::sign(ACCUSED_SEED, content.as_bytes()),
+            }],
+            "filedAt": "2026-08-02T00:00:00Z",
+        });
+        self_report["reporterMandate"] =
+            json!(register_mandate(&harness, ACCUSED_SEED).await);
+
+        let (status, _) =
+            harness.post("/v1/reports", signed(self_report, "signature", &[ACCUSED_SEED])).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "the class still refuses");
+
+        assert!(
+            harness.state.store.evidence_blob(&victim_upload.sha256).unwrap().is_some(),
+            "a refusal must not take an upload the filer did not make"
+        );
+
+        // And the reporter's own report still files.
+        let body =
+            signed(photo_report_json(&mandate, "r-1", &content), "signature", &[REPORTER_SEED]);
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_profile_claiming_images_but_permitting_none_is_text_only() {
+        // `maxImages` defaults to zero, so a custom profile can set
+        // `supportsImages` and still permit no picture. Reading only the
+        // flag let intake accept the image and the model be asked
+        // without it — the answer then recorded as a review of evidence
+        // it never saw.
+        let profile = crate::profiles::by_id("qwen3guard-8b").unwrap();
+        assert!(!profile.reviews_images());
+
+        let mut claims_support = crate::profiles::by_id("llama-guard-4-12b").unwrap();
+        claims_support.max_images = 0;
+        assert!(claims_support.supports_images);
+        assert!(
+            !claims_support.reviews_images(),
+            "a profile permitting zero images cannot review one, whatever the flag says"
+        );
+        assert!(claims_support.request_body("csam", "d", &[vec![1]]).is_err());
     }
 
     #[tokio::test]

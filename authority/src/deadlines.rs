@@ -264,7 +264,7 @@ mod tests {
     fn store_image(store: &Store, uploaded_at: &str) -> String {
         let bytes = crate::media::tiny_jpeg(10, 10);
         let accepted = crate::media::accept_image(&bytes).unwrap();
-        store.put_evidence_blob(&accepted, &bytes, uploaded_at, "onym:key:uploader").unwrap();
+        store.put_evidence_blob(&accepted, &bytes, uploaded_at, "onym:key:uploader", usize::MAX).unwrap();
         accepted.sha256
     }
 

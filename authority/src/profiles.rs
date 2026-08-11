@@ -193,17 +193,24 @@ pub struct ModelProfile {
     ///
     /// Consented, not configured. Each profile document states the
     /// inputs it enables, and that wording is inside the digest a
-    /// mandate pins — so a text-only profile shown an image must return
-    /// no decision rather than classify the caption and present the
-    /// result as though the picture had been reviewed.
+    /// mandate pins — so a profile that cannot review a picture must
+    /// return no decision rather than classify the caption and present
+    /// the result as though the picture had been reviewed.
+    ///
+    /// Never read directly for that decision — use `reviews_images()`,
+    /// which also accounts for a profile that claims support and then
+    /// permits zero images.
     pub supports_images: bool,
     /// How many images the profile's document says the model takes.
     /// Zero for text-only profiles.
     ///
     /// Defaulted so a custom profile written before media evidence
-    /// existed still loads — and defaults to zero, which means its
-    /// cases with images return no decision. An operator who wants a
-    /// custom profile to see images has to say so.
+    /// existed still loads. A custom profile that sets
+    /// `supportsImages` and omits this therefore lands on zero, and
+    /// `reviews_images()` treats that as text-only — otherwise the
+    /// budget arithmetic would send no picture and record the answer as
+    /// a review of one, which is exactly the failure the flag exists to
+    /// prevent.
     #[serde(default)]
     pub max_images: u32,
     /// Where images sit relative to the text. Genuinely per-profile:
@@ -351,6 +358,17 @@ impl ModelProfile {
         }
     }
 
+    /// Whether this profile can actually be shown a picture.
+    ///
+    /// Both halves matter, and a caller that checks only the flag has a
+    /// bug: `supportsImages` with no `maxImages` is a real configuration
+    /// — the field defaults — and it means the model is asked with no
+    /// image while the record says its answer was a review of the
+    /// evidence.
+    pub fn reviews_images(&self) -> bool {
+        self.supports_images && self.max_images > 0
+    }
+
     /// Build the request body for one case document.
     ///
     /// `images` are the normalized derivatives, in document order. A
@@ -363,7 +381,7 @@ impl ModelProfile {
         document: &str,
         images: &[Vec<u8>],
     ) -> Result<Value, String> {
-        if !images.is_empty() && !self.supports_images {
+        if !images.is_empty() && !self.reviews_images() {
             return Err(format!(
                 "profile {} takes no images but was given {}",
                 self.id,

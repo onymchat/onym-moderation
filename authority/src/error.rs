@@ -77,6 +77,16 @@ pub enum Error {
     #[error("media_quota_exceeded: {0}")]
     MediaQuotaExceeded(String),
 
+    /// This deployment's pinned model profile cannot review an image,
+    /// so it does not accept image evidence at all.
+    ///
+    /// Distinct from `media_class_refused`, which says a *class* takes
+    /// no media anywhere. This one is a property of the authority: the
+    /// same report filed at an authority pinned to an image-capable
+    /// profile would be accepted.
+    #[error("media_unreviewable: {0}")]
+    MediaUnreviewable(String),
+
     /// The class does not accept media evidence at this authority.
     /// `csam` is refused deliberately: accepting the bytes would make
     /// this authority a custodian of illegal imagery before it has the
@@ -107,6 +117,7 @@ impl Error {
             Error::MediaUnsupported(_) => "media_unsupported",
             Error::MediaTooLarge(_) => "media_too_large",
             Error::MediaQuotaExceeded(_) => "media_quota_exceeded",
+            Error::MediaUnreviewable(_) => "media_unreviewable",
             Error::MediaClassRefused(_) => "media_class_refused",
             Error::NotFound(_) => "not_found",
             Error::Internal(_) => "internal_error",
@@ -151,7 +162,7 @@ impl Error {
             // Retryable, but only after the caller files or abandons
             // what it is already holding.
             Error::MediaQuotaExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
-            Error::MediaClassRefused(_) => StatusCode::FORBIDDEN,
+            Error::MediaUnreviewable(_) | Error::MediaClassRefused(_) => StatusCode::FORBIDDEN,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }

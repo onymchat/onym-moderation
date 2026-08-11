@@ -1495,14 +1495,44 @@ impl Store {
     /// the same bytes is the same row. A client retrying an interrupted
     /// upload, or two reporters who received the same photo, both land
     /// here without a conflict to resolve.
+    /// Store an accepted upload, refusing if this key is already at its
+    /// unattached-upload bound.
+    ///
+    /// The bound is enforced here, under the same lock as the insert,
+    /// rather than only by the caller's earlier check. Read-then-insert
+    /// let concurrent uploads from one key all pass the count at 15 of
+    /// 16 and overshoot together. The caller's check stays as a cheap
+    /// early refusal — it avoids decoding an image that is going to be
+    /// rejected — but this one is the authority.
     pub fn put_evidence_blob(
         &self,
         image: &crate::media::AcceptedImage,
         original: &[u8],
         uploaded_at: &str,
         uploaded_by: &str,
+        max_unattached: usize,
     ) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
+        let existing: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM evidence_blobs WHERE sha256 = ?1",
+            params![image.sha256],
+            |row| row.get(0),
+        )?;
+        if existing == 0 {
+            let held: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM evidence_blobs \
+                 WHERE uploaded_by = ?1 \
+                   AND sha256 NOT IN (SELECT sha256 FROM evidence_blob_cases)",
+                params![uploaded_by],
+                |row| row.get(0),
+            )?;
+            if held as usize >= max_unattached {
+                return Err(Error::MediaQuotaExceeded(format!(
+                    "this key already holds {max_unattached} uploads no case rests on; file or \
+                     abandon those before uploading more"
+                )));
+            }
+        }
         conn.execute(
             // Upsert rather than ignore. A re-upload answers 200, and
             // that answer has to mean the bytes are here *and* will
@@ -1668,14 +1698,41 @@ impl Store {
         Ok(out)
     }
 
-    /// Delete these blobs unless some case still rests on them.
+    /// Delete this uploader's blobs among `digests`, unless some case
+    /// still rests on them.
     ///
-    /// Shared by retention and by the refusal path: a class that
-    /// declines media should not leave the bytes sitting for a day, and
-    /// neither caller may take a digest another live case depends on.
-    pub fn delete_unheld_evidence_blobs(&self, digests: &[String]) -> Result<usize, Error> {
+    /// Scoped to `uploaded_by` because the digests come from a signed
+    /// preimage, and a preimage is written by the sender of the photo —
+    /// who therefore knows the digest of bytes somebody *else* is about
+    /// to report them for. Unscoped, a refusal was a way to delete
+    /// another party's pending evidence: self-file under a class that
+    /// declines media, name their digest, and their upload is gone
+    /// before their report lands. On a loop, no report about that photo
+    /// could ever be filed.
+    ///
+    /// The scope costs nothing in the case this exists for: in a
+    /// genuine refusal the uploader and the filer are the same key.
+    pub fn delete_own_unheld_evidence_blobs(
+        &self,
+        uploader: &str,
+        digests: &[String],
+    ) -> Result<usize, Error> {
         let conn = self.conn.lock().unwrap();
-        Self::delete_unheld(&conn, digests)
+        let mut removed = 0;
+        for digest in digests {
+            let held: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM evidence_blob_cases WHERE sha256 = ?1",
+                params![digest],
+                |row| row.get(0),
+            )?;
+            if held == 0 {
+                removed += conn.execute(
+                    "DELETE FROM evidence_blobs WHERE sha256 = ?1 AND uploaded_by = ?2",
+                    params![digest, uploader],
+                )?;
+            }
+        }
+        Ok(removed)
     }
 
     fn delete_unheld(conn: &Connection, digests: &[String]) -> Result<usize, Error> {

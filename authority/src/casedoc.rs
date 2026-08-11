@@ -425,7 +425,7 @@ mod tests {
             accepted.height, accepted.byte_length, accepted.sha256, accepted.width
         );
         let store = store_with_report(&content, None);
-        store.put_evidence_blob(&accepted, &bytes, "2026-08-02T00:00:00Z", "onym:key:uploader").unwrap();
+        store.put_evidence_blob(&accepted, &bytes, "2026-08-02T00:00:00Z", "onym:key:uploader", usize::MAX).unwrap();
         (store, accepted)
     }
 
@@ -491,7 +491,7 @@ mod tests {
         let rebuttal_bytes = crate::media::tiny_jpeg(9, 9);
         let rebuttal = crate::media::accept_image(&rebuttal_bytes).unwrap();
         store
-            .put_evidence_blob(&rebuttal, &rebuttal_bytes, "2026-08-05T00:00:00Z", "onym:key:acc")
+            .put_evidence_blob(&rebuttal, &rebuttal_bytes, "2026-08-05T00:00:00Z", "onym:key:acc", usize::MAX)
             .unwrap();
         let content = format!(
             r#"{{"body":"","group_binding":"ab","media":[{{"blob_sha256":"cipher","height":{},"mime_type":"image/jpeg","plaintext_byte_length":{},"plaintext_sha256":"{}","width":{}}}],"message_id":"m-2","proof_version":2,"sent_at_millis":2}}"#,
