@@ -1203,11 +1203,24 @@ async fn respond(
     // Counter-evidence carrying media goes through exactly the checks
     // the report's evidence did. The accused answering a photo with a
     // photo is the same kind of claim, and it earns the same scrutiny.
+    // The case's *pinned* mandate, not the accused's latest one. A case
+    // is judged under the terms it was opened under, and the response is
+    // part of that case: re-consenting between opening and answering
+    // must not move the preservation period its media is held to, which
+    // is what `place_preservation`'s own contract requires. Resolving
+    // the newest mandate here also made an open case insufficient to
+    // answer — a user who withdrew consent after being reported would
+    // hit `no_jurisdiction` on their own defence.
+    //
+    // A case cannot exist without its mandate row, so absence is a
+    // broken invariant rather than a missing consent, and says so.
     let consented = {
-        let mandate = state
-            .store
-            .mandate_for_user(&case.accused)?
-            .ok_or(Error::NoJurisdiction)?;
+        let mandate = state.store.mandate(&case.mandate_ref)?.ok_or_else(|| {
+            Error::Internal(format!(
+                "case {} pins mandate {} which is no longer stored",
+                case.case_id, case.mandate_ref
+            ))
+        })?;
         consented_manifest(&state, &mandate)?
     };
     let media = verify_media_evidence(
@@ -2664,9 +2677,14 @@ mod tests {
         // The original survives for the referral; the derivative does
         // not, because nobody here may look at it.
         assert!(harness.state.store.evidence_blob(&accepted.sha256).unwrap().is_some());
+        // `None`, not `Some(vec![])`. Every consumer reads this as an
+        // Option and none checks the length, so a zero-length "image"
+        // was base64-encoded to the model and rendered as a broken
+        // `<img>` — a verdict that reads as though the picture had been
+        // reviewed.
         assert_eq!(
             harness.state.store.evidence_blob_derivative(&accepted.sha256).unwrap(),
-            Some(Vec::new()),
+            None,
             "the viewable copy must be destroyed as soon as the class is known"
         );
         assert_eq!(
@@ -3557,6 +3575,69 @@ mod tests {
         );
         let (status, _) = harness.post(&format!("/v1/cases/{case_id}/respond"), body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A case is answered under the terms it was opened under.
+    ///
+    /// `mandate_for_user` returns the *newest* mandate, so re-consenting
+    /// between being reported and answering swapped the terms out from
+    /// under an open case — judging the response's media against a
+    /// snapshot the case was never opened on, and placing or withholding
+    /// a preservation hold against the wrong one. Resolving the case's
+    /// pinned `mandate_ref` is what keeps the two in step.
+    ///
+    /// The newer mandate here points at a snapshot that cannot be
+    /// resolved, so reading it is observable: the pinned path answers,
+    /// the latest-mandate path fails.
+    #[tokio::test]
+    async fn a_response_is_judged_under_the_mandate_the_case_pinned() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let pinned = harness.state.store.case(&case_id).unwrap().unwrap().mandate_ref;
+
+        // The accused re-consents. Newer row, so `mandate_for_user`
+        // would now return this one.
+        harness
+            .state
+            .store
+            .put_mandate(
+                &crate::store::MandateRecord {
+                    mandate_ref: "mandate-after-the-fact".into(),
+                    user_key: testing::key_reference(ACCUSED_SEED),
+                    device_binding: "device-2".into(),
+                    classes: vec!["csam".into()],
+                    manifest_hash: "0".repeat(64),
+                },
+                b"{}",
+                b"not-a-manifest",
+                "2026-08-02T00:00:00Z",
+            )
+            .unwrap();
+        assert_ne!(
+            harness
+                .state
+                .store
+                .mandate_for_user(&testing::key_reference(ACCUSED_SEED))
+                .unwrap()
+                .unwrap()
+                .mandate_ref,
+            pinned,
+            "the fixture must actually shadow the pinned mandate"
+        );
+
+        let body = signed(
+            json!({"caseId": case_id, "statement": "that is not mine", "evidence": []}),
+            "signature",
+            &[ACCUSED_SEED],
+        );
+        let (status, response) = harness.post(&format!("/v1/cases/{case_id}/respond"), body).await;
+
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(
+            harness.state.store.case(&case_id).unwrap().unwrap().mandate_ref,
+            pinned,
+            "answering must not repin the case"
+        );
     }
 
     #[tokio::test]

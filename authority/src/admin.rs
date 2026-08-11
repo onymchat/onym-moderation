@@ -642,6 +642,16 @@ async fn case_detail(
     // Whether this case's material is under a preservation duty. It
     // governs display, so it is resolved once for the page rather than
     // per item.
+    //
+    // Existence, deliberately, and not `is_preserved`. The export gate
+    // in `referral` asks "is the duty live?", because shipping originals
+    // out after it lapsed would be unauthorized. This asks a different
+    // question — "may a moderator look at this?" — and the answer does
+    // not turn on the clock: the class was unviewable at this authority
+    // when the hold was placed, and it is still unviewable in the window
+    // between `release_after` passing and the sweep collecting the row.
+    // Keying display on the release date would start rendering in that
+    // window, which is the wrong direction to be approximate in.
     let hold = state.store.preservation_hold("case", &case_id)?;
     let preserved = hold.is_some();
     if let Some(hold) = &hold {

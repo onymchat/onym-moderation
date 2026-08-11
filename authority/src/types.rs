@@ -343,21 +343,6 @@ mod manifest_tests {
         );
     }
 
-    /// `published/` is a **serving root**, not a folder of sources.
-    /// Caddy maps it onto `authority.onym.app/policy/`, so every file
-    /// in it is a public URL whether or not the manifest links to it.
-    ///
-    /// That is how a `README.md` saying "these are drafts and need
-    /// sign-off before publication" came to be served at
-    /// `/policy/README` — on the host where people go to read the terms
-    /// before consenting. Nothing listed it and nothing linked it; it
-    /// was reachable by guessing, which is the kind of thing found by
-    /// the wrong person rather than by us.
-    ///
-    /// So the directory must hold exactly the documents the manifest
-    /// points at. Both directions are checked: an extra file is
-    /// something published that nobody agreed to read, and a missing
-    /// one is a term that 404s at the moment someone tries to read it.
     /// A schedule the service cannot apply must stop it starting.
     ///
     /// `Config::from_env` propagates this and `main` exits on it. A
@@ -430,6 +415,21 @@ mod manifest_tests {
         assert!(error.contains("not-a-class"), "{error}");
     }
 
+    /// `published/` is a **serving root**, not a folder of sources.
+    /// Caddy maps it onto `authority.onym.app/policy/`, so every file
+    /// in it is a public URL whether or not the manifest links to it.
+    ///
+    /// That is how a `README.md` saying "these are drafts and need
+    /// sign-off before publication" came to be served at
+    /// `/policy/README` — on the host where people go to read the terms
+    /// before consenting. Nothing listed it and nothing linked it; it
+    /// was reachable by guessing, which is the kind of thing found by
+    /// the wrong person rather than by us.
+    ///
+    /// So the directory must hold exactly the documents the manifest
+    /// points at. Both directions are checked: an extra file is
+    /// something published that nobody agreed to read, and a missing
+    /// one is a term that 404s at the moment someone tries to read it.
     #[test]
     fn the_published_directory_is_exactly_what_the_manifest_links_to() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

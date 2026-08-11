@@ -556,6 +556,29 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS preservation_holds_release
                 ON preservation_holds (release_after);
+
+            -- What was referred, and what the receiving body called it.
+            --
+            -- Separate from `preservation_holds` because the two have
+            -- different lifetimes. A hold ends: `drop_hold` deletes the
+            -- row once `release_after` passes, and with it went the
+            -- `referral_ref` it carried — so at exactly the moment a
+            -- preservation duty completed, the record that it had been
+            -- discharged disappeared. The only remaining trace was the
+            -- `referral_recorded` event, itself swept on the
+            -- `auditRecord` schedule.
+            --
+            -- A referral outliving its hold is the point: "we referred
+            -- this, on this date, and they gave us this reference" is
+            -- the answer to a later question from the body that
+            -- received it, long after the duty to keep the material
+            -- ended.
+            CREATE TABLE IF NOT EXISTS referrals (
+                case_id       TEXT PRIMARY KEY,
+                class_id      TEXT NOT NULL,
+                referral_ref  TEXT NOT NULL,
+                recorded_at   TEXT NOT NULL
+            );
             "#,
         )
         .map_err(|e| Error::Internal(format!("migrate: {e}")))?;
@@ -1686,29 +1709,57 @@ impl Store {
     }
 
     /// Record what the receiving body returned for a submitted referral.
+    ///
+    /// Written to both the hold (which drives the outstanding-referral
+    /// queue while the duty runs) and the `referrals` ledger (which
+    /// outlives it). The hold is still required to exist: a referral
+    /// reference for material never under preservation would be a
+    /// record of something this authority did not do.
     pub fn record_referral_reference(&self, case_id: &str, reference: &str) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
-        let changed = conn.execute(
+        let class_id: Option<String> = conn
+            .query_row(
+                "SELECT class_id FROM preservation_holds \
+                 WHERE subject_kind = 'case' AND subject_id = ?1",
+                params![case_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(class_id) = class_id else {
+            return Err(Error::NotFound(format!("no preservation hold for case {case_id}")));
+        };
+        conn.execute(
             "UPDATE preservation_holds SET referral_ref = ?1 \
              WHERE subject_kind = 'case' AND subject_id = ?2",
             params![reference, case_id],
         )?;
-        if changed == 0 {
-            return Err(Error::NotFound(format!("no preservation hold for case {case_id}")));
-        }
+        conn.execute(
+            "INSERT INTO referrals (case_id, class_id, referral_ref, recorded_at) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(case_id) DO UPDATE SET \
+               referral_ref = excluded.referral_ref, recorded_at = excluded.recorded_at",
+            params![case_id, class_id, reference, crate::util::format_timestamp(
+                time::OffsetDateTime::now_utc()
+            )],
+        )?;
         Ok(())
     }
 
     /// The referral reference recorded for a case, if any.
+    ///
+    /// Reads the ledger, not the hold: the hold is deleted when its
+    /// preservation period ends, and the referral is precisely the thing
+    /// that must survive that.
     pub fn referral_reference(&self, case_id: &str) -> Result<Option<String>, Error> {
         let conn = self.conn.lock().unwrap();
-        let mut statement = conn.prepare(
-            "SELECT referral_ref FROM preservation_holds \
-             WHERE subject_kind = 'case' AND subject_id = ?1",
-        )?;
-        let mut rows =
-            statement.query_map(params![case_id], |row| row.get::<_, Option<String>>(0))?;
-        Ok(rows.next().transpose()?.flatten())
+        let reference: Option<String> = conn
+            .query_row(
+                "SELECT referral_ref FROM referrals WHERE case_id = ?1",
+                params![case_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(reference)
     }
 
     /// One hold, by subject.
@@ -1764,10 +1815,22 @@ impl Store {
     /// claimed as. For a class nobody at this authority may view, it is
     /// a legible copy with no purpose, so it goes as soon as the class
     /// is known. The original stays sealed for the referral.
+    ///
+    /// `derivative_sha256` is blanked alongside the bytes, and that is
+    /// the load-bearing half. Blobs are shared by digest, so a drop
+    /// taken for one case lands on every case naming those bytes —
+    /// two reporters filing the same photo, one under a preserved class
+    /// and one not. Without a marker on the row, the second case's
+    /// document still lists the image as present, `unresolved_media`
+    /// stays at zero, and the triage guard that exists to stop a
+    /// picture-only case being scored on its caption never fires. The
+    /// empty digest is what `casedoc::media_lines` reads to count the
+    /// item unresolved.
     pub fn drop_derivative(&self, sha256: &str) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE evidence_blobs SET derivative = x'' WHERE sha256 = ?1",
+            "UPDATE evidence_blobs SET derivative = x'', derivative_sha256 = '' \
+             WHERE sha256 = ?1",
             params![sha256],
         )?;
         Ok(())
@@ -1870,12 +1933,22 @@ impl Store {
 
     /// The normalized derivative's bytes — what the model is sent and
     /// what the moderator panel renders. The original is never served.
+    /// The viewable derivative, or `None` when there is nothing to view.
+    ///
+    /// A dropped derivative (`drop_derivative`) leaves a zero-length blob
+    /// on the row rather than deleting it, so the empty case is mapped to
+    /// `None` here. Every consumer already treats `None` as "gone" —
+    /// `triage` refuses to score it, `admin` renders "no longer
+    /// retained" — and none of them check the length. Returning
+    /// `Some(vec![])` sent an empty base64 string to the model as though
+    /// it were a picture, and rendered a broken `<img>` to the panel.
     pub fn evidence_blob_derivative(&self, sha256: &str) -> Result<Option<Vec<u8>>, Error> {
         let conn = self.conn.lock().unwrap();
         let mut statement =
             conn.prepare("SELECT derivative FROM evidence_blobs WHERE sha256 = ?1")?;
         let mut rows = statement.query_map(params![sha256], |row| row.get::<_, Vec<u8>>(0))?;
-        rows.next().transpose().map_err(Into::into)
+        let stored: Option<Vec<u8>> = rows.next().transpose()?;
+        Ok(stored.filter(|bytes| !bytes.is_empty()))
     }
 
     /// Push an upload's expiry clock forward.
@@ -2117,8 +2190,19 @@ impl Store {
         Ok(out)
     }
 
-    /// A case's verdicts, and any mandate no remaining case needs.
-    pub fn delete_sanction_record(&self, case_id: &str) -> Result<usize, Error> {
+    /// A case's verdicts, and any mandate no remaining case needs *and*
+    /// whose consent has itself expired.
+    ///
+    /// `now` gates the mandate half. A sanction tail is measured from a
+    /// decision; a mandate's life is measured by its manifest's
+    /// `validUntil`, and the two are unrelated — a case dismissed today
+    /// sheds its 400-day tail well inside a consent running to 2027.
+    /// Dropping the mandate on the case's clock destroys a live
+    /// agreement: new reports about that user come back
+    /// `no_jurisdiction` while their client still holds, correctly, a
+    /// valid mandate. Reference-counting alone cannot see this, because
+    /// the last case to reference a consent is not the end of it.
+    pub fn delete_sanction_record(&self, case_id: &str, now: &str) -> Result<usize, Error> {
         let conn = self.conn.lock().unwrap();
         let mandate: Option<String> = conn
             .query_row(
@@ -2139,12 +2223,42 @@ impl Store {
                 params![mandate_ref, case_id],
                 |row| row.get(0),
             )?;
-            if still_used == 0 {
+            if still_used == 0 && Self::mandate_consent_expired(&conn, &mandate_ref, now)? {
                 removed += conn
                     .execute("DELETE FROM mandates WHERE mandate_ref = ?1", params![mandate_ref])?;
             }
         }
         Ok(removed)
+    }
+
+    /// Whether a mandate's consented manifest has passed its
+    /// `validUntil`, and so the mandate itself is spent.
+    ///
+    /// Unreadable or absent terms answer `false` — keeping a mandate
+    /// costs a row, while dropping one wrongly silently revokes a user's
+    /// consent, so the uncertain case holds rather than deletes.
+    fn mandate_consent_expired(
+        conn: &Connection,
+        mandate_ref: &str,
+        now: &str,
+    ) -> Result<bool, Error> {
+        let raw: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT m.raw FROM manifests m \
+                 JOIN mandates d ON d.manifest_hash = m.manifest_hash \
+                 WHERE d.mandate_ref = ?1",
+                params![mandate_ref],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(raw) = raw else { return Ok(false) };
+        let Ok(manifest) = serde_json::from_slice::<crate::types::AuthorityManifest>(&raw) else {
+            return Ok(false);
+        };
+        // Both are RFC 3339 UTC stamps as this authority writes them, so
+        // a lexicographic compare orders them correctly without pulling
+        // date parsing (and its failure modes) into the store.
+        Ok(manifest.valid_until.as_str() <= now)
     }
 
     /// Cases holding media whose process is over.
@@ -3231,6 +3345,105 @@ mod tests {
         // An unknown reporter is not an error; they simply have no
         // record yet.
         assert_eq!(store.reporter("onym:key:cc").unwrap().upheld, 0);
+    }
+
+    fn manifest_valid_until(valid_until: &str) -> Vec<u8> {
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(crate::testing::MANIFEST_JSON).unwrap();
+        manifest["validUntil"] = serde_json::Value::String(valid_until.into());
+        serde_json::to_vec(&manifest).unwrap()
+    }
+
+    /// Records a case pinning mandate `m1`, whose manifest expires at
+    /// `valid_until`.
+    fn case_with_mandate(store: &Store, case_id: &str, valid_until: &str) {
+        let manifest_raw = manifest_valid_until(valid_until);
+        let manifest_hash = crate::util::sha256_hex(&manifest_raw);
+        store
+            .put_mandate(
+                &MandateRecord {
+                    mandate_ref: "m1".into(),
+                    user_key: "onym:key:acc".into(),
+                    device_binding: "d1".into(),
+                    classes: vec!["csam".into()],
+                    manifest_hash,
+                },
+                b"raw-mandate",
+                &manifest_raw,
+                "2026-08-01T00:00:00Z",
+            )
+            .unwrap();
+        store.put_case(&sample_case(case_id)).unwrap();
+    }
+
+    /// A sanction tail and a consent are different clocks. A dismissed
+    /// case sheds its 400-day tail long before a mandate valid to 2030,
+    /// and dropping the mandate on the case's clock silently revokes a
+    /// live agreement: new reports come back `no_jurisdiction` while the
+    /// user's client still holds a valid mandate.
+    #[test]
+    fn a_spent_sanction_does_not_destroy_a_live_mandate() {
+        let store = Store::in_memory().unwrap();
+        case_with_mandate(&store, "c1", "2030-01-01T00:00:00Z");
+
+        store.delete_sanction_record("c1", "2026-08-20T00:00:00Z").unwrap();
+
+        assert!(
+            store.mandate("m1").unwrap().is_some(),
+            "a mandate still inside its validUntil must survive its last case"
+        );
+    }
+
+    #[test]
+    fn a_sanction_sweep_collects_a_mandate_whose_consent_has_expired() {
+        let store = Store::in_memory().unwrap();
+        case_with_mandate(&store, "c1", "2026-08-10T00:00:00Z");
+
+        store.delete_sanction_record("c1", "2026-08-20T00:00:00Z").unwrap();
+
+        assert!(
+            store.mandate("m1").unwrap().is_none(),
+            "an expired consent with no case left pinning it is spent"
+        );
+    }
+
+    /// A referral outlives the duty that produced it: the hold is
+    /// deleted the moment its preservation period ends, and "we referred
+    /// this and they gave us this reference" is exactly the fact that
+    /// must survive that — it is the answer to a later question from the
+    /// body that received it.
+    #[test]
+    fn a_referral_reference_survives_the_release_of_its_hold() {
+        let store = Store::in_memory().unwrap();
+        store
+            .place_preservation_hold(&PreservationHold {
+                subject_kind: "case".into(),
+                subject_id: "c1".into(),
+                class_id: "csam".into(),
+                reason: "test".into(),
+                placed_at: "2026-08-01T00:00:00Z".into(),
+                release_after: "2026-08-10T00:00:00Z".into(),
+            })
+            .unwrap();
+        store.record_referral_reference("c1", "NCMEC-12345").unwrap();
+
+        store.drop_hold("case", "c1").unwrap();
+
+        assert!(store.preservation_hold("case", "c1").unwrap().is_none());
+        assert_eq!(
+            store.referral_reference("c1").unwrap().as_deref(),
+            Some("NCMEC-12345"),
+            "releasing the hold must not erase the record that a referral was made"
+        );
+    }
+
+    /// A reference for material never under preservation would be a
+    /// record of something this authority did not do.
+    #[test]
+    fn a_referral_reference_needs_a_hold_to_record_against() {
+        let store = Store::in_memory().unwrap();
+        assert!(store.record_referral_reference("c1", "NCMEC-12345").is_err());
+        assert!(store.referral_reference("c1").unwrap().is_none());
     }
 
     /// Everyone who reported the case is credited, not just whoever

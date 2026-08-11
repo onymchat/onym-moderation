@@ -258,7 +258,7 @@ pub fn retention_sweep(state: &AppState, now: OffsetDateTime) -> Result<usize, E
     for case_id in
         state.store.cases_past_sanction_retention(&stamp, days(&schedule.sanction_record)?)?
     {
-        let gone = state.store.delete_sanction_record(&case_id)?;
+        let gone = state.store.delete_sanction_record(&case_id, &stamp)?;
         if gone > 0 {
             tracing::info!(%case_id, rows = gone, "deleted sanction record; no mark it justifies remains");
         }

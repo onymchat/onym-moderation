@@ -122,11 +122,17 @@ pub fn build(
         .case(case_id)?
         .ok_or_else(|| Error::NotFound(format!("case {case_id}")))?;
 
+    // The duty must be *live*, not merely on file. A hold row survives
+    // its own `release_after` until the next sweep deletes it, so
+    // existence alone would authorize an export during that window —
+    // shipping originals out under a duty that had already ended.
+    // `is_preserved` is the gate that answers the actual question.
     let hold = store
         .preservation_hold("case", case_id)?
+        .filter(|hold| hold.release_after.as_str() > util::format_timestamp(now).as_str())
         .ok_or_else(|| {
             Error::CaseState(format!(
-                "case {case_id} carries no preservation hold; there is no published duty to \
+                "case {case_id} carries no live preservation hold; there is no published duty to \
                  refer it under"
             ))
         })?;
