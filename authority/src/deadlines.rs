@@ -183,37 +183,88 @@ pub async fn triage_sweep(
 /// Background loop: sweep deadlines, run triage, then push any
 /// undelivered verdicts. All three are idempotent, so a missed tick
 /// costs nothing.
-/// How long an upload that never became evidence is kept.
+/// Apply the published retention schedule, and release holds that have
+/// run their course.
 ///
-/// Generous enough that a client can upload, prompt the user through
-/// the report screen, and file — and short enough that a photo somebody
-/// chose not to report does not sit on this server.
-const UNREFERENCED_UPLOAD_TTL: time::Duration = time::Duration::hours(24);
-
-/// Delete media the case and appeal no longer require.
+/// Everything here is driven by the manifest rather than by constants,
+/// because retention is consented policy: a period this service applied
+/// but never published would be exactly the promise the confidentiality
+/// document refuses to make. A deployment that publishes no schedule
+/// deletes nothing on a timer, which is what it did before this existed.
 ///
-/// Two disposals with one rule behind them: material is kept for the
-/// process that needs it and no longer. Uploads that never became
-/// evidence expire on a timer; a decided case's images go once its
-/// appeal window has closed.
-///
-/// Original and derivative always go together. Keeping the derivative
-/// would be keeping the picture, and a deletion that leaves a legible
-/// copy behind is not one.
+/// Holds outrank every period. The store enforces that per subject; this
+/// function's job is to release a hold whose duty has ended so the
+/// schedule can finally reach its material.
 pub fn retention_sweep(state: &AppState, now: OffsetDateTime) -> Result<usize, Error> {
-    let cutoff = util::format_timestamp(now - UNREFERENCED_UPLOAD_TTL);
-    let mut removed = state.store.sweep_unreferenced_evidence_blobs(&cutoff)?;
-    if removed > 0 {
-        tracing::info!(removed, "expired evidence uploads that were never reported");
+    let stamp = util::format_timestamp(now);
+
+    // A duty that has run out stops being a duty. Logged, because a
+    // preservation period ending is a fact somebody may be asked about.
+    for hold in state.store.released_holds(&stamp)? {
+        tracing::info!(
+            subject = %hold.subject_id,
+            kind = %hold.subject_kind,
+            class = %hold.class_id,
+            "preservation hold released; its material returns to the retention schedule"
+        );
+        state.store.drop_hold(&hold.subject_kind, &hold.subject_id)?;
     }
 
-    for case_id in state.store.cases_with_media_past_retention(&util::format_timestamp(now))? {
-        let gone = state.store.delete_evidence_blobs_for_case(&case_id)?;
+    let Some(schedule) = state.config.manifest.retention.as_ref() else {
+        return Ok(0);
+    };
+    let days = |raw: &str| -> Result<i64, Error> {
+        util::parse_days(raw).map_err(|e| Error::Internal(format!("retention period: {e}")))
+    };
+    let mut removed = 0;
+
+    // Uploads nobody ever reported.
+    let cutoff =
+        util::format_timestamp(now - time::Duration::days(days(&schedule.unreferenced_upload)?));
+    let expired = state.store.sweep_unreferenced_evidence_blobs(&cutoff, &stamp)?;
+    if expired > 0 {
+        tracing::info!(removed = expired, "expired evidence uploads that were never reported");
+    }
+    removed += expired;
+
+    // A finished case's images.
+    for case_id in
+        state.store.cases_with_media_past_retention(&stamp, days(&schedule.case_media)?)?
+    {
+        let gone = state.store.delete_evidence_blobs_for_case(&case_id, &stamp)?;
         if gone > 0 {
             tracing::info!(%case_id, images = gone, "deleted case media past its appeal window");
         }
         removed += gone;
     }
+
+    // Its record, its audit trail, and its sanction record — each on its
+    // own declared tail, so a deployment can keep the thing that lifts a
+    // mark longer than the material that justified it.
+    for case_id in state.store.cases_past_record_retention(&stamp, days(&schedule.case_record)?)? {
+        let gone = state.store.delete_case_record(&case_id)?;
+        if gone > 0 {
+            tracing::info!(%case_id, rows = gone, "deleted case record past its retention tail");
+        }
+        removed += gone;
+    }
+    for case_id in state.store.cases_past_record_retention(&stamp, days(&schedule.audit_record)?)? {
+        let gone = state.store.delete_case_events(&case_id)?;
+        if gone > 0 {
+            tracing::info!(%case_id, rows = gone, "deleted case audit trail past its tail");
+        }
+        removed += gone;
+    }
+    for case_id in
+        state.store.cases_past_sanction_retention(&stamp, days(&schedule.sanction_record)?)?
+    {
+        let gone = state.store.delete_sanction_record(&case_id)?;
+        if gone > 0 {
+            tracing::info!(%case_id, rows = gone, "deleted sanction record; no mark it justifies remains");
+        }
+        removed += gone;
+    }
+
     Ok(removed)
 }
 
@@ -266,6 +317,132 @@ mod tests {
         let accepted = crate::media::accept_image(&bytes).unwrap();
         store.put_evidence_blob(&accepted, &bytes, uploaded_at, "onym:key:uploader", usize::MAX).unwrap();
         accepted.sha256
+    }
+
+    /// A preservation hold outranks every period, asserted against each
+    /// sweep rather than against the idea.
+    ///
+    /// This is the test that matters most in the file. A retention sweep
+    /// that deletes material under a preservation duty is not untidy, it
+    /// is destruction of evidence — and the schedule would do exactly
+    /// that without the gate. Parameterised so a sweep added later that
+    /// forgets to consult holds fails here.
+    #[tokio::test]
+    async fn a_preservation_hold_survives_every_sweep() {
+        let store = Store::in_memory().unwrap();
+
+        // An unreported upload, a decided case with media, its record,
+        // its audit trail and its sanction record — every artifact class
+        // the schedule can reach.
+        let orphan = store_image(&store, "2020-01-01T00:00:00Z");
+        let attached = store_image(&store, "2020-01-01T00:00:00Z");
+
+        let mut case = case_due("2020-02-01T00:00:00Z");
+        case.stage = "decided".into();
+        case.disposition = Some("dismiss".into());
+        store.put_case(&case).unwrap();
+        store.attach_evidence_blobs(&case.case_id, &[attached.clone()]).unwrap();
+        store.record_event(&case.case_id, "2020-01-02T00:00:00Z", "case_opened", "").unwrap();
+
+        for (kind, id) in
+            [("blob", orphan.as_str()), ("blob", attached.as_str()), ("case", case.case_id.as_str())]
+        {
+            store
+                .place_preservation_hold(&crate::store::PreservationHold {
+                    subject_kind: kind.into(),
+                    subject_id: id.into(),
+                    class_id: "csam".into(),
+                    reason: "preservation".into(),
+                    placed_at: "2020-01-02T00:00:00Z".into(),
+                    release_after: "2099-01-01T00:00:00Z".into(),
+                })
+                .unwrap();
+        }
+        let state = crate::state::AppState::for_tests(store);
+
+        // Far past every declared tail.
+        retention_sweep(&state, util::parse_timestamp("2030-01-01T00:00:00Z").unwrap()).unwrap();
+
+        assert!(state.store.evidence_blob(&orphan).unwrap().is_some(), "held upload");
+        assert!(state.store.evidence_blob(&attached).unwrap().is_some(), "held case media");
+        assert_eq!(state.store.case_media_count(&case.case_id).unwrap(), 1, "still attached");
+        assert!(!state.store.events(&case.case_id).unwrap().is_empty(), "held audit trail");
+    }
+
+    /// A hold's release date is fixed when it is placed. A later, shorter
+    /// period must not cut a running duty short — the same reasoning that
+    /// makes a mandate pin its manifest snapshot.
+    #[tokio::test]
+    async fn a_running_hold_is_not_shortened() {
+        let store = Store::in_memory().unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+        let hold = |release: &str| crate::store::PreservationHold {
+            subject_kind: "blob".into(),
+            subject_id: digest.clone(),
+            class_id: "csam".into(),
+            reason: "preservation".into(),
+            placed_at: "2026-08-01T00:00:00Z".into(),
+            release_after: release.into(),
+        };
+        store.place_preservation_hold(&hold("2027-08-01T00:00:00Z")).unwrap();
+        // A second filing, or a manifest since publishing less time.
+        store.place_preservation_hold(&hold("2026-09-01T00:00:00Z")).unwrap();
+
+        let stored = store.preservation_hold("blob", &digest).unwrap().unwrap();
+        assert_eq!(stored.release_after, "2027-08-01T00:00:00Z", "the later date wins");
+    }
+
+    /// Once the duty ends the material rejoins the schedule — a hold is
+    /// a delay, not an exemption.
+    #[tokio::test]
+    async fn a_released_hold_returns_its_material_to_the_schedule() {
+        let store = Store::in_memory().unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+        store
+            .place_preservation_hold(&crate::store::PreservationHold {
+                subject_kind: "blob".into(),
+                subject_id: digest.clone(),
+                class_id: "csam".into(),
+                reason: "preservation".into(),
+                placed_at: "2026-08-01T00:00:00Z".into(),
+                release_after: "2026-09-01T00:00:00Z".into(),
+            })
+            .unwrap();
+        let state = crate::state::AppState::for_tests(store);
+
+        retention_sweep(&state, util::parse_timestamp("2026-08-15T00:00:00Z").unwrap()).unwrap();
+        assert!(state.store.evidence_blob(&digest).unwrap().is_some(), "still held");
+
+        retention_sweep(&state, util::parse_timestamp("2026-09-02T00:00:00Z").unwrap()).unwrap();
+        assert!(state.store.evidence_blob(&digest).unwrap().is_none(), "duty over, period applies");
+        assert!(state.store.preservation_hold("blob", &digest).unwrap().is_none());
+    }
+
+    /// A permanent ban's record is never swept, whatever the schedule
+    /// says. It is the only thing that explains a live mark or lets one
+    /// be lifted.
+    #[tokio::test]
+    async fn a_permanent_ban_keeps_its_sanction_record_forever() {
+        let store = Store::in_memory().unwrap();
+        let mut case = case_due("2026-08-01T00:00:00Z");
+        case.stage = "decided".into();
+        case.disposition = Some("ban".into());
+        store.put_case(&case).unwrap();
+        // A ban verdict with no expiry is a permanent one.
+        store
+            .put_verdict_for_tests(
+                &case.case_id,
+                "v-permanent",
+                "ban",
+                br#"{"disposition":"ban"}"#,
+                "2026-08-01T00:00:00Z",
+            )
+            .unwrap();
+
+        let eligible = store
+            .cases_past_sanction_retention("2099-01-01T00:00:00Z", 1)
+            .unwrap();
+        assert!(eligible.is_empty(), "a permanent ban outlives every period");
     }
 
     #[tokio::test]

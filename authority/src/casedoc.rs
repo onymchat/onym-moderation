@@ -461,9 +461,9 @@ mod tests {
         let (store, image) = store_with_photo_report(20, 12);
         assert_eq!(build(&store, &case()).unwrap().images.len(), 1);
 
-        store.delete_evidence_blobs_for_case("c1").unwrap();
+        store.delete_evidence_blobs_for_case("c1", "2099-01-01T00:00:00Z").unwrap();
         // Not attached to the case in this fixture, so remove directly.
-        store.sweep_unreferenced_evidence_blobs("2030-01-01T00:00:00Z").unwrap();
+        store.sweep_unreferenced_evidence_blobs("2030-01-01T00:00:00Z", "2099-01-01T00:00:00Z").unwrap();
 
         let doc = build(&store, &case()).unwrap();
         assert!(doc.images.is_empty());

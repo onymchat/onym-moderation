@@ -153,6 +153,18 @@ pub struct RecoveryClaim {
     pub grant_raw: Option<Vec<u8>>,
 }
 
+/// A preservation duty over one subject.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreservationHold {
+    /// `blob` or `case`.
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub class_id: String,
+    pub reason: String,
+    pub placed_at: String,
+    pub release_after: String,
+}
+
 /// One stored evidence image, without its bytes.
 ///
 /// Intake compares these fields against what the accused signed, so
@@ -515,6 +527,35 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS evidence_blob_cases_case
                 ON evidence_blob_cases (case_id);
+
+            -- Material this authority is required to preserve, and
+            -- until when.
+            --
+            -- A hold outranks every retention period. That direction is
+            -- the whole reason the table exists: a sweep that deletes
+            -- material under a preservation duty is not a tidiness bug,
+            -- it is destruction of evidence, and the schedule below
+            -- would do exactly that without something to stop it.
+            --
+            -- `release_after` is computed when the hold is placed, from
+            -- the period declared then. A manifest published later with
+            -- a shorter period must not shorten a hold already running,
+            -- for the same reason a mandate pins its manifest snapshot
+            -- instead of reading today's.
+            CREATE TABLE IF NOT EXISTS preservation_holds (
+                subject_kind  TEXT NOT NULL,   -- 'blob' | 'case'
+                subject_id    TEXT NOT NULL,   -- sha256 | case_id
+                class_id      TEXT NOT NULL,
+                reason        TEXT NOT NULL,
+                placed_at     TEXT NOT NULL,
+                release_after TEXT NOT NULL,
+                -- The receiving body's reference, once an operator has
+                -- submitted the referral and recorded what came back.
+                referral_ref  TEXT,
+                PRIMARY KEY (subject_kind, subject_id)
+            );
+            CREATE INDEX IF NOT EXISTS preservation_holds_release
+                ON preservation_holds (release_after);
             "#,
         )
         .map_err(|e| Error::Internal(format!("migrate: {e}")))?;
@@ -925,6 +966,27 @@ impl Store {
         Ok(())
     }
 
+
+    /// Test-only: a verdict row with a chosen disposition and body, so
+    /// the sanction sweep can be exercised against a permanent ban.
+    #[cfg(test)]
+    pub fn put_verdict_for_tests(
+        &self,
+        case_id: &str,
+        verdict_ref: &str,
+        disposition: &str,
+        raw: &[u8],
+        issued_at: &str,
+    ) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO verdicts \
+             (verdict_ref, case_id, disposition, raw, issued_at, delivered) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![verdict_ref, case_id, disposition, raw, issued_at],
+        )?;
+        Ok(())
+    }
 
     /// Test-only, and deliberately so. In the service every case-row
     /// change is a conditional `UPDATE` of the columns that change:
@@ -1489,12 +1551,228 @@ impl Store {
         Ok(out)
     }
 
-    /// Store an accepted evidence upload.
+    // ─── Preservation holds ──────────────────────────────────────────
+
+    /// Record a case event outside any other transition.
     ///
-    /// Idempotent by construction: the digest is the key, so re-uploading
-    /// the same bytes is the same row. A client retrying an interrupted
-    /// upload, or two reporters who received the same photo, both land
-    /// here without a conflict to resolve.
+    /// Most events are written alongside the state change they describe.
+    /// These are not state changes — a hold being placed, a referral
+    /// being exported — but they are exactly the things an auditor asks
+    /// about later, so they get the same log.
+    pub fn record_event(
+        &self,
+        case_id: &str,
+        at: &str,
+        kind: &str,
+        detail: &str,
+    ) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO case_events (case_id, at, kind, detail) VALUES (?1, ?2, ?3, ?4)",
+            params![case_id, at, kind, detail],
+        )?;
+        Ok(())
+    }
+
+    /// Place a hold, or extend one already in place.
+    ///
+    /// Extension takes the later release date, never the earlier. A
+    /// second report about the same image, or a manifest that has since
+    /// published a shorter period, may add time to a duty; neither may
+    /// take it away.
+    pub fn place_preservation_hold(&self, hold: &PreservationHold) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO preservation_holds \
+             (subject_kind, subject_id, class_id, reason, placed_at, release_after) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(subject_kind, subject_id) DO UPDATE SET \
+               release_after = MAX(release_after, excluded.release_after)",
+            params![
+                hold.subject_kind,
+                hold.subject_id,
+                hold.class_id,
+                hold.reason,
+                hold.placed_at,
+                hold.release_after,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Whether this subject is under a hold that has not released.
+    ///
+    /// The one gate every deletion path consults. Deliberately a single
+    /// method rather than a join copied into each sweep: a sweep added
+    /// later that forgets to call this is a bug someone has to notice,
+    /// and there should be exactly one thing to remember.
+    pub fn is_preserved(&self, kind: &str, id: &str, now: &str) -> Result<bool, Error> {
+        let conn = self.conn.lock().unwrap();
+        Self::preserved(&conn, kind, id, now)
+    }
+
+    fn preserved(conn: &Connection, kind: &str, id: &str, now: &str) -> Result<bool, Error> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM preservation_holds \
+             WHERE subject_kind = ?1 AND subject_id = ?2 AND release_after > ?3",
+            params![kind, id, now],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Holds whose duty has run out, so their material becomes
+    /// sweepable. Returned rather than deleted silently: an expiring
+    /// hold is a fact worth logging.
+    pub fn released_holds(&self, now: &str) -> Result<Vec<PreservationHold>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT subject_kind, subject_id, class_id, reason, placed_at, release_after \
+             FROM preservation_holds WHERE release_after <= ?1",
+        )?;
+        let rows = statement.query_map(params![now], |row| {
+            Ok(PreservationHold {
+                subject_kind: row.get(0)?,
+                subject_id: row.get(1)?,
+                class_id: row.get(2)?,
+                reason: row.get(3)?,
+                placed_at: row.get(4)?,
+                release_after: row.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Drop a released hold, so the schedule can reach its subject.
+    pub fn drop_hold(&self, kind: &str, id: &str) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM preservation_holds WHERE subject_kind = ?1 AND subject_id = ?2",
+            params![kind, id],
+        )?;
+        Ok(())
+    }
+
+    /// Cases with a preservation hold and no referral reference yet.
+    /// The panel's referral queue: a referral nobody notices is the
+    /// failure this machinery exists to prevent.
+    pub fn cases_awaiting_referral(&self) -> Result<Vec<PreservationHold>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT subject_kind, subject_id, class_id, reason, placed_at, release_after \
+             FROM preservation_holds \
+             WHERE subject_kind = 'case' AND referral_ref IS NULL \
+             ORDER BY placed_at",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(PreservationHold {
+                subject_kind: row.get(0)?,
+                subject_id: row.get(1)?,
+                class_id: row.get(2)?,
+                reason: row.get(3)?,
+                placed_at: row.get(4)?,
+                release_after: row.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Record what the receiving body returned for a submitted referral.
+    pub fn record_referral_reference(&self, case_id: &str, reference: &str) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE preservation_holds SET referral_ref = ?1 \
+             WHERE subject_kind = 'case' AND subject_id = ?2",
+            params![reference, case_id],
+        )?;
+        if changed == 0 {
+            return Err(Error::NotFound(format!("no preservation hold for case {case_id}")));
+        }
+        Ok(())
+    }
+
+    /// The referral reference recorded for a case, if any.
+    pub fn referral_reference(&self, case_id: &str) -> Result<Option<String>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT referral_ref FROM preservation_holds \
+             WHERE subject_kind = 'case' AND subject_id = ?1",
+        )?;
+        let mut rows =
+            statement.query_map(params![case_id], |row| row.get::<_, Option<String>>(0))?;
+        Ok(rows.next().transpose()?.flatten())
+    }
+
+    /// One hold, by subject.
+    pub fn preservation_hold(
+        &self,
+        kind: &str,
+        id: &str,
+    ) -> Result<Option<PreservationHold>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT subject_kind, subject_id, class_id, reason, placed_at, release_after \
+             FROM preservation_holds WHERE subject_kind = ?1 AND subject_id = ?2",
+        )?;
+        let mut rows = statement.query_map(params![kind, id], |row| {
+            Ok(PreservationHold {
+                subject_kind: row.get(0)?,
+                subject_id: row.get(1)?,
+                class_id: row.get(2)?,
+                reason: row.get(3)?,
+                placed_at: row.get(4)?,
+                release_after: row.get(5)?,
+            })
+        })?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
+    /// The digests a case rests on, in a stable order.
+    pub fn case_media_digests(&self, case_id: &str) -> Result<Vec<String>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT sha256 FROM evidence_blob_cases WHERE case_id = ?1 ORDER BY sha256",
+        )?;
+        let rows = statement.query_map(params![case_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<_, _>>().map_err(Into::into)
+    }
+
+    /// The exact original bytes.
+    ///
+    /// Separate from the derivative accessor on purpose: this is the
+    /// authenticated artifact, and the only caller that needs it is the
+    /// referral. Nothing that renders or classifies should reach for it.
+    pub fn evidence_blob_original(&self, sha256: &str) -> Result<Option<Vec<u8>>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare("SELECT bytes FROM evidence_blobs WHERE sha256 = ?1")?;
+        let mut rows = statement.query_map(params![sha256], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
+    /// Destroy a blob's normalized derivative, keeping the original.
+    ///
+    /// The derivative exists only because the upload route has no class
+    /// context: it is built before anything knows what the bytes will be
+    /// claimed as. For a class nobody at this authority may view, it is
+    /// a legible copy with no purpose, so it goes as soon as the class
+    /// is known. The original stays sealed for the referral.
+    pub fn drop_derivative(&self, sha256: &str) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE evidence_blobs SET derivative = x'' WHERE sha256 = ?1",
+            params![sha256],
+        )?;
+        Ok(())
+    }
+
     /// Store an accepted upload, refusing if this key is already at its
     /// unattached-upload bound.
     ///
@@ -1657,14 +1935,215 @@ impl Store {
     /// An upload that never became evidence is somebody's photo sitting
     /// on a server for no reason, so the sweep is a retention obligation
     /// rather than disk housekeeping.
-    pub fn sweep_unreferenced_evidence_blobs(&self, uploaded_before: &str) -> Result<usize, Error> {
+    pub fn sweep_unreferenced_evidence_blobs(
+        &self,
+        uploaded_before: &str,
+        now: &str,
+    ) -> Result<usize, Error> {
         let conn = self.conn.lock().unwrap();
-        let removed = conn.execute(
-            "DELETE FROM evidence_blobs \
-             WHERE uploaded_at < ?1 \
-               AND sha256 NOT IN (SELECT sha256 FROM evidence_blob_cases)",
-            params![uploaded_before],
+        // Candidates first, then the hold gate, then delete. A single
+        // bulk DELETE would be fewer queries and one more place for a
+        // preservation duty to be missed; these sweeps run on an
+        // interval over small sets, and being obviously correct is
+        // worth more here than being fast.
+        let candidates: Vec<String> = {
+            let mut statement = conn.prepare(
+                "SELECT sha256 FROM evidence_blobs \
+                 WHERE uploaded_at < ?1 \
+                   AND sha256 NOT IN (SELECT sha256 FROM evidence_blob_cases)",
+            )?;
+            let rows = statement.query_map(params![uploaded_before], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let mut removed = 0;
+        for digest in candidates {
+            if Self::preserved(&conn, "blob", &digest, now)? {
+                continue;
+            }
+            removed +=
+                conn.execute("DELETE FROM evidence_blobs WHERE sha256 = ?1", params![digest])?;
+        }
+        Ok(removed)
+    }
+
+    // ─── Scheduled deletion ──────────────────────────────────────────
+
+    /// Cases whose record may go: decided, past their tail, unheld.
+    ///
+    /// The anchor is the later of the appeal and decision deadlines —
+    /// the same point the media sweep uses, because it is the moment the
+    /// process the material was disclosed for is actually over.
+    pub fn cases_past_record_retention(
+        &self,
+        now: &str,
+        tail_days: i64,
+    ) -> Result<Vec<String>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT case_id, decision_deadline, appeal_deadline FROM cases \
+             WHERE stage = 'decided' \
+               AND appeal_state != 'pending' \
+               AND new_holder_state != 'pending'",
         )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (case_id, decision_deadline, appeal_deadline) = row?;
+            let anchor = appeal_deadline
+                .filter(|appeal| appeal.as_str() > decision_deadline.as_str())
+                .unwrap_or(decision_deadline);
+            if !Self::tail_elapsed(&anchor, tail_days, now)? {
+                continue;
+            }
+            if Self::preserved(&conn, "case", &case_id, now)? {
+                continue;
+            }
+            out.push(case_id);
+        }
+        Ok(out)
+    }
+
+    /// Whether `anchor + tail` is in the past.
+    ///
+    /// An unparseable anchor keeps the material. A corrupt timestamp is
+    /// a reason to look, not a reason to delete.
+    fn tail_elapsed(anchor: &str, tail_days: i64, now: &str) -> Result<bool, Error> {
+        let Ok(anchor) = crate::util::parse_timestamp(anchor) else { return Ok(false) };
+        let Ok(now) = crate::util::parse_timestamp(now) else { return Ok(false) };
+        Ok(now >= anchor + time::Duration::days(tail_days))
+    }
+
+    /// Reports, responses and assessments for a case. The `cases` row
+    /// itself stays: it is what says the case existed and how it ended,
+    /// and it holds no disclosed content.
+    pub fn delete_case_record(&self, case_id: &str) -> Result<usize, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut removed = 0;
+        for table in ["reports", "responses", "assessments"] {
+            removed +=
+                conn.execute(&format!("DELETE FROM {table} WHERE case_id = ?1"), params![case_id])?;
+        }
+        Ok(removed)
+    }
+
+    /// Non-content case events.
+    pub fn delete_case_events(&self, case_id: &str) -> Result<usize, Error> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM case_events WHERE case_id = ?1", params![case_id])?)
+    }
+
+    /// Cases whose sanction record may go.
+    ///
+    /// This is the most dangerous sweep in the service and it is
+    /// deliberately the most conservative. A device's marks are two bits
+    /// with no explanation attached; the verdict is the only thing that
+    /// says what they mean and the only basis on which one can be
+    /// lifted. Deleting it while a mark is live would leave somebody
+    /// marked with no way to show why or to have it cleared.
+    ///
+    /// So: a case with any permanent ban is never eligible, whatever the
+    /// schedule says. A case with a timed ban becomes eligible only once
+    /// the tail has elapsed **since the ban expired**, not since the
+    /// case ended. Anything unparseable keeps the record.
+    pub fn cases_past_sanction_retention(
+        &self,
+        now: &str,
+        tail_days: i64,
+    ) -> Result<Vec<String>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT c.case_id, c.decision_deadline, v.disposition, v.raw FROM cases c \
+             JOIN verdicts v ON v.case_id = c.case_id \
+             WHERE c.stage = 'decided' \
+               AND c.appeal_state != 'pending' \
+               AND c.new_holder_state != 'pending'",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?;
+
+        // Per case: the latest mark horizon, and whether any is endless.
+        let mut horizon: std::collections::BTreeMap<String, String> = Default::default();
+        let mut endless: std::collections::BTreeSet<String> = Default::default();
+        for row in rows {
+            let (case_id, decision_deadline, disposition, raw) = row?;
+            let anchor = if disposition == "ban" {
+                match serde_json::from_slice::<serde_json::Value>(&raw)
+                    .ok()
+                    .and_then(|v| v.get("banExpires").and_then(|e| e.as_str()).map(str::to_string))
+                {
+                    Some(expiry) => expiry,
+                    // A ban with no expiry is permanent. The record
+                    // outlives every schedule.
+                    None => {
+                        endless.insert(case_id);
+                        continue;
+                    }
+                }
+            } else {
+                decision_deadline
+            };
+            let slot = horizon.entry(case_id).or_insert_with(|| anchor.clone());
+            if anchor.as_str() > slot.as_str() {
+                *slot = anchor;
+            }
+        }
+
+        let mut out = Vec::new();
+        for (case_id, anchor) in horizon {
+            if endless.contains(&case_id) {
+                continue;
+            }
+            if !Self::tail_elapsed(&anchor, tail_days, now)? {
+                continue;
+            }
+            if Self::preserved(&conn, "case", &case_id, now)? {
+                continue;
+            }
+            out.push(case_id);
+        }
+        Ok(out)
+    }
+
+    /// A case's verdicts, and any mandate no remaining case needs.
+    pub fn delete_sanction_record(&self, case_id: &str) -> Result<usize, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mandate: Option<String> = conn
+            .query_row(
+                "SELECT mandate_ref FROM cases WHERE case_id = ?1",
+                params![case_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut removed =
+            conn.execute("DELETE FROM verdicts WHERE case_id = ?1", params![case_id])?;
+
+        // A mandate is per user and several cases may pin it. Dropping
+        // one another case still rests on would leave that case
+        // unjudgeable under the terms its accused agreed to.
+        if let Some(mandate_ref) = mandate {
+            let still_used: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM cases WHERE mandate_ref = ?1 AND case_id != ?2",
+                params![mandate_ref, case_id],
+                |row| row.get(0),
+            )?;
+            if still_used == 0 {
+                removed += conn
+                    .execute("DELETE FROM mandates WHERE mandate_ref = ?1", params![mandate_ref])?;
+            }
+        }
         Ok(removed)
     }
 
@@ -1679,21 +2158,40 @@ impl Store {
     /// somebody may still be asking about. The decision deadline is a
     /// signed, already-authenticated horizon, so it gives that grace
     /// without inventing new state.
-    pub fn cases_with_media_past_retention(&self, now: &str) -> Result<Vec<String>, Error> {
+    pub fn cases_with_media_past_retention(
+        &self,
+        now: &str,
+        tail_days: i64,
+    ) -> Result<Vec<String>, Error> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(
-            "SELECT DISTINCT b.case_id FROM evidence_blob_cases b \
+            "SELECT DISTINCT b.case_id, c.decision_deadline, c.appeal_deadline \
+             FROM evidence_blob_cases b \
              JOIN cases c ON c.case_id = b.case_id \
              WHERE c.stage = 'decided' \
                AND c.appeal_state != 'pending' \
                AND c.new_holder_state != 'pending' \
-               AND c.decision_deadline < ?1 \
-               AND (c.appeal_deadline IS NULL OR c.appeal_deadline < ?1)",
+               AND NOT EXISTS ( \
+                     SELECT 1 FROM preservation_holds h \
+                     WHERE h.subject_kind = 'case' AND h.subject_id = c.case_id \
+                       AND h.release_after > ?1)",
         )?;
-        let rows = statement.query_map(params![now], |row| row.get::<_, String>(0))?;
+        let rows = statement.query_map(params![now], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            let (case_id, decision_deadline, appeal_deadline) = row?;
+            let anchor = appeal_deadline
+                .filter(|appeal| appeal.as_str() > decision_deadline.as_str())
+                .unwrap_or(decision_deadline);
+            if Self::tail_elapsed(&anchor, tail_days, now)? {
+                out.push(case_id);
+            }
         }
         Ok(out)
     }
@@ -1716,6 +2214,7 @@ impl Store {
         &self,
         uploader: &str,
         digests: &[String],
+        now: &str,
     ) -> Result<usize, Error> {
         let conn = self.conn.lock().unwrap();
         let mut removed = 0;
@@ -1725,7 +2224,7 @@ impl Store {
                 params![digest],
                 |row| row.get(0),
             )?;
-            if held == 0 {
+            if held == 0 && !Self::preserved(&conn, "blob", digest, now)? {
                 removed += conn.execute(
                     "DELETE FROM evidence_blobs WHERE sha256 = ?1 AND uploaded_by = ?2",
                     params![digest, uploader],
@@ -1735,7 +2234,7 @@ impl Store {
         Ok(removed)
     }
 
-    fn delete_unheld(conn: &Connection, digests: &[String]) -> Result<usize, Error> {
+    fn delete_unheld(conn: &Connection, digests: &[String], now: &str) -> Result<usize, Error> {
         let mut removed = 0;
         for digest in digests {
             let still_held: i64 = conn.query_row(
@@ -1743,7 +2242,9 @@ impl Store {
                 params![digest],
                 |row| row.get(0),
             )?;
-            if still_held == 0 {
+            // Two different holds, both blocking: a case still resting
+            // on the bytes, and a preservation duty over them.
+            if still_held == 0 && !Self::preserved(conn, "blob", digest, now)? {
                 removed +=
                     conn.execute("DELETE FROM evidence_blobs WHERE sha256 = ?1", params![digest])?;
             }
@@ -1772,8 +2273,18 @@ impl Store {
     /// Original and derivative go together, because they are one row:
     /// keeping the derivative would be keeping the picture, and a
     /// deletion that leaves a legible copy behind is not one.
-    pub fn delete_evidence_blobs_for_case(&self, case_id: &str) -> Result<usize, Error> {
+    pub fn delete_evidence_blobs_for_case(
+        &self,
+        case_id: &str,
+        now: &str,
+    ) -> Result<usize, Error> {
         let conn = self.conn.lock().unwrap();
+        // A held case keeps everything, including the attachment rows:
+        // detaching would make its images look like dangling uploads to
+        // the expiry sweep.
+        if Self::preserved(&conn, "case", case_id, now)? {
+            return Ok(0);
+        }
         let candidates: Vec<String> = {
             let mut statement =
                 conn.prepare("SELECT sha256 FROM evidence_blob_cases WHERE case_id = ?1")?;
@@ -1781,7 +2292,7 @@ impl Store {
             rows.collect::<Result<_, _>>()?
         };
         conn.execute("DELETE FROM evidence_blob_cases WHERE case_id = ?1", params![case_id])?;
-        Self::delete_unheld(&conn, &candidates)
+        Self::delete_unheld(&conn, &candidates, now)
     }
 
     /// The disclosed content of every report joined to a case — what

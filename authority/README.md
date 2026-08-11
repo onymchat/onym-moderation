@@ -634,30 +634,50 @@ Reference implementation. Known limits:
   undecided. Video, album and voice attachments are signed at send time
   but no authority accepts them yet, so those cases still wait for a
   human.
-- **`csam` does not accept image evidence, and does briefly hold it.**
-  The class is refused with `media_class_refused` and text reports for
-  it are unaffected. The refusal is about readiness rather than about
-  the report: adjudicating the class on imagery would mean retaining it
-  through a case and an appeal, and this authority has neither a
-  published retention schedule nor a statutory-reporting path.
+- **`csam` accepts image evidence only where the manifest publishes a
+  preservation duty for it, and this manifest publishes none.** Absent
+  that, a report naming an image is refused with `media_class_refused`
+  and the bytes are deleted before the refusal returns; text reports for
+  the class are unaffected. The gate is a manifest term rather than a
+  constant, so turning it on means publishing new terms and taking fresh
+  consent — it cannot be flipped by an environment variable.
 
-  Be precise about what that does *not* mean. Evidence bytes arrive on
-  their own content-addressed route, which carries no class, so an
-  image is decoded, normalized and written before any report names the
+  Be precise about what the refusal does *not* mean. Evidence bytes
+  arrive on their own content-addressed route, which carries no class, so
+  an image is decoded, normalized and written before any report names the
   class it is claimed under. This authority therefore does receive it.
-  What it does not do is keep it: the refusal deletes the blob — the
-  original and the derivative — before it returns, unless another live
-  case rests on the same digest. Custody is bounded by the request, not
+  What it does not do is keep it. Custody is bounded by the request, not
   by the expiry window.
-- **Media retention is a sweep, not a published schedule.** Uploads
-  nobody reported expire after 24 hours and are bounded per key while
-  they wait. A decided case's images are deleted once the later of its
-  appeal and decision deadlines has passed and no claim is pending —
-  the later of the two because a dismissal carries no appeal deadline
-  at all, and keying on that alone would delete its evidence on the
-  next sweep. Original and derivative go together, and a digest several
-  cases rest on survives until the last of them is finished. There is
-  still no declared retention period for the rest of the case record.
+
+  Where a deployment *does* publish preservation terms, accepted material
+  is held under a preservation hold that outranks every retention period,
+  the normalized copy is destroyed as soon as the class is known, no
+  model is shown it, the panel never renders it, and a signed referral
+  package is built for an operator to submit. The referral does not wait
+  for the response window or the appeal.
+
+  **An operator who accepts this material without being a service
+  provider with the protections and the reporting relationship that role
+  carries may be committing an offence simply by holding it.** The
+  default is off for that reason.
+- **Retention is a published schedule, enforced.** The manifest names
+  the periods, so they are pinned by every mandate: an unreported upload,
+  a case's images, its record, its audit trail, and the mandate and
+  verdicts behind a sanction each have a declared tail measured from the
+  point the thing they belong to has finished. A deployment publishing
+  no schedule deletes nothing on a timer, which is what this service did
+  before.
+
+  Two rules outrank the periods. A **preservation hold** blocks every
+  sweep, with a release date fixed when it is placed so a later, shorter
+  period cannot cut a running duty short. And a **sanction record is
+  never dropped while a mark is in force** — a permanent ban means a
+  permanent record, because the verdict is the only thing that explains
+  a device's two bits or lets them be lifted.
+
+  What is still missing: nothing verifies deletion propagated to an
+  operator's backups, and the schedule speaks only for this service's
+  own storage.
 - **Notices are returned to the reporter's call and stored, not pushed
   to the accused.** Serving them is the interface's job (§5.5), and it
   reads them from the gate check.

@@ -39,32 +39,43 @@ on underneath an existing consent.
 
 ## Retention
 
-**No deletion schedule is published, because none is kept.**
+**A schedule is published and enforced.** It has its own document —
+[retention](./retention.md) — because the periods are named in the
+manifest and therefore pinned by your mandate.
 
-This is deliberate and it is the uncomfortable answer. A period named
-here that the implementation did not honour would be worse than naming
-none: you would be relying on a deletion that never happens. Nothing in
-this service deletes case material on a timer today, so nothing here
-promises that it does.
+In short: an unreported upload lasts a day, a case's images last thirty
+days past the end of the case, the case record and its audit trail last
+400 days past the same point, and the mandate and verdicts behind a
+sanction last 400 days past the moment the last mark they justify ends —
+never while one is in force.
 
-What is held, and why it cannot simply be dropped:
+An earlier version of this document said no schedule was published
+because none was kept, and undertook that if one were ever committed to
+it would be built first and published second. That is what happened. The
+periods are enforced by a sweep that compares wall-clock times, so they
+survive a restart, and it logs what it removed.
 
-- **Signed mandates and verdicts** — needed to validate or clear a live
-  mark. A device's marks are two bits with no explanation attached; the
-  record here is the only thing that says what they mean, and losing it
-  would leave someone marked with no way to show why or to have it
-  lifted.
-- **Case material** — reports, disclosed evidence, responses, appeals,
-  and final model outputs — for as long as intake, the case, and any
-  appeal require.
-- **Non-content audit records** — enough to answer "did this happen,
-  and when".
+What is held regardless of any timer, and why it cannot simply be
+dropped:
+
+- **Signed mandates and verdicts, while a mark is live** — a device's
+  marks are two bits with no explanation attached; the record here is the
+  only thing that says what they mean, and losing it would leave someone
+  marked with no way to show why or to have it lifted. A permanent ban
+  means a permanent record.
+- **That a case existed** — its class and how it ended, with no
+  disclosed content. This is what makes the transparency counts
+  answerable.
+- **Material under a preservation duty** — where law specifically
+  requires it. A preservation hold outranks every period above, and its
+  release date is fixed when it is placed so a later, shorter period
+  cannot cut it short. See [lawful reporting](./lawful-reporting.md).
 
 Case material is **not sold, not used for advertising, and not used to
 train a model.**
 
-If a retention period is committed to in future, it will be built
-first and published second.
+This document speaks for what this service stores. Backups, if an
+operator keeps them, are the operator's to account for.
 
 ## Bounds
 
