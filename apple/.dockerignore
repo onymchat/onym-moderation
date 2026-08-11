@@ -1,0 +1,26 @@
+# Keep the build context to what the Dockerfile actually copies.
+#
+# target/ is ~9k files and 1.6GB on a checkout that has been built
+# locally, against 24 files of everything else. BuildKit walks the whole
+# context before it copies anything, so leaving it in costs every local
+# build and buys nothing — the Dockerfile only takes Cargo.toml,
+# Cargo.lock and src/.
+#
+# This used to be covered by onym-infra's rsync excludes, which no
+# longer apply now that deploys build these contexts directly rather
+# than on the droplet (onymchat/onym-infra#13).
+.git/
+target/
+
+# The Dockerfile copies none of these, so nothing is baked into a layer
+# today. They are excluded anyway: a build context is the wrong place
+# for a DeviceCheck key to be sitting when someone later reaches for
+# `COPY . .`.
+secrets/
+*.p8
+.env
+.env.*
+!.env.example
+
+.DS_Store
+*.log

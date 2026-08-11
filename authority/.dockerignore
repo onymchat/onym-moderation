@@ -1,0 +1,29 @@
+# Keep the build context to what the Dockerfile actually copies.
+#
+# target/ dominates a locally built checkout by three orders of
+# magnitude in file count. BuildKit walks the whole context before it
+# copies anything, so leaving it in costs every local build and buys
+# nothing — the Dockerfile only takes Cargo.toml, Cargo.lock and src/.
+#
+# This used to be covered by onym-infra's rsync excludes, which no
+# longer apply now that deploys build these contexts directly rather
+# than on the droplet (onymchat/onym-infra#13).
+#
+# Note what is deliberately NOT an input: published/ and manifest/ are
+# read at runtime from a mount, not built in. The published terms must
+# be the bytes the deployment serves and signs, not a copy frozen into
+# an image at build time.
+.git/
+target/
+
+# Excluded even though the Dockerfile copies none of them — a build
+# context is the wrong place for a signing seed to be sitting when
+# someone later reaches for `COPY . .`.
+secrets/
+*.p8
+.env
+.env.*
+!.env.example
+
+.DS_Store
+*.log
