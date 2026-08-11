@@ -20,6 +20,7 @@ mod deadlines;
 mod decisions;
 mod delivery;
 mod error;
+mod media;
 mod policy;
 mod profiles;
 mod recovery;
@@ -426,8 +427,13 @@ async fn main() {
     deadlines::spawn(state.clone());
 
     let app = api::router(state.clone())
-        .merge(admin::router(state))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024));
+        .merge(admin::router(state.clone()))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024))
+        // Merged *after* the JSON limit, and carrying its own. Evidence
+        // images do not fit in 1 MiB, and the fix for that is a second
+        // ceiling on one route rather than a wider ceiling on all of
+        // them: every JSON endpoint keeps the bound it was written for.
+        .merge(api::evidence_router(state));
 
     let addr: SocketAddr = match bind_addr.parse() {
         Ok(a) => a,

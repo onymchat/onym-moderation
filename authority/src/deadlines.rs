@@ -183,6 +183,40 @@ pub async fn triage_sweep(
 /// Background loop: sweep deadlines, run triage, then push any
 /// undelivered verdicts. All three are idempotent, so a missed tick
 /// costs nothing.
+/// How long an upload that never became evidence is kept.
+///
+/// Generous enough that a client can upload, prompt the user through
+/// the report screen, and file — and short enough that a photo somebody
+/// chose not to report does not sit on this server.
+const UNREFERENCED_UPLOAD_TTL: time::Duration = time::Duration::hours(24);
+
+/// Delete media the case and appeal no longer require.
+///
+/// Two disposals with one rule behind them: material is kept for the
+/// process that needs it and no longer. Uploads that never became
+/// evidence expire on a timer; a decided case's images go once its
+/// appeal window has closed.
+///
+/// Original and derivative always go together. Keeping the derivative
+/// would be keeping the picture, and a deletion that leaves a legible
+/// copy behind is not one.
+pub fn retention_sweep(state: &AppState, now: OffsetDateTime) -> Result<usize, Error> {
+    let cutoff = util::format_timestamp(now - UNREFERENCED_UPLOAD_TTL);
+    let mut removed = state.store.sweep_unreferenced_evidence_blobs(&cutoff)?;
+    if removed > 0 {
+        tracing::info!(removed, "expired evidence uploads that were never reported");
+    }
+
+    for case_id in state.store.cases_with_media_past_retention(&util::format_timestamp(now))? {
+        let gone = state.store.delete_evidence_blobs_for_case(&case_id)?;
+        if gone > 0 {
+            tracing::info!(%case_id, images = gone, "deleted case media past its appeal window");
+        }
+        removed += gone;
+    }
+    Ok(removed)
+}
+
 pub fn spawn(state: Arc<AppState>) {
     let interval = std::time::Duration::from_secs(state.config.deadline_sweep_secs);
 
@@ -200,6 +234,9 @@ pub fn spawn(state: Arc<AppState>) {
             }
             if let Err(e) = deadlines.delivery.flush(&deadlines.store).await {
                 tracing::error!(error = %e, "verdict delivery failed");
+            }
+            if let Err(e) = retention_sweep(&deadlines, OffsetDateTime::now_utc()) {
+                tracing::error!(error = %e, "media retention sweep failed");
             }
             tokio::time::sleep(interval).await;
         }
@@ -222,6 +259,179 @@ pub fn spawn(state: Arc<AppState>) {
 mod tests {
     use super::*;
     use crate::store::{CaseRecord, Store};
+
+    /// Store one image and return its digest.
+    fn store_image(store: &Store, uploaded_at: &str) -> String {
+        let bytes = crate::media::tiny_jpeg(10, 10);
+        let accepted = crate::media::accept_image(&bytes).unwrap();
+        store.put_evidence_blob(&accepted, &bytes, uploaded_at, "onym:key:uploader", usize::MAX).unwrap();
+        accepted.sha256
+    }
+
+    #[tokio::test]
+    async fn an_upload_nobody_reported_expires() {
+        let store = Store::in_memory().unwrap();
+        let stale = store_image(&store, "2026-08-01T00:00:00Z");
+        let state = crate::state::AppState::for_tests(store);
+
+        let removed =
+            retention_sweep(&state, util::parse_timestamp("2026-08-10T00:00:00Z").unwrap())
+                .unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(state.store.evidence_blob(&stale).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_reports_uploads_survive_the_gap_before_its_case_opens() {
+        // The report goes on file before its case exists, and filing
+        // restarts the upload's clock — so the gap is protected for a
+        // full window rather than by a flag the sweep then skips.
+        let store = Store::in_memory().unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+        store.touch_evidence_blobs(&[digest.clone()], "2026-08-10T00:00:00Z").unwrap();
+        let state = crate::state::AppState::for_tests(store);
+
+        retention_sweep(&state, util::parse_timestamp("2026-08-10T06:00:00Z").unwrap()).unwrap();
+
+        assert!(state.store.evidence_blob(&digest).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn an_upload_whose_case_never_opened_still_expires() {
+        // The hole this closes: a flag set at filing time made a blob
+        // invisible to the expiry sweep, and a case that never opened
+        // left it invisible to case deletion too — retained forever and
+        // counted against no budget. Case opening genuinely can fail
+        // after the report is stored: a lapsed manifest and an expired
+        // mandate both return an error in exactly that span.
+        let store = Store::in_memory().unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+        store.touch_evidence_blobs(&[digest.clone()], "2026-08-01T00:00:00Z").unwrap();
+        let state = crate::state::AppState::for_tests(store);
+
+        let removed =
+            retention_sweep(&state, util::parse_timestamp("2026-08-03T00:00:00Z").unwrap())
+                .unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(state.store.evidence_blob(&digest).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_decided_case_past_its_appeal_window_loses_original_and_derivative_together() {
+        let store = Store::in_memory().unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+        store.touch_evidence_blobs(&[digest.clone()], "2026-08-01T00:00:00Z").unwrap();
+
+        let mut case = case_due("2026-08-05T00:00:00Z");
+        case.stage = "decided".into();
+        case.disposition = Some("dismiss".into());
+        case.appeal_deadline = Some("2026-08-06T00:00:00Z".into());
+        store.put_case(&case).unwrap();
+        store.attach_evidence_blobs(&case.case_id, &[digest.clone()]).unwrap();
+        let state = crate::state::AppState::for_tests(store);
+
+        // Still inside the appeal window: a human may yet need to look.
+        retention_sweep(&state, util::parse_timestamp("2026-08-05T12:00:00Z").unwrap()).unwrap();
+        assert!(state.store.evidence_blob(&digest).unwrap().is_some());
+
+        retention_sweep(&state, util::parse_timestamp("2026-08-07T00:00:00Z").unwrap()).unwrap();
+        assert!(state.store.evidence_blob(&digest).unwrap().is_none());
+        assert!(
+            state.store.evidence_blob_derivative(&digest).unwrap().is_none(),
+            "a deletion that leaves the derivative behind still leaves the picture"
+        );
+    }
+
+    /// The same photo can legitimately belong to two cases — forwarded
+    /// by two senders, or one sender reported under two classes — and
+    /// content addressing makes both resolve to one stored row. The
+    /// first case finishing must not take the second case's evidence
+    /// with it.
+    #[tokio::test]
+    async fn a_photo_two_cases_rest_on_survives_the_first_one_ending() {
+        let store = Store::in_memory().unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+        store.touch_evidence_blobs(&[digest.clone()], "2026-08-01T00:00:00Z").unwrap();
+
+        let mut finished = case_due("2026-08-05T00:00:00Z");
+        finished.case_id = "finished".into();
+        finished.stage = "decided".into();
+        finished.disposition = Some("dismiss".into());
+        store.put_case(&finished).unwrap();
+        store.attach_evidence_blobs("finished", &[digest.clone()]).unwrap();
+
+        // Still open, and resting on the same bytes.
+        let mut live = case_due("2026-12-01T00:00:00Z");
+        live.case_id = "live".into();
+        store.put_case(&live).unwrap();
+        store.attach_evidence_blobs("live", &[digest.clone()]).unwrap();
+
+        let state = crate::state::AppState::for_tests(store);
+        retention_sweep(&state, util::parse_timestamp("2026-08-10T00:00:00Z").unwrap()).unwrap();
+
+        assert!(
+            state.store.evidence_blob(&digest).unwrap().is_some(),
+            "a finished case must not delete evidence a live case still rests on"
+        );
+
+        // And once the last case holding it is done, it does go.
+        live.stage = "decided".into();
+        live.disposition = Some("dismiss".into());
+        state.store.put_case(&live).unwrap();
+        retention_sweep(&state, util::parse_timestamp("2026-12-02T00:00:00Z").unwrap()).unwrap();
+        assert!(state.store.evidence_blob(&digest).unwrap().is_none());
+    }
+
+    /// A dismissal carries no appeal deadline — it is final and clears
+    /// the marks — so keying retention on that alone would delete its
+    /// evidence on the very next sweep, minutes after a decision
+    /// somebody may still be asking about.
+    #[tokio::test]
+    async fn a_dismissal_does_not_lose_its_evidence_the_moment_it_is_decided() {
+        let store = Store::in_memory().unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+        store.touch_evidence_blobs(&[digest.clone()], "2026-08-01T00:00:00Z").unwrap();
+
+        let mut case = case_due("2026-08-20T00:00:00Z");
+        case.stage = "decided".into();
+        case.disposition = Some("dismiss".into());
+        case.appeal_deadline = None;
+        store.put_case(&case).unwrap();
+        store.attach_evidence_blobs(&case.case_id, &[digest.clone()]).unwrap();
+        let state = crate::state::AppState::for_tests(store);
+
+        // Decided early; the case's own signed horizon has not passed.
+        retention_sweep(&state, util::parse_timestamp("2026-08-06T00:00:00Z").unwrap()).unwrap();
+        assert!(state.store.evidence_blob(&digest).unwrap().is_some());
+
+        retention_sweep(&state, util::parse_timestamp("2026-08-21T00:00:00Z").unwrap()).unwrap();
+        assert!(state.store.evidence_blob(&digest).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pending_appeal_keeps_the_evidence_it_is_about() {
+        let store = Store::in_memory().unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+        store.touch_evidence_blobs(&[digest.clone()], "2026-08-01T00:00:00Z").unwrap();
+
+        let mut case = case_due("2026-08-05T00:00:00Z");
+        case.stage = "decided".into();
+        case.disposition = Some("ban".into());
+        case.appeal_deadline = Some("2026-08-06T00:00:00Z".into());
+        case.appeal_state = "pending".into();
+        store.put_case(&case).unwrap();
+        store.attach_evidence_blobs(&case.case_id, &[digest.clone()]).unwrap();
+        let state = crate::state::AppState::for_tests(store);
+
+        retention_sweep(&state, util::parse_timestamp("2026-09-01T00:00:00Z").unwrap()).unwrap();
+
+        assert!(
+            state.store.evidence_blob(&digest).unwrap().is_some(),
+            "deleting the material under a pending review would decide it by attrition"
+        );
+    }
 
     fn case_due(decision_deadline: &str) -> CaseRecord {
         CaseRecord {

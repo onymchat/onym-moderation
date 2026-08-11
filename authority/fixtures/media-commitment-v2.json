@@ -1,0 +1,23 @@
+{
+  "note": "Cross-implementation vector for the version 2 media commitment. The signer (onym-ios) and the verifier (onym-moderation) are written in different languages and agree on these bytes only by construction, so this file is the one thing that would catch drift between them. An identical copy lives at onym-ios/Tests/OnymIOSTests/Fixtures/media-commitment-v2.json; changing either without the other must break both sides' tests.",
+  "inputs": {
+    "messageId": "00000000-0000-0000-0000-000000000001",
+    "groupId": "group-1",
+    "groupSecretHex": "0707070707070707070707070707070707070707070707070707070707070707",
+    "sentAtMillis": 1785580800123,
+    "body": "hello",
+    "media": [
+      {
+        "blobSha256": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+        "mimeType": "image/jpeg",
+        "plaintextSha256": "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+        "plaintextByteLength": 421337,
+        "width": 1200,
+        "height": 1600
+      }
+    ]
+  },
+  "preimage": "{\"body\":\"hello\",\"group_binding\":\"18413f675da1f5410fa8e199b799c2bf3700575ddac201c9a8d2dfdf8327ce6a\",\"media\":[{\"blob_sha256\":\"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f\",\"height\":1600,\"mime_type\":\"image\\/jpeg\",\"plaintext_byte_length\":421337,\"plaintext_sha256\":\"1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a\",\"width\":1200}],\"message_id\":\"00000000-0000-0000-0000-000000000001\",\"proof_version\":2,\"sent_at_millis\":1785580800123}",
+  "signerPublicKeyHex": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+  "signatureBase64": "+lXjQDhSsaxssuZj6OgodqrKIbmjRz5mxkyE46hmsvBAj5DDsJVhDnuZKXroRtCNHRYLq5StHjrHe5OwLwHXCQ=="
+}

@@ -618,10 +618,46 @@ Reference implementation. Known limits:
   hand. For a class with a `permanent` term the contract *requires* an
   external appellate, so that gap matters most exactly where the
   sanction is heaviest.
-- **Triage classifies text.** Evidence that is an image or a video is
-  not scored; those cases come back inconclusive and wait for a human,
-  which is the safe direction but leaves the most serious classes least
-  automated.
+- **Triage classifies text and reported images; video, album and voice
+  evidence are still unscored.** A reported photo is uploaded to
+  `PUT /v1/evidence-blobs/{sha256}`, authenticated against the digest
+  the accused signed in a version 2 proof preimage, normalized into a
+  derivative, and sent to profiles whose published terms enable images.
+  A deployment whose pinned profile is text-only refuses image evidence
+  at intake rather than accepting it and declining to decide later —
+  the difference matters, because a case that can never be decided is
+  dismissed at its deadline, so accepting unreadable evidence would
+  hand anyone able to file against an accused a way to end the case.
+  For the same reason, a case carrying more images than the profile
+  takes is decided on as many as fit, with the rest named by digest in
+  the case document and listed on the assessment, rather than left
+  undecided. Video, album and voice attachments are signed at send time
+  but no authority accepts them yet, so those cases still wait for a
+  human.
+- **`csam` does not accept image evidence, and does briefly hold it.**
+  The class is refused with `media_class_refused` and text reports for
+  it are unaffected. The refusal is about readiness rather than about
+  the report: adjudicating the class on imagery would mean retaining it
+  through a case and an appeal, and this authority has neither a
+  published retention schedule nor a statutory-reporting path.
+
+  Be precise about what that does *not* mean. Evidence bytes arrive on
+  their own content-addressed route, which carries no class, so an
+  image is decoded, normalized and written before any report names the
+  class it is claimed under. This authority therefore does receive it.
+  What it does not do is keep it: the refusal deletes the blob — the
+  original and the derivative — before it returns, unless another live
+  case rests on the same digest. Custody is bounded by the request, not
+  by the expiry window.
+- **Media retention is a sweep, not a published schedule.** Uploads
+  nobody reported expire after 24 hours and are bounded per key while
+  they wait. A decided case's images are deleted once the later of its
+  appeal and decision deadlines has passed and no claim is pending —
+  the later of the two because a dismissal carries no appeal deadline
+  at all, and keying on that alone would delete its evidence on the
+  next sweep. Original and derivative go together, and a digest several
+  cases rest on survives until the last of them is finished. There is
+  still no declared retention period for the rest of the case record.
 - **Notices are returned to the reporter's call and stored, not pushed
   to the accused.** Serving them is the interface's job (§5.5), and it
   reads them from the gate check.

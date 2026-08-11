@@ -153,6 +153,23 @@ pub struct RecoveryClaim {
     pub grant_raw: Option<Vec<u8>>,
 }
 
+/// One stored evidence image, without its bytes.
+///
+/// Intake compares these fields against what the accused signed, so
+/// they are exactly the values the commitment covers — plus the
+/// derivative's identity, which the accused did not sign because this
+/// authority produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceBlobRecord {
+    pub sha256: String,
+    pub mime_type: String,
+    pub byte_length: u64,
+    pub width: u32,
+    pub height: u32,
+    pub derivative_sha256: String,
+    pub derivative_version: u32,
+}
+
 /// One case, in the lifecycle of Moderation.md §10.
 ///
 /// `stage` is the state machine: `open` (notice served, response
@@ -437,6 +454,67 @@ impl Store {
                 undeliverable INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS verdicts_undelivered ON verdicts (delivered);
+
+            -- Evidence images, addressed by the SHA-256 of the exact
+            -- bytes uploaded. Content addressing is the whole integrity
+            -- story: the primary key *is* the digest the accused signed,
+            -- so a row cannot be swapped for different bytes and an
+            -- upload arriving twice is the same row rather than a
+            -- conflict. That is also why there is no owner column —
+            -- holding a blob grants nothing without a signature over
+            -- its digest, and that signature is the evidence.
+            CREATE TABLE IF NOT EXISTS evidence_blobs (
+                sha256             TEXT PRIMARY KEY,
+                mime_type          TEXT NOT NULL,
+                byte_length        INTEGER NOT NULL,
+                width              INTEGER NOT NULL,
+                height             INTEGER NOT NULL,
+                -- The exact original: this is the authenticated
+                -- artifact, and nothing else may stand in for it when
+                -- the question is what the accused sent.
+                bytes              BLOB NOT NULL,
+                -- The normalized derivative and its digest. What the
+                -- model classifies and what a moderator is shown, kept
+                -- distinct from the original so an appeal can establish
+                -- both separately.
+                derivative         BLOB NOT NULL,
+                derivative_sha256  TEXT NOT NULL,
+                derivative_version INTEGER NOT NULL,
+                -- Doubles as the expiry clock. Filing a report that
+                -- names this blob pushes it forward, which is what
+                -- protects the gap between the report going on file and
+                -- its case opening — a gap that is not only a crash
+                -- window: a lapsed manifest or an expired mandate
+                -- returns an error in exactly that span.
+                --
+                -- A boolean "referenced" flag used to guard that gap,
+                -- and it was worse than nothing: a blob marked but never
+                -- attached became invisible to the expiry sweep (which
+                -- skipped marked rows) *and* to case deletion (which
+                -- only reaches attached rows), so it was retained
+                -- forever and counted against no budget.
+                uploaded_at        TEXT NOT NULL,
+                -- The key that uploaded these bytes, so unreferenced
+                -- uploads can be bounded per uploader.
+                uploaded_by        TEXT NOT NULL DEFAULT ''
+            );
+
+            -- Which cases rest on which blob. A join table rather than a
+            -- column on the blob, because content addressing means one
+            -- row can genuinely serve several cases: the same photo
+            -- forwarded by two senders, or one sender reported under two
+            -- classes, both resolve to the same digest and the same
+            -- stored bytes. A single `case_id` would record only
+            -- whichever case attached first, and retention on that case
+            -- would then delete the evidence out from under the others,
+            -- which are still live.
+            CREATE TABLE IF NOT EXISTS evidence_blob_cases (
+                sha256  TEXT NOT NULL,
+                case_id TEXT NOT NULL,
+                PRIMARY KEY (sha256, case_id)
+            );
+            CREATE INDEX IF NOT EXISTS evidence_blob_cases_case
+                ON evidence_blob_cases (case_id);
             "#,
         )
         .map_err(|e| Error::Internal(format!("migrate: {e}")))?;
@@ -467,6 +545,7 @@ impl Store {
             ("cases", "claim_revision", "INTEGER NOT NULL DEFAULT 0"),
             ("assessments", "attempts", "INTEGER NOT NULL DEFAULT 0"),
             ("assessments", "document", "BLOB"),
+            ("evidence_blobs", "uploaded_by", "TEXT NOT NULL DEFAULT ''"),
         ] {
             Self::add_column(&conn, table, column, definition)?;
         }
@@ -1408,6 +1487,301 @@ impl Store {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Store an accepted evidence upload.
+    ///
+    /// Idempotent by construction: the digest is the key, so re-uploading
+    /// the same bytes is the same row. A client retrying an interrupted
+    /// upload, or two reporters who received the same photo, both land
+    /// here without a conflict to resolve.
+    /// Store an accepted upload, refusing if this key is already at its
+    /// unattached-upload bound.
+    ///
+    /// The bound is enforced here, under the same lock as the insert,
+    /// rather than only by the caller's earlier check. Read-then-insert
+    /// let concurrent uploads from one key all pass the count at 15 of
+    /// 16 and overshoot together. The caller's check stays as a cheap
+    /// early refusal — it avoids decoding an image that is going to be
+    /// rejected — but this one is the authority.
+    pub fn put_evidence_blob(
+        &self,
+        image: &crate::media::AcceptedImage,
+        original: &[u8],
+        uploaded_at: &str,
+        uploaded_by: &str,
+        max_unattached: usize,
+    ) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        let existing: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM evidence_blobs WHERE sha256 = ?1",
+            params![image.sha256],
+            |row| row.get(0),
+        )?;
+        if existing == 0 {
+            let held: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM evidence_blobs \
+                 WHERE uploaded_by = ?1 \
+                   AND sha256 NOT IN (SELECT sha256 FROM evidence_blob_cases)",
+                params![uploaded_by],
+                |row| row.get(0),
+            )?;
+            if held as usize >= max_unattached {
+                return Err(Error::MediaQuotaExceeded(format!(
+                    "this key already holds {max_unattached} uploads no case rests on; file or \
+                     abandon those before uploading more"
+                )));
+            }
+        }
+        conn.execute(
+            // Upsert rather than ignore. A re-upload answers 200, and
+            // that answer has to mean the bytes are here *and* will
+            // stay: leaving `uploaded_at` stale let a client re-send at
+            // the edge of expiry, get an acknowledgement, and have the
+            // sweep delete the blob before the report naming it landed.
+            //
+            // `uploaded_by` deliberately stays with the original
+            // uploader. The budget is about who is parking bytes on
+            // this authority, and that should not transfer to whoever
+            // happened to re-send them last.
+            "INSERT INTO evidence_blobs \
+             (sha256, mime_type, byte_length, width, height, bytes, derivative, \
+              derivative_sha256, derivative_version, uploaded_at, uploaded_by) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+             ON CONFLICT(sha256) DO UPDATE SET uploaded_at = excluded.uploaded_at",
+            params![
+                image.sha256,
+                image.mime_type,
+                image.byte_length as i64,
+                image.width as i64,
+                image.height as i64,
+                original,
+                image.derivative,
+                image.derivative_sha256,
+                image.derivative_version as i64,
+                uploaded_at,
+                uploaded_by,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// An evidence blob's metadata, without its bytes.
+    ///
+    /// Intake compares this against the sender's signed commitment, and
+    /// never needs the pixels to do it.
+    pub fn evidence_blob(&self, sha256: &str) -> Result<Option<EvidenceBlobRecord>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT sha256, mime_type, byte_length, width, height, derivative_sha256, \
+             derivative_version FROM evidence_blobs WHERE sha256 = ?1",
+        )?;
+        let mut rows = statement.query_map(params![sha256], |row| {
+            Ok(EvidenceBlobRecord {
+                sha256: row.get(0)?,
+                mime_type: row.get(1)?,
+                byte_length: row.get::<_, i64>(2)? as u64,
+                width: row.get::<_, i64>(3)? as u32,
+                height: row.get::<_, i64>(4)? as u32,
+                derivative_sha256: row.get(5)?,
+                derivative_version: row.get::<_, i64>(6)? as u32,
+            })
+        })?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
+    /// The normalized derivative's bytes — what the model is sent and
+    /// what the moderator panel renders. The original is never served.
+    pub fn evidence_blob_derivative(&self, sha256: &str) -> Result<Option<Vec<u8>>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement =
+            conn.prepare("SELECT derivative FROM evidence_blobs WHERE sha256 = ?1")?;
+        let mut rows = statement.query_map(params![sha256], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
+    /// Push an upload's expiry clock forward.
+    ///
+    /// Called as a report naming these blobs goes on file, which happens
+    /// before its case exists. Restarting the clock — rather than
+    /// setting a flag the sweep then skips — means an upload waiting for
+    /// its case is protected for a full expiry window, and an upload
+    /// whose case never opens still expires like any other. There is no
+    /// state a blob can reach from which nothing collects it.
+    pub fn touch_evidence_blobs(&self, digests: &[String], at: &str) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        for digest in digests {
+            conn.execute(
+                "UPDATE evidence_blobs SET uploaded_at = ?1 WHERE sha256 = ?2",
+                params![at, digest],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Bind referenced uploads to the case that now rests on them.
+    ///
+    /// Inserts into the join table, so a digest several cases depend on
+    /// records every one of them rather than only the first.
+    pub fn attach_evidence_blobs(&self, case_id: &str, digests: &[String]) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        for digest in digests {
+            conn.execute(
+                "INSERT OR IGNORE INTO evidence_blob_cases (sha256, case_id) VALUES (?1, ?2)",
+                params![digest, case_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// How many uploads this key holds that no report has claimed.
+    ///
+    /// The bound this feeds is the only thing standing between a
+    /// consented key and unlimited storage: uploading happens before any
+    /// report justifies it, and the expiry sweep only reclaims after a
+    /// day.
+    pub fn unreferenced_uploads_by(&self, uploader: &str) -> Result<usize, Error> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM evidence_blobs \
+             WHERE uploaded_by = ?1 \
+               AND sha256 NOT IN (SELECT sha256 FROM evidence_blob_cases)",
+            params![uploader],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Drop uploads nobody ever filed a report against.
+    ///
+    /// An upload that never became evidence is somebody's photo sitting
+    /// on a server for no reason, so the sweep is a retention obligation
+    /// rather than disk housekeeping.
+    pub fn sweep_unreferenced_evidence_blobs(&self, uploaded_before: &str) -> Result<usize, Error> {
+        let conn = self.conn.lock().unwrap();
+        let removed = conn.execute(
+            "DELETE FROM evidence_blobs \
+             WHERE uploaded_at < ?1 \
+               AND sha256 NOT IN (SELECT sha256 FROM evidence_blob_cases)",
+            params![uploaded_before],
+        )?;
+        Ok(removed)
+    }
+
+    /// Cases holding media whose process is over.
+    ///
+    /// "Over" means decided, with no claim pending, and past the later
+    /// of the appeal deadline and the decision deadline. Taking the
+    /// later of the two matters because a dismissal carries no appeal
+    /// deadline at all — it is final and clears the marks — and keying
+    /// only on that would make a case dismissed on the record lose its
+    /// evidence on the very next sweep, minutes after a decision
+    /// somebody may still be asking about. The decision deadline is a
+    /// signed, already-authenticated horizon, so it gives that grace
+    /// without inventing new state.
+    pub fn cases_with_media_past_retention(&self, now: &str) -> Result<Vec<String>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT b.case_id FROM evidence_blob_cases b \
+             JOIN cases c ON c.case_id = b.case_id \
+             WHERE c.stage = 'decided' \
+               AND c.appeal_state != 'pending' \
+               AND c.new_holder_state != 'pending' \
+               AND c.decision_deadline < ?1 \
+               AND (c.appeal_deadline IS NULL OR c.appeal_deadline < ?1)",
+        )?;
+        let rows = statement.query_map(params![now], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Delete this uploader's blobs among `digests`, unless some case
+    /// still rests on them.
+    ///
+    /// Scoped to `uploaded_by` because the digests come from a signed
+    /// preimage, and a preimage is written by the sender of the photo —
+    /// who therefore knows the digest of bytes somebody *else* is about
+    /// to report them for. Unscoped, a refusal was a way to delete
+    /// another party's pending evidence: self-file under a class that
+    /// declines media, name their digest, and their upload is gone
+    /// before their report lands. On a loop, no report about that photo
+    /// could ever be filed.
+    ///
+    /// The scope costs nothing in the case this exists for: in a
+    /// genuine refusal the uploader and the filer are the same key.
+    pub fn delete_own_unheld_evidence_blobs(
+        &self,
+        uploader: &str,
+        digests: &[String],
+    ) -> Result<usize, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut removed = 0;
+        for digest in digests {
+            let held: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM evidence_blob_cases WHERE sha256 = ?1",
+                params![digest],
+                |row| row.get(0),
+            )?;
+            if held == 0 {
+                removed += conn.execute(
+                    "DELETE FROM evidence_blobs WHERE sha256 = ?1 AND uploaded_by = ?2",
+                    params![digest, uploader],
+                )?;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn delete_unheld(conn: &Connection, digests: &[String]) -> Result<usize, Error> {
+        let mut removed = 0;
+        for digest in digests {
+            let still_held: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM evidence_blob_cases WHERE sha256 = ?1",
+                params![digest],
+                |row| row.get(0),
+            )?;
+            if still_held == 0 {
+                removed +=
+                    conn.execute("DELETE FROM evidence_blobs WHERE sha256 = ?1", params![digest])?;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// How many images a case already rests on.
+    pub fn case_media_count(&self, case_id: &str) -> Result<usize, Error> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM evidence_blob_cases WHERE case_id = ?1",
+            params![case_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Forget a finished case's media.
+    ///
+    /// Detaches this case, then deletes only the blobs no other case
+    /// still rests on. A shared digest survives until the last case
+    /// holding it is done — deleting on the first would take evidence
+    /// from a live case that happens to have received the same photo.
+    ///
+    /// Original and derivative go together, because they are one row:
+    /// keeping the derivative would be keeping the picture, and a
+    /// deletion that leaves a legible copy behind is not one.
+    pub fn delete_evidence_blobs_for_case(&self, case_id: &str) -> Result<usize, Error> {
+        let conn = self.conn.lock().unwrap();
+        let candidates: Vec<String> = {
+            let mut statement =
+                conn.prepare("SELECT sha256 FROM evidence_blob_cases WHERE case_id = ?1")?;
+            let rows = statement.query_map(params![case_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        conn.execute("DELETE FROM evidence_blob_cases WHERE case_id = ?1", params![case_id])?;
+        Self::delete_unheld(&conn, &candidates)
     }
 
     /// The disclosed content of every report joined to a case — what

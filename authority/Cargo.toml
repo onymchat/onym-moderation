@@ -19,6 +19,11 @@ sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Evidence images are attacker-supplied bytes, so the decoder surface is
+# deliberately narrow: default features off, and only the two formats the
+# allowlist accepts. Every other decoder this crate can build is one this
+# authority will never be asked to run.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

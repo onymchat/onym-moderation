@@ -12,7 +12,7 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
@@ -22,6 +22,7 @@ use time::OffsetDateTime;
 use crate::canonical;
 use crate::cases;
 use crate::decisions;
+use crate::media;
 use crate::error::Error;
 use crate::state::AppState;
 use crate::store::CaseRecord;
@@ -43,6 +44,285 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/cases/:case_id/decide", post(decide))
         .route("/v1/verdicts/:verdict_ref/requeue", post(requeue_verdict))
         .with_state(state)
+}
+
+/// Evidence bytes, on their own router because they need their own body
+/// ceiling.
+///
+/// Kept separate so the caller can apply the 1 MiB JSON limit to every
+/// other route and merge this afterwards. The alternative — raising the
+/// global limit until an image fits — would hand every JSON endpoint a
+/// megabytes-wide surface it has no use for.
+pub fn evidence_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/v1/evidence-blobs/:sha256", put(put_evidence_blob))
+        .layer(axum::extract::DefaultBodyLimit::disable())
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            media::MAX_EVIDENCE_BLOB_BYTES,
+        ))
+        .with_state(state)
+}
+
+/// Freshness window for an evidence-upload credential, matching the
+/// status-query window.
+const UPLOAD_CREDENTIAL_MAX_AGE_SECONDS: i64 = 300;
+
+/// How many uploads one key may hold that no report has claimed.
+///
+/// Generous next to any real reporting session — a report discloses one
+/// photo — and small enough that the worst a consented key can park on
+/// this authority is bounded rather than open-ended.
+const MAX_UNREFERENCED_UPLOADS_PER_KEY: usize = 16;
+
+/// How many evidence images may be decoded at once.
+///
+/// Bounds total decode memory rather than only per-request: the
+/// per-image ceiling is what one upload can allocate, this is how many
+/// can allocate it simultaneously.
+static DECODE_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+/// Classes that do not accept media evidence.
+///
+/// `csam` is refused on purpose, and the refusal is about this
+/// authority's readiness rather than the report's merit. Accepting the
+/// bytes would make it a custodian of illegal imagery — stored,
+/// rendered to human reviewers on appeal — while it still has no
+/// retention schedule, no deletion machinery beyond the minimum below,
+/// and no statutory-reporting path. The honest disposition is to say so
+/// and point at lawful reporting channels, not to take custody it
+/// cannot discharge. Text reports for the class are unaffected.
+const CLASSES_REFUSING_MEDIA: [&str; 1] = ["csam"];
+
+/// Check every media commitment in a report against the bytes on file.
+///
+/// Returns the digests the report depends on, in evidence order, so the
+/// caller can bind them to the case.
+fn verify_media_evidence(
+    state: &AppState,
+    class_id: &str,
+    evidence: &[EvidenceItem],
+    already_on_case: usize,
+    // `filer`: the key filing this report or response. A refusal may
+    // delete only this key's own pending uploads.
+    filer: &str,
+) -> Result<Vec<String>, Error> {
+    // Three passes, in this order, and the order is the point.
+    //
+    // Everything here is attacker-chosen: the commitment is written by
+    // the accused, so its length is theirs to pick. Bounds therefore
+    // come first, before anything that costs a query. Refusals come
+    // second, so a refusal deletes every blob the filing named rather
+    // than only the ones seen before the first `return`. Resolution
+    // comes last.
+    let mut committed: Vec<(usize, media::MediaCommitment)> = Vec::new();
+    for (index, item) in evidence.iter().enumerate() {
+        if let media::Disclosed::Media(commitments) =
+            media::parse_disclosed(&item.disclosed_content)?
+        {
+            for commitment in commitments {
+                committed.push((index, commitment));
+            }
+            // Bound as we go, so a preimage naming ten thousand blobs
+            // is refused while reading it rather than after.
+            if committed.len() > media::MAX_MEDIA_PER_FILING {
+                return Err(Error::BadRequest(format!(
+                    "this filing commits to more than {} media items",
+                    media::MAX_MEDIA_PER_FILING
+                )));
+            }
+        }
+    }
+    if committed.is_empty() {
+        return Ok(Vec::new());
+    }
+    // A ceiling across the case, not just this filing. Reports join an
+    // open case and responses accumulate on one, so the per-filing
+    // bound alone left a case able to gather hundreds of images, every
+    // one of them resolved on each document build.
+    if already_on_case + committed.len() > media::MAX_MEDIA_PER_CASE {
+        return Err(Error::BadRequest(format!(
+            "this case already rests on {already_on_case} images; the ceiling is {}",
+            media::MAX_MEDIA_PER_CASE
+        )));
+    }
+
+    // Refusals. Both delete every blob this filing named — bytes
+    // arrived before anything knew what they would be claimed as, so
+    // this authority is holding them, and the honest remedy is to hold
+    // them for this request rather than for the expiry window. Only
+    // blobs no case rests on: a digest a live case depends on is not
+    // this filing's to take.
+    let refusal = if CLASSES_REFUSING_MEDIA.contains(&class_id) {
+        Some(Error::MediaClassRefused(format!(
+            "class {class_id:?} does not accept media evidence at this authority"
+        )))
+    } else if state.config.triage.as_ref().is_some_and(|t| !t.profile.reviews_images()) {
+        // The pinned model cannot inspect an image, so this authority
+        // cannot adjudicate one. Refusing at intake — rather than
+        // taking the evidence and declining to decide later — is what
+        // stops image evidence becoming a way to end a case: a case
+        // that can never be decided is dismissed at its deadline, and
+        // anyone able to file against this accused could reach that by
+        // attaching a picture.
+        // Its own code, not the class refusal above. The class refuses
+        // nothing here — this deployment's pinned model does — and the
+        // two mean different things to a client: one says no authority
+        // will ever take images for this class, the other says another
+        // authority would.
+        Some(Error::MediaUnreviewable(format!(
+            "this authority's pinned model profile cannot review images, so it does not accept \
+             image evidence; a text report for {class_id:?} is unaffected"
+        )))
+    } else {
+        None
+    };
+    if let Some(reason) = refusal {
+        let named: Vec<String> =
+            committed.iter().map(|(_, c)| c.plaintext_sha256.clone()).collect();
+        state.store.delete_own_unheld_evidence_blobs(filer, &named)?;
+        return Err(reason);
+    }
+
+    let mut digests = Vec::new();
+    for (index, commitment) in committed {
+        if !media::ALLOWED_MEDIA_TYPES.contains(&commitment.mime_type.as_str()) {
+            return Err(Error::MediaUnsupported(format!(
+                "evidence item {index} commits to {:?}, which this authority does not accept",
+                commitment.mime_type
+            )));
+        }
+        // Dimensions are required for an image, not optional-and-checked
+        // -if-present. They are printed in the case document and in the
+        // panel as facts about the evidence, so a commitment that
+        // omitted them would have those numbers attributed to a
+        // signature that never covered them.
+        let (Some(width), Some(height)) = (commitment.width, commitment.height) else {
+            return Err(Error::AuthenticityUnverified(format!(
+                "evidence item {index} commits to an image without dimensions; they are shown \
+                 as attested and must be signed"
+            )));
+        };
+        let stored = state.store.evidence_blob(&commitment.plaintext_sha256)?.ok_or_else(|| {
+            Error::MediaMissing(format!(
+                "evidence item {index} names an image that has not been uploaded"
+            ))
+        })?;
+
+        // Every field the accused signed must match what is on file. A
+        // mismatch is an authenticity failure, not a format one: the
+        // bytes may be a perfectly good image, just not the one this
+        // proof attests to.
+        let mismatch = stored.mime_type != commitment.mime_type
+            || stored.byte_length != commitment.plaintext_byte_length
+            || width != stored.width
+            || height != stored.height;
+        if mismatch {
+            return Err(Error::AuthenticityUnverified(format!(
+                "evidence item {index} does not match the image it commits to"
+            )));
+        }
+        digests.push(stored.sha256);
+    }
+    Ok(digests)
+}
+
+/// Accept the bytes of one reported image.
+///
+/// The path segment is the SHA-256 the caller claims, and the first
+/// thing this does is recompute it. That check — not the credential
+/// below — is what makes the upload safe to accept: a report can only
+/// use these bytes by presenting the accused's signature over this same
+/// digest, so bytes that hash to something else are simply not the
+/// reported photo.
+///
+/// The credential exists for a narrower reason: uploading is the one
+/// operation here that costs storage before any report justifies it, so
+/// it is restricted to keys that have consented to this authority, and
+/// bounded per key. That is resource control, not the integrity story.
+async fn put_evidence_blob(
+    State(state): State<Arc<AppState>>,
+    Path(sha256): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, Error> {
+    let credential = |name: &'static str| headers.get(name).and_then(|value| value.to_str().ok());
+    let (Some(key), Some(timestamp), Some(signature)) = (
+        credential("x-onym-key"),
+        credential("x-onym-timestamp"),
+        credential("x-onym-signature"),
+    ) else {
+        return Err(Error::SignatureInvalid("evidence upload is not authenticated".into()));
+    };
+    let now = OffsetDateTime::now_utc();
+    let fresh = util::parse_timestamp(timestamp)
+        .map(|signed_at| {
+            (now - signed_at).whole_seconds().abs() <= UPLOAD_CREDENTIAL_MAX_AGE_SECONDS
+        })
+        .unwrap_or(false);
+    let message = format!("evidence-blob:{sha256}:{timestamp}");
+    if !fresh || verify_signature(key, message.as_bytes(), signature).is_err() {
+        return Err(Error::SignatureInvalid("evidence upload credential did not verify".into()));
+    }
+    if state.store.mandates_for_user(key)?.is_empty() {
+        return Err(Error::ReporterUnconsented);
+    }
+    // Consent alone is not a budget. Without this a single consented key
+    // can push unlimited blobs into the store and wait for nothing —
+    // uploads are only reclaimed a day later, and only if no report ever
+    // named them. The bound is on *unreferenced* uploads, so a reporter
+    // filing real reports is never blocked by their own history; only
+    // one accumulating bytes they never report is.
+    // Bytes already on file cost nothing new, and re-sending them is
+    // the documented recovery path — so the cap must not be the thing
+    // that breaks it. Checked before the bound, not after.
+    let already_stored = state.store.evidence_blob(&sha256)?.is_some();
+    if !already_stored && state.store.unreferenced_uploads_by(key)? >= MAX_UNREFERENCED_UPLOADS_PER_KEY {
+        return Err(Error::MediaQuotaExceeded(format!(
+            "this key already holds {MAX_UNREFERENCED_UPLOADS_PER_KEY} uploads no case rests \
+             on; file or abandon those before uploading more"
+        )));
+    }
+
+    // Validate and normalize before anything is persisted, so a
+    // decompression bomb is a rejected request rather than a row.
+    //
+    // Off the async runtime, and behind a permit. Decoding a 24-megapixel
+    // image and resizing it is hundreds of milliseconds of CPU and a
+    // ~96 MB allocation; inline on a tokio worker it blocks a thread
+    // that is supposed to be handling every other request, and nothing
+    // bounded how many ran at once.
+    let _permit = DECODE_PERMITS
+        .acquire()
+        .await
+        .map_err(|_| Error::Internal("decode permits closed".into()))?;
+    let decode_input = body.clone();
+    let accepted = tokio::task::spawn_blocking(move || media::accept_image(&decode_input))
+        .await
+        .map_err(|e| Error::Internal(format!("evidence decode task failed: {e}")))??;
+    if !sha256.eq_ignore_ascii_case(&accepted.sha256) || sha256 != sha256.to_lowercase() {
+        return Err(Error::BadRequest(format!(
+            "uploaded bytes hash to {}, not the {sha256:?} in the path",
+            accepted.sha256
+        )));
+    }
+
+    state.store.put_evidence_blob(
+        &accepted,
+        &body,
+        &util::format_timestamp(now),
+        key,
+        MAX_UNREFERENCED_UPLOADS_PER_KEY,
+    )?;
+
+    Ok(Json(json!({
+        "sha256": accepted.sha256,
+        "mimeType": accepted.mime_type,
+        "byteLength": accepted.byte_length,
+        "width": accepted.width,
+        "height": accepted.height,
+        "derivativeSha256": accepted.derivative_sha256,
+        "derivativeVersion": accepted.derivative_version,
+    })))
 }
 
 /// Statements are free text from unauthenticated or semi-authenticated
@@ -367,6 +647,29 @@ async fn file_report(
             ))
         })?;
     }
+
+    // Media evidence: the signed commitment names bytes, and those
+    // bytes have to be here and be the ones named. The signature check
+    // above already proved the accused wrote the commitment; this proves
+    // the authority is holding what the commitment describes.
+    // Counted against the case this report will join, if one is open.
+    // Reports join rather than open a second case, so passing zero here
+    // left the case-wide ceiling dead on the path that actually
+    // accumulates: every joining report added its own filing's worth
+    // with nothing bounding the total.
+    let joining = state.store.open_case_for(&report.accused, &report.class_id)?;
+    let already_on_case = match &joining {
+        Some(case) => state.store.case_media_count(&case.case_id)?,
+        None => 0,
+    };
+    let media_digests = verify_media_evidence(
+        &state,
+        &report.class_id,
+        &report.evidence,
+        already_on_case,
+        &report.reporter,
+    )?;
+
     let evidence_summary = report_evidence_summary(&report)?;
 
     let now = OffsetDateTime::now_utc();
@@ -391,6 +694,13 @@ async fn file_report(
             &stamp,
         )?;
     }
+    // The report is on file; its case does not exist yet. Restart the
+    // uploads' expiry clock so they survive that gap — including the
+    // paths just below that return an error inside it, a lapsed
+    // manifest and an expired mandate.
+    if !media_digests.is_empty() {
+        state.store.touch_evidence_blobs(&media_digests, &stamp)?;
+    }
 
     // Further reports join an open case rather than opening a second
     // one. Opening a case sets a mark before any response, so
@@ -402,7 +712,7 @@ async fn file_report(
     // opened the case a moment ago, and the honest response is to join
     // theirs — the same thing we would have done had we looked a
     // moment later.
-    let case = match state.store.open_case_for(&report.accused, &report.class_id)? {
+    let case = match joining {
         Some(existing) => join_case(&state, &existing, &report, now, &evidence_summary)?,
         None => {
             // Consent has a horizon at both ends. The accused's
@@ -447,6 +757,9 @@ async fn file_report(
     };
 
     state.store.attach_report_to_case(&report.reporter, &report.report_id, &case.case_id)?;
+    if !media_digests.is_empty() {
+        state.store.attach_evidence_blobs(&case.case_id, &media_digests)?;
+    }
 
     Ok(Json(json!({
         "reportId": report.report_id,
@@ -781,6 +1094,17 @@ async fn respond(
             })?;
     }
 
+    // Counter-evidence carrying media goes through exactly the checks
+    // the report's evidence did. The accused answering a photo with a
+    // photo is the same kind of claim, and it earns the same scrutiny.
+    let media_digests = verify_media_evidence(
+        &state,
+        &case.class_id,
+        &response.evidence,
+        state.store.case_media_count(&case_id)?,
+        &case.accused,
+    )?;
+
     let now = OffsetDateTime::now_utc();
     let stamp = util::format_timestamp(now);
     let late = util::parse_timestamp(&case.response_deadline)
@@ -800,6 +1124,10 @@ async fn respond(
         event_detail: &response.statement,
         limit: MAX_RESPONSES_PER_CASE,
     })?;
+    if !media_digests.is_empty() {
+        state.store.touch_evidence_blobs(&media_digests, &stamp)?;
+        state.store.attach_evidence_blobs(&case_id, &media_digests)?;
+    }
 
     Ok(Json(json!({ "caseId": case_id, "recorded": true, "late": late })))
 }
@@ -1594,6 +1922,20 @@ mod tests {
             Self { state: Arc::new(AppState::for_tests(Store::in_memory().unwrap())) }
         }
 
+        /// A harness whose pinned profile is a real published one, so
+        /// intake decisions that depend on the model's declared inputs
+        /// are exercised against terms that actually exist.
+        fn with_profile(profile_id: &str) -> Self {
+            Self {
+                state: Arc::new(AppState::for_tests_with_triage(
+                    Store::in_memory().unwrap(),
+                    profile_id,
+                    "http://127.0.0.1:1",
+                    crate::config::TriageMode::Autonomous,
+                )),
+            }
+        }
+
         async fn send(&self, request: Request<Body>) -> (StatusCode, Value) {
             let response = router(self.state.clone()).oneshot(request).await.unwrap();
             let status = response.status();
@@ -1610,6 +1952,29 @@ mod tests {
                     .unwrap(),
             )
             .await
+        }
+
+        /// Drive the evidence-blob route, which lives on its own router
+        /// with its own body limit — so it has to be exercised through
+        /// that router rather than the JSON one.
+        async fn put_blob(
+            &self,
+            sha256: &str,
+            bytes: Vec<u8>,
+            seed: [u8; 32],
+        ) -> (StatusCode, Value) {
+            let timestamp = util::format_timestamp(OffsetDateTime::now_utc());
+            let message = format!("evidence-blob:{sha256}:{timestamp}");
+            let request = Request::put(format!("/v1/evidence-blobs/{sha256}"))
+                .header("x-onym-key", testing::key_reference(seed))
+                .header("x-onym-timestamp", timestamp)
+                .header("x-onym-signature", testing::sign(seed, message.as_bytes()))
+                .body(Body::from(bytes))
+                .unwrap();
+            let response = evidence_router(self.state.clone()).oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
         }
 
         async fn decide(&self, case_id: &str, body: Value) -> (StatusCode, Value) {
@@ -1693,6 +2058,624 @@ mod tests {
             }],
             "filedAt": "2026-08-02T00:00:00Z",
         })
+    }
+
+    /// A v2 proof preimage: the shape an iOS sender signs for a message
+    /// carrying media. Keys are in UTF-8 byte order because that is what
+    /// the client's encoder produces; the authority verifies the
+    /// signature over these bytes verbatim and parses the fields out.
+    fn media_preimage(image: &media::AcceptedImage) -> String {
+        format!(
+            r#"{{"body":"","group_binding":"ab","media":[{{"blob_sha256":"cipher","height":{},"mime_type":"{}","plaintext_byte_length":{},"plaintext_sha256":"{}","width":{}}}],"message_id":"m-1","proof_version":2,"sent_at_millis":1}}"#,
+            image.height, image.mime_type, image.byte_length, image.sha256, image.width
+        )
+    }
+
+    /// A v2 preimage committing to several images at once.
+    fn media_preimage_many(images: &[media::AcceptedImage]) -> String {
+        let entries: Vec<String> = images
+            .iter()
+            .map(|image| {
+                format!(
+                    r#"{{"blob_sha256":"cipher","height":{},"mime_type":"{}","plaintext_byte_length":{},"plaintext_sha256":"{}","width":{}}}"#,
+                    image.height, image.mime_type, image.byte_length, image.sha256, image.width
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"body":"","group_binding":"ab","media":[{}],"message_id":"m-1","proof_version":2,"sent_at_millis":1}}"#,
+            entries.join(",")
+        )
+    }
+
+    /// A report whose single evidence item is a photo.
+    fn photo_report_json(reporter_mandate: &str, report_id: &str, content: &str) -> Value {
+        json!({
+            "reportVersion": 1,
+            "reportId": report_id,
+            "reporter": testing::key_reference(REPORTER_SEED),
+            "reporterMandate": reporter_mandate,
+            "accused": testing::key_reference(ACCUSED_SEED),
+            "classId": "unsolicited-pornography",
+            "evidence": [{
+                "disclosedContent": content,
+                "authenticityProof": testing::sign(ACCUSED_SEED, content.as_bytes()),
+            }],
+            "filedAt": "2026-08-02T00:00:00Z",
+        })
+    }
+
+    /// Registered parties, an uploaded photo, and the signed commitment
+    /// naming it — everything a valid photo report needs.
+    async fn seed_photo(harness: &Harness) -> (String, media::AcceptedImage, String) {
+        register_mandate(harness, ACCUSED_SEED).await;
+        let reporter_mandate = register_mandate(harness, REPORTER_SEED).await;
+        let bytes = media::tiny_jpeg(24, 16);
+        let accepted = media::accept_image(&bytes).unwrap();
+        let (status, response) =
+            harness.put_blob(&accepted.sha256, bytes, REPORTER_SEED).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let content = media_preimage(&accepted);
+        (reporter_mandate, accepted, content)
+    }
+
+    // ─── Media evidence ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_reported_photo_opens_a_case_and_reaches_the_document() {
+        let harness = Harness::new();
+        let (mandate, accepted, content) = seed_photo(&harness).await;
+        let body =
+            signed(photo_report_json(&mandate, "r-1", &content), "signature", &[REPORTER_SEED]);
+
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+
+        let case_id = response["caseId"].as_str().unwrap();
+        let case = harness.state.store.case(case_id).unwrap().unwrap();
+        let document = crate::casedoc::build(&harness.state.store, &case).unwrap();
+        assert_eq!(document.images.len(), 1);
+        assert_eq!(document.images[0].sha256, accepted.sha256);
+        // The image's identity is inside the text, so the input digest
+        // covers what the model saw and not merely its caption.
+        assert!(document.text.contains(&accepted.sha256));
+        assert!(document.text.contains(&accepted.derivative_sha256));
+        assert!(document.text.contains("24x16"));
+    }
+
+    #[tokio::test]
+    async fn a_photo_report_is_refused_until_its_bytes_are_uploaded() {
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let mandate = register_mandate(&harness, REPORTER_SEED).await;
+        // The commitment is perfectly valid; the authority just does not
+        // hold what it names.
+        let accepted = media::accept_image(&media::tiny_jpeg(8, 8)).unwrap();
+        let content = media_preimage(&accepted);
+        let body =
+            signed(photo_report_json(&mandate, "r-1", &content), "signature", &[REPORTER_SEED]);
+
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::FAILED_DEPENDENCY);
+        assert_eq!(response["error"], "media_missing");
+    }
+
+    #[tokio::test]
+    async fn one_flipped_byte_makes_the_photo_a_different_image() {
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let mandate = register_mandate(&harness, REPORTER_SEED).await;
+
+        // Upload one image, then commit to a *different* one. The
+        // signature is valid over the commitment; the bytes on file are
+        // simply not the ones it names.
+        let uploaded = media::tiny_jpeg(24, 16);
+        let accepted = media::accept_image(&uploaded).unwrap();
+        harness.put_blob(&accepted.sha256, uploaded, REPORTER_SEED).await;
+
+        let other = media::accept_image(&media::tiny_jpeg(25, 16)).unwrap();
+        let content = media_preimage(&other);
+        let body =
+            signed(photo_report_json(&mandate, "r-1", &content), "signature", &[REPORTER_SEED]);
+
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::FAILED_DEPENDENCY);
+        assert_eq!(response["error"], "media_missing");
+    }
+
+    #[tokio::test]
+    async fn a_commitment_that_misstates_the_image_does_not_authenticate_it() {
+        let harness = Harness::new();
+        let (mandate, accepted, _) = seed_photo(&harness).await;
+        // Right digest, wrong declared length: the bytes on file are the
+        // ones named, but the proof describes something else, so it does
+        // not attest to them.
+        let content = format!(
+            r#"{{"body":"","group_binding":"ab","media":[{{"blob_sha256":"cipher","height":{},"mime_type":"image/jpeg","plaintext_byte_length":{},"plaintext_sha256":"{}","width":{}}}],"message_id":"m-1","proof_version":2,"sent_at_millis":1}}"#,
+            accepted.height,
+            accepted.byte_length + 1,
+            accepted.sha256,
+            accepted.width
+        );
+        let body =
+            signed(photo_report_json(&mandate, "r-1", &content), "signature", &[REPORTER_SEED]);
+
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response["error"], "authenticity_unverified");
+    }
+
+    #[tokio::test]
+    async fn csam_does_not_accept_image_evidence() {
+        let harness = Harness::new();
+        let (mandate, _, content) = seed_photo(&harness).await;
+        let mut report = photo_report_json(&mandate, "r-1", &content);
+        report["classId"] = json!("csam");
+        let body = signed(report, "signature", &[REPORTER_SEED]);
+
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(response["error"], "media_class_refused");
+    }
+
+    #[tokio::test]
+    async fn an_upload_from_an_unconsented_key_is_refused() {
+        let harness = Harness::new();
+        register_mandate(&harness, REPORTER_SEED).await;
+        let bytes = media::tiny_jpeg(8, 8);
+        let accepted = media::accept_image(&bytes).unwrap();
+
+        let (status, response) =
+            harness.put_blob(&accepted.sha256, bytes, STRANGER_SEED).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+        assert_eq!(response["error"], "reporter_unconsented");
+    }
+
+    #[tokio::test]
+    async fn an_upload_whose_bytes_do_not_match_its_name_is_refused() {
+        let harness = Harness::new();
+        register_mandate(&harness, REPORTER_SEED).await;
+        let bytes = media::tiny_jpeg(8, 8);
+        let wrong_name = util::sha256_hex(b"something else entirely");
+
+        let (status, response) = harness.put_blob(&wrong_name, bytes, REPORTER_SEED).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    }
+
+    #[tokio::test]
+    async fn re_uploading_the_same_photo_is_the_same_blob() {
+        // Content addressing makes retries free: an interrupted upload
+        // resumes by simply sending the bytes again, and two reporters
+        // who received the same photo share one row.
+        let harness = Harness::new();
+        register_mandate(&harness, REPORTER_SEED).await;
+        let bytes = media::tiny_jpeg(12, 12);
+        let accepted = media::accept_image(&bytes).unwrap();
+
+        for _ in 0..2 {
+            let (status, _) =
+                harness.put_blob(&accepted.sha256, bytes.clone(), REPORTER_SEED).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let stored = harness.state.store.evidence_blob(&accepted.sha256).unwrap().unwrap();
+        assert_eq!(stored.byte_length, accepted.byte_length);
+    }
+
+    #[tokio::test]
+    async fn a_key_cannot_park_unlimited_uploads() {
+        // Consent is not a budget: uploading happens before any report
+        // justifies it, and the expiry sweep only reclaims a day later.
+        let harness = Harness::new();
+        register_mandate(&harness, REPORTER_SEED).await;
+
+        for size in 0..MAX_UNREFERENCED_UPLOADS_PER_KEY {
+            let bytes = media::tiny_jpeg(8 + size as u32, 8);
+            let accepted = media::accept_image(&bytes).unwrap();
+            let (status, response) =
+                harness.put_blob(&accepted.sha256, bytes, REPORTER_SEED).await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+        }
+
+        let bytes = media::tiny_jpeg(200, 8);
+        let accepted = media::accept_image(&bytes).unwrap();
+        let (status, response) = harness.put_blob(&accepted.sha256, bytes, REPORTER_SEED).await;
+        // Not `media_too_large`: nothing is wrong with the image, and a
+        // client reading only the status would otherwise shrink it and
+        // retry forever against a limit that is not about size.
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{response}");
+        assert_eq!(response["error"], "media_quota_exceeded");
+    }
+
+    #[tokio::test]
+    async fn a_text_only_authority_refuses_image_evidence_at_intake() {
+        // Not merely "declines to decide later". A case that can never
+        // be decided is dismissed at its deadline, so accepting image
+        // evidence a text-only model cannot read would hand anyone able
+        // to file against this accused — the accused included, since
+        // they can sign their own disclosed content — a way to end the
+        // case.
+        let harness = Harness::with_profile("qwen3guard-8b");
+        let (mandate, accepted, content) = seed_photo(&harness).await;
+        let body =
+            signed(photo_report_json(&mandate, "r-1", &content), "signature", &[REPORTER_SEED]);
+
+        let (status, response) = harness.post("/v1/reports", body).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+        // Its own code: the class refuses nothing here, this deployment
+        // does, and another authority would take the same report.
+        assert_eq!(response["error"], "media_unreviewable");
+        assert!(harness.state.store.evidence_blob(&accepted.sha256).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_joining_report_cannot_push_a_case_past_its_media_ceiling() {
+        // Reports join an open case rather than opening a second one,
+        // so the case-wide ceiling has to be measured against the case
+        // being joined — measuring against zero left it dead on the
+        // one path that actually accumulates.
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let mandate = register_mandate(&harness, REPORTER_SEED).await;
+
+        // Four images per report, so the ceiling is reached before the
+        // separate cap on how many notices a case may emit.
+        let per_report = 4usize;
+        let mut images_on_case = 0usize;
+        let mut last_status = StatusCode::OK;
+        for round in 0..(media::MAX_MEDIA_PER_CASE / per_report + 2) {
+            let mut accepted = Vec::new();
+            for slot in 0..per_report {
+                let bytes = media::tiny_jpeg(20 + (round * per_report + slot) as u32, 16);
+                let image = media::accept_image(&bytes).unwrap();
+                harness.put_blob(&image.sha256, bytes, REPORTER_SEED).await;
+                accepted.push(image);
+            }
+            let content = media_preimage_many(&accepted);
+            let body = signed(
+                photo_report_json(&mandate, &format!("r-{round}"), &content),
+                "signature",
+                &[REPORTER_SEED],
+            );
+            let (status, _) = harness.post("/v1/reports", body).await;
+            last_status = status;
+            if status != StatusCode::OK {
+                break;
+            }
+            images_on_case += per_report;
+        }
+
+        assert_eq!(images_on_case, media::MAX_MEDIA_PER_CASE);
+        assert_eq!(last_status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_cannot_delete_someone_elses_pending_evidence() {
+        // The digests in a preimage are written by the sender of the
+        // photo, who therefore knows the digest of bytes somebody else
+        // is about to report them for. Unscoped, a refusal was a way to
+        // delete another party's upload before their report landed —
+        // and on a loop, to make sure no report about that photo could
+        // ever be filed.
+        let harness = Harness::new();
+        let (mandate, victim_upload, content) = seed_photo(&harness).await;
+
+        // The accused self-files under a class that declines media,
+        // naming the reporter's uploaded-but-unattached blob.
+        let mut self_report = json!({
+            "reportVersion": 1,
+            "reportId": "r-self",
+            "reporter": testing::key_reference(ACCUSED_SEED),
+            "reporterMandate": mandate,
+            "accused": testing::key_reference(ACCUSED_SEED),
+            "classId": "csam",
+            "evidence": [{
+                "disclosedContent": content,
+                "authenticityProof": testing::sign(ACCUSED_SEED, content.as_bytes()),
+            }],
+            "filedAt": "2026-08-02T00:00:00Z",
+        });
+        self_report["reporterMandate"] =
+            json!(register_mandate(&harness, ACCUSED_SEED).await);
+
+        let (status, _) =
+            harness.post("/v1/reports", signed(self_report, "signature", &[ACCUSED_SEED])).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "the class still refuses");
+
+        assert!(
+            harness.state.store.evidence_blob(&victim_upload.sha256).unwrap().is_some(),
+            "a refusal must not take an upload the filer did not make"
+        );
+
+        // And the reporter's own report still files.
+        let body =
+            signed(photo_report_json(&mandate, "r-1", &content), "signature", &[REPORTER_SEED]);
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_profile_claiming_images_but_permitting_none_is_text_only() {
+        // `maxImages` defaults to zero, so a custom profile can set
+        // `supportsImages` and still permit no picture. Reading only the
+        // flag let intake accept the image and the model be asked
+        // without it — the answer then recorded as a review of evidence
+        // it never saw.
+        let profile = crate::profiles::by_id("qwen3guard-8b").unwrap();
+        assert!(!profile.reviews_images());
+
+        let mut claims_support = crate::profiles::by_id("llama-guard-4-12b").unwrap();
+        claims_support.max_images = 0;
+        assert!(claims_support.supports_images);
+        assert!(
+            !claims_support.reviews_images(),
+            "a profile permitting zero images cannot review one, whatever the flag says"
+        );
+        assert!(claims_support.request_body("csam", "d", &[vec![1]]).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_refusal_deletes_every_image_the_filing_named() {
+        // The refusal used to `return` inside the per-item loop, so a
+        // report carrying images on two evidence items left the second
+        // item's bytes on disk for the full expiry window.
+        let harness = Harness::new();
+        let (mandate, first, first_content) = seed_photo(&harness).await;
+        let second_bytes = media::tiny_jpeg(31, 17);
+        let second = media::accept_image(&second_bytes).unwrap();
+        harness.put_blob(&second.sha256, second_bytes, REPORTER_SEED).await;
+
+        let mut report = photo_report_json(&mandate, "r-1", &first_content);
+        report["classId"] = json!("csam");
+        let second_content = media_preimage(&second);
+        report["evidence"] = json!([
+            {
+                "disclosedContent": first_content,
+                "authenticityProof": testing::sign(ACCUSED_SEED, first_content.as_bytes()),
+            },
+            {
+                "disclosedContent": second_content,
+                "authenticityProof": testing::sign(ACCUSED_SEED, second_content.as_bytes()),
+            },
+        ]);
+
+        let (status, _) =
+            harness.post("/v1/reports", signed(report, "signature", &[REPORTER_SEED])).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(harness.state.store.evidence_blob(&first.sha256).unwrap().is_none());
+        assert!(
+            harness.state.store.evidence_blob(&second.sha256).unwrap().is_none(),
+            "every image the filing named, not only the first item's"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_commitment_is_bounded_before_it_becomes_work() {
+        // A signed preimage's length is attacker-chosen, and the
+        // refusal path costs two queries per digest. Bounding after
+        // refusing made a preimage naming thousands of blobs into
+        // thousands of queries per request.
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let mandate = register_mandate(&harness, REPORTER_SEED).await;
+        let entries: Vec<String> = (0..500)
+            .map(|i| {
+                format!(
+                    r#"{{"blob_sha256":"c","height":4,"mime_type":"image/jpeg","plaintext_byte_length":9,"plaintext_sha256":"{:064x}","width":3}}"#,
+                    i
+                )
+            })
+            .collect();
+        let content = format!(
+            r#"{{"body":"","group_binding":"ab","media":[{}],"message_id":"m","proof_version":2,"sent_at_millis":1}}"#,
+            entries.join(",")
+        );
+        let mut report = photo_report_json(&mandate, "r-1", &content);
+        report["classId"] = json!("csam");
+
+        let (status, response) =
+            harness.post("/v1/reports", signed(report, "signature", &[REPORTER_SEED])).await;
+
+        // Bounded, not refused for the class — the bound comes first.
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], "bad_request");
+    }
+
+    #[tokio::test]
+    async fn a_commitment_without_dimensions_does_not_authenticate_an_image() {
+        // Width and height are printed in the case document and the
+        // panel as facts about the evidence. A commitment omitting them
+        // would have those numbers attributed to a signature that never
+        // covered them.
+        let harness = Harness::new();
+        let (mandate, accepted, _) = seed_photo(&harness).await;
+        let content = format!(
+            r#"{{"body":"","group_binding":"ab","media":[{{"blob_sha256":"cipher","mime_type":"image/jpeg","plaintext_byte_length":{},"plaintext_sha256":"{}"}}],"message_id":"m-1","proof_version":2,"sent_at_millis":1}}"#,
+            accepted.byte_length, accepted.sha256
+        );
+        let body =
+            signed(photo_report_json(&mandate, "r-1", &content), "signature", &[REPORTER_SEED]);
+
+        let (status, response) = harness.post("/v1/reports", body).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+        assert_eq!(response["error"], "authenticity_unverified");
+    }
+
+    #[tokio::test]
+    async fn a_refused_csam_report_does_not_leave_the_image_on_the_server() {
+        // The upload route has no class context, so the bytes are on
+        // disk before anything knows what they will be claimed as.
+        // Custody is unavoidable; holding it for a day is not.
+        let harness = Harness::new();
+        let (mandate, accepted, content) = seed_photo(&harness).await;
+        let mut report = photo_report_json(&mandate, "r-1", &content);
+        report["classId"] = json!("csam");
+
+        let (status, response) =
+            harness.post("/v1/reports", signed(report, "signature", &[REPORTER_SEED])).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(response["error"], "media_class_refused");
+        assert!(
+            harness.state.store.evidence_blob(&accepted.sha256).unwrap().is_none(),
+            "a refused class must not leave the image sitting for the expiry window"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_does_not_take_an_image_a_live_case_rests_on() {
+        // The same digest can serve two cases. A refusal is this
+        // report's business and no other's.
+        let harness = Harness::new();
+        let (mandate, accepted, content) = seed_photo(&harness).await;
+        let (ok_status, _) = harness
+            .post(
+                "/v1/reports",
+                signed(photo_report_json(&mandate, "r-1", &content), "signature", &[REPORTER_SEED]),
+            )
+            .await;
+        assert_eq!(ok_status, StatusCode::OK);
+
+        let mut refused = photo_report_json(&mandate, "r-2", &content);
+        refused["classId"] = json!("csam");
+        let (status, _) =
+            harness.post("/v1/reports", signed(refused, "signature", &[REPORTER_SEED])).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            harness.state.store.evidence_blob(&accepted.sha256).unwrap().is_some(),
+            "a live case still rests on these bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_re_upload_at_the_edge_of_expiry_refreshes_the_clock() {
+        // The 200 has to mean the bytes are here and will stay. It did
+        // not: an ignored insert left `uploaded_at` stale, so the sweep
+        // could take a blob the server had just acknowledged.
+        let harness = Harness::new();
+        register_mandate(&harness, REPORTER_SEED).await;
+        let bytes = media::tiny_jpeg(12, 12);
+        let accepted = media::accept_image(&bytes).unwrap();
+        harness.put_blob(&accepted.sha256, bytes.clone(), REPORTER_SEED).await;
+        // Age it to the brink.
+        harness
+            .state
+            .store
+            .touch_evidence_blobs(&[accepted.sha256.clone()], "2020-01-01T00:00:00Z")
+            .unwrap();
+
+        let (status, _) = harness.put_blob(&accepted.sha256, bytes, REPORTER_SEED).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let swept = harness
+            .state
+            .store
+            .sweep_unreferenced_evidence_blobs("2020-06-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(swept, 0, "the re-upload restarted the clock");
+        assert!(harness.state.store.evidence_blob(&accepted.sha256).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_key_at_the_quota_can_still_re_upload_what_it_already_sent() {
+        // The cap must not break the one recovery path the design
+        // leans on: re-sending bytes already on file costs nothing new.
+        let harness = Harness::new();
+        register_mandate(&harness, REPORTER_SEED).await;
+        let mut first: Option<Vec<u8>> = None;
+        for size in 0..MAX_UNREFERENCED_UPLOADS_PER_KEY {
+            let bytes = media::tiny_jpeg(8 + size as u32, 8);
+            let accepted = media::accept_image(&bytes).unwrap();
+            harness.put_blob(&accepted.sha256, bytes.clone(), REPORTER_SEED).await;
+            if first.is_none() {
+                first = Some(bytes);
+            }
+        }
+
+        let bytes = first.unwrap();
+        let accepted = media::accept_image(&bytes).unwrap();
+        let (status, response) = harness.put_blob(&accepted.sha256, bytes, REPORTER_SEED).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+
+        // A genuinely new one is still refused.
+        let fresh = media::tiny_jpeg(300, 8);
+        let fresh_accepted = media::accept_image(&fresh).unwrap();
+        let (status, _) = harness.put_blob(&fresh_accepted.sha256, fresh, REPORTER_SEED).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn uploads_a_case_rests_on_do_not_count_against_the_bound() {
+        // The bound is on uploads no case rests on — keyed on the join
+        // table rather than on a flag set at filing time, so an upload
+        // whose case never opened keeps counting instead of vanishing
+        // from the budget the way the earlier flag let it.
+        let harness = Harness::new();
+        let (mandate, _, content) = seed_photo(&harness).await;
+        let body =
+            signed(photo_report_json(&mandate, "r-1", &content), "signature", &[REPORTER_SEED]);
+        let (status, _) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let reporter = testing::key_reference(REPORTER_SEED);
+        assert_eq!(harness.state.store.unreferenced_uploads_by(&reporter).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_commitment_spelling_its_digest_in_uppercase_still_finds_the_bytes() {
+        // Uploads are stored under lowercase hex. A digest differing
+        // only in case would otherwise be refused as missing with the
+        // bytes sitting on disk.
+        let harness = Harness::new();
+        let (mandate, accepted, _) = seed_photo(&harness).await;
+        let content = format!(
+            r#"{{"body":"","group_binding":"ab","media":[{{"blob_sha256":"cipher","height":{},"mime_type":"image/jpeg","plaintext_byte_length":{},"plaintext_sha256":"{}","width":{}}}],"message_id":"m-1","proof_version":2,"sent_at_millis":1}}"#,
+            accepted.height,
+            accepted.byte_length,
+            accepted.sha256.to_uppercase(),
+            accepted.width
+        );
+        let body =
+            signed(photo_report_json(&mandate, "r-1", &content), "signature", &[REPORTER_SEED]);
+
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_filed_photo_report_survives_a_retry_without_re_uploading() {
+        let harness = Harness::new();
+        let (mandate, _, content) = seed_photo(&harness).await;
+        let body =
+            signed(photo_report_json(&mandate, "r-1", &content), "signature", &[REPORTER_SEED]);
+
+        let (first_status, first) = harness.post("/v1/reports", body.clone()).await;
+        assert_eq!(first_status, StatusCode::OK, "{first}");
+        let (second_status, second) = harness.post("/v1/reports", body).await;
+        assert_eq!(second_status, StatusCode::OK, "{second}");
+        assert_eq!(second["duplicate"], true);
+        assert_eq!(second["caseId"], first["caseId"]);
+    }
+
+    #[tokio::test]
+    async fn a_text_report_still_files_unchanged_alongside_media_support() {
+        // The regression that matters most: disclosed content is now
+        // parsed, and everything already on file predates that.
+        let harness = Harness::new();
+        register_mandate(&harness, ACCUSED_SEED).await;
+        let mandate = register_mandate(&harness, REPORTER_SEED).await;
+        let body = signed(report_json(&mandate, "r-1"), "signature", &[REPORTER_SEED]);
+
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let case_id = response["caseId"].as_str().unwrap();
+        let case = harness.state.store.case(case_id).unwrap().unwrap();
+        let document = crate::casedoc::build(&harness.state.store, &case).unwrap();
+        assert!(document.images.is_empty());
+        assert!(!document.text.contains("shown-as"));
     }
 
     /// A human ban decision with the appeal routes #23 made
