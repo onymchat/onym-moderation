@@ -264,7 +264,7 @@ mod tests {
     fn store_image(store: &Store, uploaded_at: &str) -> String {
         let bytes = crate::media::tiny_jpeg(10, 10);
         let accepted = crate::media::accept_image(&bytes).unwrap();
-        store.put_evidence_blob(&accepted, &bytes, uploaded_at).unwrap();
+        store.put_evidence_blob(&accepted, &bytes, uploaded_at, "onym:key:uploader").unwrap();
         accepted.sha256
     }
 
@@ -322,6 +322,72 @@ mod tests {
             state.store.evidence_blob_derivative(&digest).unwrap().is_none(),
             "a deletion that leaves the derivative behind still leaves the picture"
         );
+    }
+
+    /// The same photo can legitimately belong to two cases — forwarded
+    /// by two senders, or one sender reported under two classes — and
+    /// content addressing makes both resolve to one stored row. The
+    /// first case finishing must not take the second case's evidence
+    /// with it.
+    #[tokio::test]
+    async fn a_photo_two_cases_rest_on_survives_the_first_one_ending() {
+        let store = Store::in_memory().unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+        store.mark_evidence_blobs_referenced(&[digest.clone()]).unwrap();
+
+        let mut finished = case_due("2026-08-05T00:00:00Z");
+        finished.case_id = "finished".into();
+        finished.stage = "decided".into();
+        finished.disposition = Some("dismiss".into());
+        store.put_case(&finished).unwrap();
+        store.attach_evidence_blobs("finished", &[digest.clone()]).unwrap();
+
+        // Still open, and resting on the same bytes.
+        let mut live = case_due("2026-12-01T00:00:00Z");
+        live.case_id = "live".into();
+        store.put_case(&live).unwrap();
+        store.attach_evidence_blobs("live", &[digest.clone()]).unwrap();
+
+        let state = crate::state::AppState::for_tests(store);
+        retention_sweep(&state, util::parse_timestamp("2026-08-10T00:00:00Z").unwrap()).unwrap();
+
+        assert!(
+            state.store.evidence_blob(&digest).unwrap().is_some(),
+            "a finished case must not delete evidence a live case still rests on"
+        );
+
+        // And once the last case holding it is done, it does go.
+        live.stage = "decided".into();
+        live.disposition = Some("dismiss".into());
+        state.store.put_case(&live).unwrap();
+        retention_sweep(&state, util::parse_timestamp("2026-12-02T00:00:00Z").unwrap()).unwrap();
+        assert!(state.store.evidence_blob(&digest).unwrap().is_none());
+    }
+
+    /// A dismissal carries no appeal deadline — it is final and clears
+    /// the marks — so keying retention on that alone would delete its
+    /// evidence on the very next sweep, minutes after a decision
+    /// somebody may still be asking about.
+    #[tokio::test]
+    async fn a_dismissal_does_not_lose_its_evidence_the_moment_it_is_decided() {
+        let store = Store::in_memory().unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+        store.mark_evidence_blobs_referenced(&[digest.clone()]).unwrap();
+
+        let mut case = case_due("2026-08-20T00:00:00Z");
+        case.stage = "decided".into();
+        case.disposition = Some("dismiss".into());
+        case.appeal_deadline = None;
+        store.put_case(&case).unwrap();
+        store.attach_evidence_blobs(&case.case_id, &[digest.clone()]).unwrap();
+        let state = crate::state::AppState::for_tests(store);
+
+        // Decided early; the case's own signed horizon has not passed.
+        retention_sweep(&state, util::parse_timestamp("2026-08-06T00:00:00Z").unwrap()).unwrap();
+        assert!(state.store.evidence_blob(&digest).unwrap().is_some());
+
+        retention_sweep(&state, util::parse_timestamp("2026-08-21T00:00:00Z").unwrap()).unwrap();
+        assert!(state.store.evidence_blob(&digest).unwrap().is_none());
     }
 
     #[tokio::test]

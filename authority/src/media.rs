@@ -121,12 +121,22 @@ pub fn parse_disclosed(content: &str) -> Result<Disclosed, Error> {
             Ok(Disclosed::Text)
         }
         2 => {
-            let items: Vec<MediaCommitment> = serde_json::from_value(
+            let mut items: Vec<MediaCommitment> = serde_json::from_value(
                 object.get("media").cloned().unwrap_or(serde_json::Value::Null),
             )
             .map_err(|e| {
                 Error::AuthenticityUnverified(format!("version 2 proof has unreadable media: {e}"))
             })?;
+            // Digests are compared against stored keys, and uploads are
+            // stored under lowercase hex. Normalizing here rather than
+            // at each comparison keeps one spelling of a digest from
+            // meaning "not on file" while the bytes sit in the store.
+            // Note this touches only the parsed copy — the signature
+            // covers the original string, which is never rewritten.
+            for item in &mut items {
+                item.plaintext_sha256.make_ascii_lowercase();
+                item.blob_sha256.make_ascii_lowercase();
+            }
             if items.is_empty() {
                 return Err(Error::AuthenticityUnverified(
                     "a version 2 proof must commit to at least one media item".into(),

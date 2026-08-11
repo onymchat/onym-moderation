@@ -67,6 +67,13 @@ pub fn evidence_router(state: Arc<AppState>) -> Router {
 /// status-query window.
 const UPLOAD_CREDENTIAL_MAX_AGE_SECONDS: i64 = 300;
 
+/// How many uploads one key may hold that no report has claimed.
+///
+/// Generous next to any real reporting session — a report discloses one
+/// photo — and small enough that the worst a consented key can park on
+/// this authority is bounded rather than open-ended.
+const MAX_UNREFERENCED_UPLOADS_PER_KEY: usize = 16;
+
 /// Classes that do not accept media evidence.
 ///
 /// `csam` is refused on purpose, and the refusal is about this
@@ -158,8 +165,8 @@ fn verify_media_evidence(
 ///
 /// The credential exists for a narrower reason: uploading is the one
 /// operation here that costs storage before any report justifies it, so
-/// it is restricted to keys that have consented to this authority. It is
-/// quota control, not the integrity story.
+/// it is restricted to keys that have consented to this authority, and
+/// bounded per key. That is resource control, not the integrity story.
 async fn put_evidence_blob(
     State(state): State<Arc<AppState>>,
     Path(sha256): Path<String>,
@@ -187,6 +194,18 @@ async fn put_evidence_blob(
     if state.store.mandates_for_user(key)?.is_empty() {
         return Err(Error::ReporterUnconsented);
     }
+    // Consent alone is not a budget. Without this a single consented key
+    // can push unlimited blobs into the store and wait for nothing —
+    // uploads are only reclaimed a day later, and only if no report ever
+    // named them. The bound is on *unreferenced* uploads, so a reporter
+    // filing real reports is never blocked by their own history; only
+    // one accumulating bytes they never report is.
+    if state.store.unreferenced_uploads_by(key)? >= MAX_UNREFERENCED_UPLOADS_PER_KEY {
+        return Err(Error::MediaTooLarge(format!(
+            "this key already holds {MAX_UNREFERENCED_UPLOADS_PER_KEY} uploads no report \
+             references; file or abandon those before uploading more"
+        )));
+    }
 
     // Validate and normalize before anything is persisted, so a
     // decompression bomb is a rejected request rather than a row.
@@ -198,7 +217,7 @@ async fn put_evidence_blob(
         )));
     }
 
-    state.store.put_evidence_blob(&accepted, &body, &util::format_timestamp(now))?;
+    state.store.put_evidence_blob(&accepted, &body, &util::format_timestamp(now), key)?;
 
     Ok(Json(json!({
         "sha256": accepted.sha256,
@@ -2090,6 +2109,64 @@ mod tests {
         }
         let stored = harness.state.store.evidence_blob(&accepted.sha256).unwrap().unwrap();
         assert_eq!(stored.byte_length, accepted.byte_length);
+    }
+
+    #[tokio::test]
+    async fn a_key_cannot_park_unlimited_uploads() {
+        // Consent is not a budget: uploading happens before any report
+        // justifies it, and the expiry sweep only reclaims a day later.
+        let harness = Harness::new();
+        register_mandate(&harness, REPORTER_SEED).await;
+
+        for size in 0..MAX_UNREFERENCED_UPLOADS_PER_KEY {
+            let bytes = media::tiny_jpeg(8 + size as u32, 8);
+            let accepted = media::accept_image(&bytes).unwrap();
+            let (status, response) =
+                harness.put_blob(&accepted.sha256, bytes, REPORTER_SEED).await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+        }
+
+        let bytes = media::tiny_jpeg(200, 8);
+        let accepted = media::accept_image(&bytes).unwrap();
+        let (status, response) = harness.put_blob(&accepted.sha256, bytes, REPORTER_SEED).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{response}");
+        assert_eq!(response["error"], "media_too_large");
+    }
+
+    #[tokio::test]
+    async fn uploads_a_report_already_names_do_not_count_against_the_bound() {
+        // The bound is on uploads nobody reported. A reporter filing
+        // real reports must never be blocked by their own history.
+        let harness = Harness::new();
+        let (mandate, _, content) = seed_photo(&harness).await;
+        let body =
+            signed(photo_report_json(&mandate, "r-1", &content), "signature", &[REPORTER_SEED]);
+        let (status, _) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let reporter = testing::key_reference(REPORTER_SEED);
+        assert_eq!(harness.state.store.unreferenced_uploads_by(&reporter).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_commitment_spelling_its_digest_in_uppercase_still_finds_the_bytes() {
+        // Uploads are stored under lowercase hex. A digest differing
+        // only in case would otherwise be refused as missing with the
+        // bytes sitting on disk.
+        let harness = Harness::new();
+        let (mandate, accepted, _) = seed_photo(&harness).await;
+        let content = format!(
+            r#"{{"body":"","group_binding":"ab","media":[{{"blob_sha256":"cipher","height":{},"mime_type":"image/jpeg","plaintext_byte_length":{},"plaintext_sha256":"{}","width":{}}}],"message_id":"m-1","proof_version":2,"sent_at_millis":1}}"#,
+            accepted.height,
+            accepted.byte_length,
+            accepted.sha256.to_uppercase(),
+            accepted.width
+        );
+        let body =
+            signed(photo_report_json(&mandate, "r-1", &content), "signature", &[REPORTER_SEED]);
+
+        let (status, response) = harness.post("/v1/reports", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
     }
 
     #[tokio::test]

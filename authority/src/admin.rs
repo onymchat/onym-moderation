@@ -622,6 +622,8 @@ async fn case_detail(
         }
     }
 
+    body.push_str(&accused_response_section(&state, &case)?);
+
     body.push_str("<h2>History</h2><table><tr><th>At</th><th>Event</th><th>Detail</th></tr>");
     for (at, kind, detail) in state.store.events(&case_id)? {
         body.push_str(&format!(
@@ -714,6 +716,45 @@ async fn initial_decision(
     .await?;
 
     Ok(Redirect::to(&format!("/admin/cases/{case_id}")).into_response())
+}
+
+/// What the accused filed, including any counter-evidence images.
+///
+/// The panel had no response section at all: a reviewer could read the
+/// accused's statement only inside the stored case-document blob under
+/// the assessment, and a photo rebuttal appeared there as a digest and
+/// nothing more. Since the merits are reviewed by a human exactly once
+/// — on appeal — the answer to an accusation should be as legible as
+/// the accusation.
+fn accused_response_section(state: &AppState, case: &CaseRecord) -> Result<String, Error> {
+    let responses = state.store.responses(&case.case_id)?;
+    let mut out = String::from("<h2>Accused response</h2>");
+    if responses.is_empty() {
+        out.push_str("<p class=empty>None on file.</p>");
+        return Ok(out);
+    }
+
+    for (index, (raw, late, filed_at)) in responses.iter().enumerate() {
+        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(raw) else { continue };
+        out.push_str(&format!(
+            "<p class=detail>Response {} filed {}{}</p>",
+            index + 1,
+            escape(filed_at),
+            if *late { ", after the response deadline" } else { "" },
+        ));
+        let statement = parsed.get("statement").and_then(|v| v.as_str()).unwrap_or("");
+        out.push_str(&format!("<pre class=evidence>{}</pre>", escape(statement)));
+
+        let Some(items) = parsed.get("evidence").and_then(|v| v.as_array()) else { continue };
+        for item in items {
+            let Some(content) = item.get("disclosedContent").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            out.push_str(&render_evidence_images(state, content, &case.class_id)?);
+            out.push_str(&format!("<pre class=evidence>{}</pre>", escape(content)));
+        }
+    }
+    Ok(out)
 }
 
 /// Classes whose evidence a reviewer should choose to look at, rather

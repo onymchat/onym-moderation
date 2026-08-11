@@ -168,9 +168,6 @@ pub struct EvidenceBlobRecord {
     pub height: u32,
     pub derivative_sha256: String,
     pub derivative_version: u32,
-    /// The case this blob became evidence for, or `None` while it is
-    /// still an unreferenced upload.
-    pub case_id: Option<String>,
 }
 
 /// One case, in the lifecycle of Moderation.md §10.
@@ -492,11 +489,27 @@ impl Store {
                 -- upload, and the sweep would delete bytes a stored
                 -- report depends on.
                 referenced         INTEGER NOT NULL DEFAULT 0,
-                -- The case this blob became evidence for. Filled when
-                -- the report is attached, and what retention deletes by.
-                case_id            TEXT
+                -- The key that uploaded these bytes, so unreferenced
+                -- uploads can be bounded per uploader.
+                uploaded_by        TEXT NOT NULL DEFAULT ''
             );
-            CREATE INDEX IF NOT EXISTS evidence_blobs_case ON evidence_blobs (case_id);
+
+            -- Which cases rest on which blob. A join table rather than a
+            -- column on the blob, because content addressing means one
+            -- row can genuinely serve several cases: the same photo
+            -- forwarded by two senders, or one sender reported under two
+            -- classes, both resolve to the same digest and the same
+            -- stored bytes. A single `case_id` would record only
+            -- whichever case attached first, and retention on that case
+            -- would then delete the evidence out from under the others,
+            -- which are still live.
+            CREATE TABLE IF NOT EXISTS evidence_blob_cases (
+                sha256  TEXT NOT NULL,
+                case_id TEXT NOT NULL,
+                PRIMARY KEY (sha256, case_id)
+            );
+            CREATE INDEX IF NOT EXISTS evidence_blob_cases_case
+                ON evidence_blob_cases (case_id);
             "#,
         )
         .map_err(|e| Error::Internal(format!("migrate: {e}")))?;
@@ -528,6 +541,7 @@ impl Store {
             ("assessments", "attempts", "INTEGER NOT NULL DEFAULT 0"),
             ("assessments", "document", "BLOB"),
             ("evidence_blobs", "referenced", "INTEGER NOT NULL DEFAULT 0"),
+            ("evidence_blobs", "uploaded_by", "TEXT NOT NULL DEFAULT ''"),
         ] {
             Self::add_column(&conn, table, column, definition)?;
         }
@@ -1482,13 +1496,14 @@ impl Store {
         image: &crate::media::AcceptedImage,
         original: &[u8],
         uploaded_at: &str,
+        uploaded_by: &str,
     ) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO evidence_blobs \
              (sha256, mime_type, byte_length, width, height, bytes, derivative, \
-              derivative_sha256, derivative_version, uploaded_at, case_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
+              derivative_sha256, derivative_version, uploaded_at, uploaded_by) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 image.sha256,
                 image.mime_type,
@@ -1500,6 +1515,7 @@ impl Store {
                 image.derivative_sha256,
                 image.derivative_version as i64,
                 uploaded_at,
+                uploaded_by,
             ],
         )?;
         Ok(())
@@ -1513,7 +1529,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(
             "SELECT sha256, mime_type, byte_length, width, height, derivative_sha256, \
-             derivative_version, case_id FROM evidence_blobs WHERE sha256 = ?1",
+             derivative_version FROM evidence_blobs WHERE sha256 = ?1",
         )?;
         let mut rows = statement.query_map(params![sha256], |row| {
             Ok(EvidenceBlobRecord {
@@ -1524,7 +1540,6 @@ impl Store {
                 height: row.get::<_, i64>(4)? as u32,
                 derivative_sha256: row.get(5)?,
                 derivative_version: row.get::<_, i64>(6)? as u32,
-                case_id: row.get(7)?,
             })
         })?;
         rows.next().transpose().map_err(Into::into)
@@ -1555,17 +1570,35 @@ impl Store {
         Ok(())
     }
 
-    /// Bind referenced uploads to the case that now rests on them, so
-    /// retention has something to delete them by.
+    /// Bind referenced uploads to the case that now rests on them.
+    ///
+    /// Inserts into the join table, so a digest several cases depend on
+    /// records every one of them rather than only the first.
     pub fn attach_evidence_blobs(&self, case_id: &str, digests: &[String]) -> Result<(), Error> {
         let conn = self.conn.lock().unwrap();
         for digest in digests {
             conn.execute(
-                "UPDATE evidence_blobs SET case_id = ?1 WHERE sha256 = ?2 AND case_id IS NULL",
-                params![case_id, digest],
+                "INSERT OR IGNORE INTO evidence_blob_cases (sha256, case_id) VALUES (?1, ?2)",
+                params![digest, case_id],
             )?;
         }
         Ok(())
+    }
+
+    /// How many uploads this key holds that no report has claimed.
+    ///
+    /// The bound this feeds is the only thing standing between a
+    /// consented key and unlimited storage: uploading happens before any
+    /// report justifies it, and the expiry sweep only reclaims after a
+    /// day.
+    pub fn unreferenced_uploads_by(&self, uploader: &str) -> Result<usize, Error> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM evidence_blobs WHERE uploaded_by = ?1 AND referenced = 0",
+            params![uploader],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
     }
 
     /// Drop uploads nobody ever filed a report against.
@@ -1577,7 +1610,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let removed = conn.execute(
             "DELETE FROM evidence_blobs \
-             WHERE referenced = 0 AND case_id IS NULL AND uploaded_at < ?1",
+             WHERE referenced = 0 AND uploaded_at < ?1 \
+               AND sha256 NOT IN (SELECT sha256 FROM evidence_blob_cases)",
             params![uploaded_before],
         )?;
         Ok(removed)
@@ -1585,24 +1619,24 @@ impl Store {
 
     /// Cases holding media whose process is over.
     ///
-    /// "Over" means decided *and* past the appeal window, because an
-    /// appeal is reviewed by a human looking at the same evidence. A
-    /// case with a live appeal deadline still needs its pictures; one
-    /// past it does not, and keeping them would be retention beyond
-    /// what the case and appeal require.
-    ///
-    /// A case still awaiting appeal review is excluded even if its
-    /// deadline has passed — the claim is on the table and deleting the
-    /// material under a pending review would decide it by attrition.
+    /// "Over" means decided, with no claim pending, and past the later
+    /// of the appeal deadline and the decision deadline. Taking the
+    /// later of the two matters because a dismissal carries no appeal
+    /// deadline at all — it is final and clears the marks — and keying
+    /// only on that would make a case dismissed on the record lose its
+    /// evidence on the very next sweep, minutes after a decision
+    /// somebody may still be asking about. The decision deadline is a
+    /// signed, already-authenticated horizon, so it gives that grace
+    /// without inventing new state.
     pub fn cases_with_media_past_retention(&self, now: &str) -> Result<Vec<String>, Error> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(
-            "SELECT DISTINCT b.case_id FROM evidence_blobs b \
+            "SELECT DISTINCT b.case_id FROM evidence_blob_cases b \
              JOIN cases c ON c.case_id = b.case_id \
-             WHERE b.case_id IS NOT NULL \
-               AND c.stage = 'decided' \
+             WHERE c.stage = 'decided' \
                AND c.appeal_state != 'pending' \
                AND c.new_holder_state != 'pending' \
+               AND c.decision_deadline < ?1 \
                AND (c.appeal_deadline IS NULL OR c.appeal_deadline < ?1)",
         )?;
         let rows = statement.query_map(params![now], |row| row.get::<_, String>(0))?;
@@ -1615,13 +1649,36 @@ impl Store {
 
     /// Forget a finished case's media.
     ///
-    /// Original and derivative go together — keeping the derivative
-    /// would be keeping the picture, and a deletion that leaves the
-    /// image behind is not one.
+    /// Detaches this case, then deletes only the blobs no other case
+    /// still rests on. A shared digest survives until the last case
+    /// holding it is done — deleting on the first would take evidence
+    /// from a live case that happens to have received the same photo.
+    ///
+    /// Original and derivative go together, because they are one row:
+    /// keeping the derivative would be keeping the picture, and a
+    /// deletion that leaves a legible copy behind is not one.
     pub fn delete_evidence_blobs_for_case(&self, case_id: &str) -> Result<usize, Error> {
         let conn = self.conn.lock().unwrap();
-        let removed =
-            conn.execute("DELETE FROM evidence_blobs WHERE case_id = ?1", params![case_id])?;
+        let candidates: Vec<String> = {
+            let mut statement =
+                conn.prepare("SELECT sha256 FROM evidence_blob_cases WHERE case_id = ?1")?;
+            let rows = statement.query_map(params![case_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        conn.execute("DELETE FROM evidence_blob_cases WHERE case_id = ?1", params![case_id])?;
+
+        let mut removed = 0;
+        for digest in candidates {
+            let still_held: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM evidence_blob_cases WHERE sha256 = ?1",
+                params![digest],
+                |row| row.get(0),
+            )?;
+            if still_held == 0 {
+                removed += conn
+                    .execute("DELETE FROM evidence_blobs WHERE sha256 = ?1", params![digest])?;
+            }
+        }
         Ok(removed)
     }
 

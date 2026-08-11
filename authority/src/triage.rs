@@ -244,6 +244,33 @@ impl Triage {
         // the image would otherwise be dropped, the caption classified
         // alone, and the verdict would read as though the picture had
         // been reviewed.
+        // Evidence the record commits to but cannot produce. Deciding
+        // here would mean scoring whatever text survives — for a
+        // picture-only report, an empty caption — and signing it as a
+        // review of the material. That is the exact failure the
+        // modality check below exists to prevent, arriving by a
+        // different route.
+        if document.unresolved_media > 0 {
+            return self.record(
+                state,
+                case,
+                profile,
+                "",
+                &document,
+                Assessed {
+                    outcome: Outcome::NoDecision,
+                    score: None,
+                    labels: Vec::new(),
+                    note: format!(
+                        "case {} commits to {} media item(s) whose bytes are not on file; it \
+                         will not be decided on evidence that cannot be produced",
+                        case.case_id, document.unresolved_media
+                    ),
+                },
+                now,
+            );
+        }
+
         if !document.images.is_empty()
             && (!profile.supports_images || document.images.len() as u32 > profile.max_images)
         {
@@ -1060,7 +1087,7 @@ mod tests {
     fn attach_photo(store: &crate::store::Store, class_id: &str) -> crate::media::AcceptedImage {
         let bytes = crate::media::tiny_jpeg(20, 12);
         let accepted = crate::media::accept_image(&bytes).unwrap();
-        store.put_evidence_blob(&accepted, &bytes, "2026-08-02T00:00:00Z").unwrap();
+        store.put_evidence_blob(&accepted, &bytes, "2026-08-02T00:00:00Z", "onym:key:uploader").unwrap();
         store.mark_evidence_blobs_referenced(&[accepted.sha256.clone()]).unwrap();
         store.attach_evidence_blobs("c1", &[accepted.sha256.clone()]).unwrap();
         let content = format!(
@@ -1120,6 +1147,45 @@ mod tests {
         let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
         assert_eq!(assessment.outcome, "no-decision");
         assert!(assessment.note.contains("cannot inspect"), "{}", assessment.note);
+    }
+
+    /// Evidence the record commits to but cannot produce.
+    ///
+    /// This is the same failure as the modality one, arriving by a
+    /// different route: with the blob gone the document has no images,
+    /// so a modality check alone would wave a picture-only case through
+    /// and let the model score its caption — usually the empty string —
+    /// with the verdict recording a review of the picture.
+    #[tokio::test]
+    async fn a_case_whose_media_is_gone_is_not_decided_on_what_is_left() {
+        let (url, seen) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "unsafe\nS12"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "unsolicited-pornography", "2026-08-04T00:00:00Z");
+        let accepted = attach_photo(&store, "unsolicited-pornography");
+        // Retention already ran, or the row was never stored.
+        store.delete_evidence_blobs_for_case("c1").unwrap();
+        assert!(store.evidence_blob(&accepted.sha256).unwrap().is_none());
+
+        // An image-capable profile, so modality is not what refuses.
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "llama-guard-4-12b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        assert_eq!(state.store.case("c1").unwrap().unwrap().disposition, None);
+        assert!(seen.lock().unwrap().is_empty(), "the model must not be asked at all");
+        let (raw, _) = state.store.assessment("c1").unwrap().unwrap();
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(assessment.outcome, "no-decision");
+        assert!(assessment.note.contains("not on file"), "{}", assessment.note);
     }
 
     /// And the other half: a profile whose terms enable images is sent

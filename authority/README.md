@@ -634,10 +634,14 @@ Reference implementation. Known limits:
   no statutory-reporting path — so the refusal is about readiness, not
   about the report.
 - **Media retention is a sweep, not a published schedule.** Uploads
-  nobody reported expire after 24 hours; a decided case's images are
-  deleted once its appeal window closes and no claim is pending, with
-  original and derivative removed together. There is still no declared
-  retention period for the rest of the case record.
+  nobody reported expire after 24 hours and are bounded per key while
+  they wait. A decided case's images are deleted once the later of its
+  appeal and decision deadlines has passed and no claim is pending —
+  the later of the two because a dismissal carries no appeal deadline
+  at all, and keying on that alone would delete its evidence on the
+  next sweep. Original and derivative go together, and a digest several
+  cases rest on survives until the last of them is finished. There is
+  still no declared retention period for the rest of the case record.
 - **Notices are returned to the reporter's call and stored, not pushed
   to the accused.** Serving them is the interface's job (§5.5), and it
   reads them from the gate check.

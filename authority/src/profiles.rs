@@ -230,6 +230,7 @@ pub struct ModelProfile {
 /// control and cannot promise stays on the host.
 fn build_content_parts(
     user: &str,
+    document: Option<&str>,
     images: &[Vec<u8>],
     placement: ImagePlacement,
 ) -> Vec<Value> {
@@ -253,11 +254,14 @@ fn build_content_parts(
             parts
         }
         ImagePlacement::AfterTextPrefix => {
-            // The prefix is everything up to the case document's first
-            // labelled field; the images follow it, then the rest. Split
-            // on the document's own leading label so the boundary is the
-            // one the profile describes rather than a character count.
-            let (prefix, rest) = match user.find("CLASS:") {
+            // "text prefix, image, remaining context" — so the boundary
+            // is where the case document begins inside the filled
+            // prompt. Located by finding the document itself rather than
+            // by scanning for a label: a canonical rule whose text
+            // happens to contain "CLASS:" would otherwise move the
+            // boundary into the middle of the prompt, and rule bodies
+            // are policy text nobody would think to check for that.
+            let (prefix, rest) = match document.and_then(|d| user.find(d)) {
                 Some(index) if index > 0 => user.split_at(index),
                 _ => (user, ""),
             };
@@ -408,7 +412,12 @@ impl ModelProfile {
             // multimodal support was added elsewhere.
             Value::String(user)
         } else {
-            Value::Array(build_content_parts(&user, images, self.image_placement))
+            Value::Array(build_content_parts(
+                &user,
+                Some(document),
+                images,
+                self.image_placement,
+            ))
         };
         messages.push(serde_json::json!({ "role": "user", "content": user_content }));
 
@@ -1573,6 +1582,28 @@ mod tests {
 
     /// Decoding is pinned: the same case must not decide differently on
     /// a retry.
+    /// Image placement is anchored on where the document begins, not on
+    /// a label scanned out of the filled prompt. Shieldstral's rule
+    /// bodies are policy prose, and one containing the literal
+    /// "CLASS:" would otherwise move the boundary into the middle of
+    /// the instruction.
+    #[test]
+    fn images_land_at_the_document_boundary_not_at_a_label_in_the_rule() {
+        let profile = shieldstral_3b();
+        assert_eq!(profile.image_placement, ImagePlacement::AfterTextPrefix);
+        let document = "CLASS: csam\n\nREPORTED MATERIAL:\nthe material";
+        let body = profile.request_body("csam", document, &[vec![1, 2, 3]]).unwrap();
+
+        let parts = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        // The prefix ends exactly where the document starts, so the
+        // whole instruction precedes the image and the whole document
+        // follows it.
+        assert!(!parts[0]["text"].as_str().unwrap().contains("REPORTED MATERIAL"));
+        assert!(parts[2]["text"].as_str().unwrap().starts_with(document));
+    }
+
     #[test]
     fn decoding_is_deterministic() {
         for profile in builtin() {
