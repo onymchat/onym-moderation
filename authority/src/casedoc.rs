@@ -229,6 +229,20 @@ fn media_lines(
             ));
             continue;
         };
+        // The row survives a `drop_derivative` — only the viewable copy
+        // goes — so "the blob exists" is not "there is something to
+        // look at". Blobs are shared by digest, so a drop taken under a
+        // preserved class on one case reaches every other case naming
+        // the same bytes; without this, such a case would list the image
+        // as present and be scored as though it had been seen.
+        if stored.derivative_sha256.is_empty() {
+            *unresolved += 1;
+            out.push_str(&format!(
+                "[media of {label}: sha256 {} is retained but not viewable at this authority]\n",
+                commitment.plaintext_sha256
+            ));
+            continue;
+        }
         images.push(DocumentImage {
             sha256: stored.sha256.clone(),
             mime_type: stored.mime_type.clone(),
@@ -461,9 +475,9 @@ mod tests {
         let (store, image) = store_with_photo_report(20, 12);
         assert_eq!(build(&store, &case()).unwrap().images.len(), 1);
 
-        store.delete_evidence_blobs_for_case("c1").unwrap();
+        store.delete_evidence_blobs_for_case("c1", "2099-01-01T00:00:00Z").unwrap();
         // Not attached to the case in this fixture, so remove directly.
-        store.sweep_unreferenced_evidence_blobs("2030-01-01T00:00:00Z").unwrap();
+        store.sweep_unreferenced_evidence_blobs("2030-01-01T00:00:00Z", "2099-01-01T00:00:00Z").unwrap();
 
         let doc = build(&store, &case()).unwrap();
         assert!(doc.images.is_empty());
@@ -478,6 +492,34 @@ mod tests {
         assert!(!doc.text.contains("shown-as"));
         assert!(doc.text.contains(&image.sha256), "the signed commitment is still on the record");
         assert!(doc.text.contains("REPORTED MATERIAL:"), "the record still renders");
+    }
+
+    /// Blobs are shared by digest, so a derivative dropped for one case
+    /// lands on every case naming the same bytes: two reporters file the
+    /// same photo, one under a preserved class, one not. The second case
+    /// must not be scored as though the picture had been reviewed —
+    /// there is nothing left at this authority to review it with.
+    #[test]
+    fn a_shared_blob_whose_derivative_was_dropped_counts_unresolved() {
+        let (store, image) = store_with_photo_report(20, 12);
+        assert_eq!(build(&store, &case()).unwrap().unresolved_media, 0);
+
+        // What `place_preservation` does for an unviewable class.
+        store.drop_derivative(&image.sha256).unwrap();
+
+        let doc = build(&store, &case()).unwrap();
+        assert_eq!(
+            doc.unresolved_media, 1,
+            "an image with no viewable copy is not an image the case was decided on"
+        );
+        assert!(doc.images.is_empty(), "nothing may be handed to the model");
+        assert!(doc.text.contains("not viewable at this authority"));
+        // The original is untouched — it is still the referral's
+        // authenticated artifact.
+        assert!(store.evidence_blob_original(&image.sha256).unwrap().is_some());
+        // And the accessor reports "nothing to show", not an empty
+        // picture that every consumer would treat as present.
+        assert_eq!(store.evidence_blob_derivative(&image.sha256).unwrap(), None);
     }
 
     /// The accused's photo rebuttal must reach the model. `respond`

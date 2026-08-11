@@ -24,6 +24,7 @@ mod media;
 mod policy;
 mod profiles;
 mod recovery;
+mod referral;
 mod state;
 mod store;
 mod triage;

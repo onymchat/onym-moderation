@@ -41,6 +41,14 @@ pub const MANIFEST_JSON: &str = r#"{
   ],
   "newHolderAppeal": "hash:new-holder",
   "appellate": "onym:component:test-appellate",
+  "retention": {
+    "policy": "https://authority.test/policy/retention",
+    "unreferencedUpload": "P1D",
+    "caseMedia": "P1D",
+    "caseRecord": "P400D",
+    "auditRecord": "P400D",
+    "sanctionRecord": "P400D"
+  },
   "validUntil": "2030-01-01T00:00:00Z"
 }"#;
 

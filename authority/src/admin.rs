@@ -45,6 +45,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/cases/:case_id", get(case_detail))
         .route("/admin/cases/:case_id/decide", post(initial_decision))
         .route("/admin/cases/:case_id/review", post(review))
+        .route(
+            "/admin/cases/:case_id/referral",
+            get(export_referral).post(record_referral),
+        )
         .with_state(state)
 }
 
@@ -421,6 +425,28 @@ async fn index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result
         body.push_str(&decision_table(&undecided, now));
     }
 
+    let awaiting_referral = state.store.cases_awaiting_referral()?;
+    body.push_str("<h2>Referrals outstanding</h2>");
+    if awaiting_referral.is_empty() {
+        body.push_str("<p class=empty>None.</p>");
+    } else {
+        body.push_str(
+            "<table class=queue><thead><tr><th>Case</th><th>Class</th>\
+             <th>Held since</th><th>Held until</th></tr></thead><tbody>",
+        );
+        for hold in &awaiting_referral {
+            body.push_str(&format!(
+                "<tr><td><a href=\"/admin/cases/{id}\">{id}</a></td><td>{class}</td>\
+                 <td>{placed}</td><td>{until}</td></tr>",
+                id = escape(&hold.subject_id),
+                class = escape(&hold.class_id),
+                placed = escape(&hold.placed_at),
+                until = escape(&hold.release_after),
+            ));
+        }
+        body.push_str("</tbody></table>");
+    }
+
     body.push_str("<h2>Appeals awaiting review</h2>");
     if appeals.is_empty() {
         body.push_str(
@@ -613,6 +639,48 @@ async fn case_detail(
 
     body.push_str("<h2>Disclosed evidence</h2>");
     let evidence = state.store.evidence_for_case(&case_id)?;
+    // Whether this case's material is under a preservation duty. It
+    // governs display, so it is resolved once for the page rather than
+    // per item.
+    //
+    // Existence, deliberately, and not `is_preserved`. The export gate
+    // in `referral` asks "is the duty live?", because shipping originals
+    // out after it lapsed would be unauthorized. This asks a different
+    // question — "may a moderator look at this?" — and the answer does
+    // not turn on the clock: the class was unviewable at this authority
+    // when the hold was placed, and it is still unviewable in the window
+    // between `release_after` passing and the sweep collecting the row.
+    // Keying display on the release date would start rendering in that
+    // window, which is the wrong direction to be approximate in.
+    let hold = state.store.preservation_hold("case", &case_id)?;
+    let preserved = hold.is_some();
+    if let Some(hold) = &hold {
+        let reference = state.store.referral_reference(&case_id)?;
+        body.push_str(&format!(
+            "<h2>Preserved for lawful referral</h2>\
+             <table class=facts><tbody>\
+             <tr><th>Class</th><td>{class}</td></tr>\
+             <tr><th>Held since</th><td>{placed}</td></tr>\
+             <tr><th>Held until</th><td>{until}</td></tr>\
+             <tr><th>Referral reference</th><td>{reference}</td></tr>\
+             </tbody></table>\
+             <p class=detail>This material is not displayed and is not shown to a model. \
+             Retention sweeps do not touch a preserved case.</p>\
+             <form method=post action=\"/admin/cases/{case}/referral\">\
+             <label>Reference returned by the receiving body\
+             <input name=reference maxlength=200 required></label>\
+             <button type=submit>Record referral</button></form>\
+             <p class=detail><a href=\"/admin/cases/{case}/referral\">Download the signed \
+             referral package</a> — this is the one path by which the material leaves, and the \
+             download is recorded in the case history.</p>",
+            class = escape(&hold.class_id),
+            placed = escape(&hold.placed_at),
+            until = escape(&hold.release_after),
+            reference = reference.as_deref().map(escape).unwrap_or_else(|| "not yet submitted".into()),
+            case = escape(&case_id),
+        ));
+    }
+
     // The page's image budget, shared by the report evidence and the
     // accused's response below.
     let mut rendered_images = 0usize;
@@ -624,13 +692,14 @@ async fn case_detail(
                 &state,
                 &item,
                 &case.class_id,
+                preserved,
                 &mut rendered_images,
             )?);
             body.push_str(&format!("<pre class=evidence>{}</pre>", escape(&item)));
         }
     }
 
-    body.push_str(&accused_response_section(&state, &case, &mut rendered_images)?);
+    body.push_str(&accused_response_section(&state, &case, preserved, &mut rendered_images)?);
 
     body.push_str("<h2>History</h2><table><tr><th>At</th><th>Event</th><th>Detail</th></tr>");
     for (at, kind, detail) in state.store.events(&case_id)? {
@@ -737,6 +806,7 @@ async fn initial_decision(
 fn accused_response_section(
     state: &AppState,
     case: &CaseRecord,
+    preserved: bool,
     rendered: &mut usize,
 ) -> Result<String, Error> {
     let responses = state.store.responses(&case.case_id)?;
@@ -766,12 +836,126 @@ fn accused_response_section(
                 state,
                 content,
                 &case.class_id,
+                preserved,
                 rendered,
             )?);
             out.push_str(&format!("<pre class=evidence>{}</pre>", escape(content)));
         }
     }
     Ok(out)
+}
+
+/// Hand the operator the signed referral package.
+///
+/// The one path by which preserved material leaves this service, so it
+/// is logged as one. The audit row does not say "somebody looked" —
+/// nobody here can — it says these bytes were exported for referral, at
+/// this time, which is what an auditor asking about custody needs.
+///
+/// Served as the signed manifest followed by each image, so a single
+/// download carries everything the receiving body needs to check the
+/// digests against the content.
+async fn export_referral(
+    State(state): State<Arc<AppState>>,
+    Path(case_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    if !authenticated(&state, &headers) {
+        return Ok(panel_response(login_page(false)));
+    }
+    let now = OffsetDateTime::now_utc();
+    let package = crate::referral::build(
+        &state.store,
+        &case_id,
+        &state.config.manifest.component_id,
+        &state.signing_key,
+        now,
+    )?;
+
+    let mut body = package.manifest_json()?;
+    body.push(b'\n');
+    for (digest, bytes) in &package.images {
+        body.extend_from_slice(format!("--- {digest} ---\n").as_bytes());
+        body.extend_from_slice(bytes);
+        body.push(b'\n');
+    }
+
+    state.store.record_event(
+        &case_id,
+        &util::format_timestamp(now),
+        "referral_exported",
+        &format!("{} image(s) exported for lawful referral", package.images.len()),
+    )?;
+
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"referral-{case_id}.bin\""),
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+/// Record what the receiving body returned.
+///
+/// Until this exists the case sits in the referral queue, because a
+/// referral nobody submitted and a referral nobody recorded look the
+/// same from here and only one of them is finished.
+async fn record_referral(
+    State(state): State<Arc<AppState>>,
+    Path(case_id): Path<String>,
+    headers: HeaderMap,
+    axum::Form(form): axum::Form<ReferralForm>,
+) -> Result<Response, Error> {
+    if !authenticated(&state, &headers) {
+        return Ok(panel_response(login_page(false)));
+    }
+    let reference = form.reference.trim();
+    if reference.is_empty() {
+        return Err(Error::BadRequest("a referral reference is required".into()));
+    }
+    let now = OffsetDateTime::now_utc();
+    state.store.record_referral_reference(&case_id, reference, &util::format_timestamp(now))?;
+    state.store.record_event(
+        &case_id,
+        &util::format_timestamp(now),
+        "referral_recorded",
+        reference,
+    )?;
+    Ok(Redirect::to(&format!("/admin/cases/{case_id}")).into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct ReferralForm {
+    reference: String,
+}
+
+/// The digests of an item's preserved images, as text.
+///
+/// A reviewer cannot see the picture and should still be able to say
+/// exactly which bytes are held — for the referral, and for an appeal
+/// that asks whether the right thing was preserved.
+fn preserved_digests(disclosed_content: &str) -> String {
+    let Ok(crate::media::Disclosed::Media(commitments)) =
+        crate::media::parse_disclosed(disclosed_content)
+    else {
+        return String::new();
+    };
+    let mut out = String::from("<pre class=mono>");
+    for commitment in commitments {
+        out.push_str(&escape(&format!(
+            "sha256 {} · {} · {} bytes\n",
+            commitment.plaintext_sha256,
+            commitment.mime_type,
+            commitment.plaintext_byte_length
+        )));
+    }
+    out.push_str("</pre>");
+    out
 }
 
 /// How many reported images one panel page will inline.
@@ -803,8 +987,29 @@ fn render_evidence_images(
     state: &AppState,
     disclosed_content: &str,
     class_id: &str,
+    preserved: bool,
     rendered: &mut usize,
 ) -> Result<String, Error> {
+    // Preserved material is not shown to anyone here, and saying so is
+    // the point. The derivative was destroyed at intake, so a render
+    // would fail anyway — but "no picture appeared" and "this authority
+    // does not display this" are different messages to a reviewer, and
+    // only one of them is true.
+    if preserved {
+        let count = match crate::media::parse_disclosed(disclosed_content) {
+            Ok(crate::media::Disclosed::Media(commitments)) => commitments.len(),
+            _ => 0,
+        };
+        if count == 0 {
+            return Ok(String::new());
+        }
+        return Ok(format!(
+            "<p class=empty>{count} image(s) on this item are preserved for lawful referral and \
+             are not displayed. Nobody at this authority views this material; the digests below \
+             identify what is held.</p>{}",
+            preserved_digests(disclosed_content)
+        ));
+    }
     let commitments = match crate::media::parse_disclosed(disclosed_content) {
         Ok(crate::media::Disclosed::Media(commitments)) => commitments,
         Ok(crate::media::Disclosed::Text) => return Ok(String::new()),
@@ -1379,6 +1584,44 @@ fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Preserved material is described, never drawn.
+    ///
+    /// The derivative is destroyed at intake so a render would fail
+    /// anyway — but a reviewer seeing nothing should be told this
+    /// authority does not display it, not left to conclude the page is
+    /// broken.
+    #[test]
+    fn preserved_evidence_is_described_and_not_rendered() {
+        let store = crate::store::Store::in_memory().unwrap();
+        let bytes = crate::media::tiny_jpeg(12, 10);
+        let accepted = crate::media::accept_image(&bytes).unwrap();
+        store
+            .put_evidence_blob(&accepted, &bytes, "2026-08-02T00:00:00Z", "onym:key:rep", usize::MAX)
+            .unwrap();
+        let state = crate::state::AppState::for_tests(store);
+        let content = format!(
+            r#"{{"body":"","group_binding":"ab","media":[{{"blob_sha256":"cipher","height":{},"mime_type":"image/jpeg","plaintext_byte_length":{},"plaintext_sha256":"{}","width":{}}}],"message_id":"m","proof_version":2,"sent_at_millis":1}}"#,
+            accepted.height, accepted.byte_length, accepted.sha256, accepted.width
+        );
+
+        let mut rendered = 0usize;
+        let html =
+            render_evidence_images(&state, &content, "csam", true, &mut rendered).unwrap();
+
+        assert!(!html.contains("<img"), "preserved material must not be drawn");
+        assert!(html.contains("not displayed"));
+        assert!(html.contains(&accepted.sha256), "the digest identifies what is held");
+        assert_eq!(rendered, 0, "and it does not spend the page's image budget");
+
+        // The same item, unpreserved, does render.
+        let mut rendered = 0usize;
+        let html =
+            render_evidence_images(&state, &content, "unsolicited-pornography", false, &mut rendered)
+                .unwrap();
+        assert!(html.contains("<img"));
+        assert_eq!(rendered, 1);
+    }
 
     /// The panel renders evidence, which is by definition text a
     /// stranger wrote. Escaping is the only thing between that and the

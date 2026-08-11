@@ -237,13 +237,37 @@ impl Triage {
             );
         }
 
-        // Modality is a term, not a capability flag. The profile
-        // document a mandate pinned states the inputs it enables, so a
-        // case whose evidence this model cannot see is one it must not
-        // decide. The failure mode this prevents is specific and quiet:
-        // the image would otherwise be dropped, the caption classified
-        // alone, and the verdict would read as though the picture had
-        // been reviewed.
+        // A case under a preservation duty is not classified here at
+        // all.
+        //
+        // The material is held for referral to a body equipped to act
+        // on it, and nobody at this authority views it — which includes
+        // no model being shown it. Deciding the case on whatever text
+        // survives would also be deciding it on part of its evidence,
+        // and the honest outcome is to leave it to the human path that
+        // the referral queue exists to drive.
+        if state.store.is_preserved("case", &case.case_id, &util::format_timestamp(now))? {
+            let document = casedoc::build(&state.store, case)?;
+            return self.record(
+                state,
+                case,
+                profile,
+                "",
+                &document,
+                Assessed {
+                    outcome: Outcome::NoDecision,
+                    score: None,
+                    labels: Vec::new(),
+                    note: format!(
+                        "case {} is preserved for lawful referral; its material is not shown to \
+                         a model and this authority does not classify it",
+                        case.case_id
+                    ),
+                },
+                now,
+            );
+        }
+
         // Evidence the record commits to but cannot produce. Deciding
         // here would mean scoring whatever text survives — for a
         // picture-only report, an empty caption — and signing it as a
@@ -271,6 +295,13 @@ impl Triage {
             );
         }
 
+        // Modality is a term, not a capability flag. The profile document
+        // a mandate pinned states the inputs it enables, so a case whose
+        // evidence this model cannot see is one it must not decide. The
+        // failure mode this prevents is specific and quiet: the image
+        // would otherwise be dropped, the caption classified alone, and
+        // the verdict would read as though the picture had been reviewed.
+        //
         // A model that cannot inspect an image at all cannot judge a
         // case that rests on one, so this stays a refusal to decide.
         // Intake now declines image evidence outright when the pinned
@@ -1405,6 +1436,48 @@ mod tests {
         assert_eq!(decoded(images[1]), rebuttal.derivative_sha256);
     }
 
+    /// A preserved case is not classified here at all.
+    ///
+    /// Not "not banned" — not asked. The material is held for a body
+    /// equipped to act on it, and nobody at this authority views it,
+    /// which includes no model being shown it.
+    #[tokio::test]
+    async fn a_preserved_case_is_never_shown_to_a_model() {
+        let (url, seen) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "unsafe\nS12"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "unsolicited-pornography", "2026-08-04T00:00:00Z");
+        attach_photo(&store, "unsolicited-pornography");
+        store
+            .place_preservation_hold(&crate::store::PreservationHold {
+                subject_kind: "case".into(),
+                subject_id: "c1".into(),
+                class_id: "csam".into(),
+                reason: "preservation".into(),
+                placed_at: "2026-08-02T00:00:00Z".into(),
+                release_after: "2099-01-01T00:00:00Z".into(),
+            })
+            .unwrap();
+        // An image-capable profile, so modality is not what refuses.
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "llama-guard-4-12b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        assert_eq!(state.store.case("c1").unwrap().unwrap().disposition, None);
+        assert!(seen.lock().unwrap().is_empty(), "the model must not be consulted at all");
+        let (raw, _) = state.store.assessment("c1").unwrap().unwrap();
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert!(assessment.note.contains("lawful referral"), "{}", assessment.note);
+    }
+
     /// Evidence the record commits to but cannot produce.
     ///
     /// This is the same failure as the modality one, arriving by a
@@ -1422,7 +1495,7 @@ mod tests {
         open_case(&store, "unsolicited-pornography", "2026-08-04T00:00:00Z");
         let accepted = attach_photo(&store, "unsolicited-pornography");
         // Retention already ran, or the row was never stored.
-        store.delete_evidence_blobs_for_case("c1").unwrap();
+        store.delete_evidence_blobs_for_case("c1", "2099-01-01T00:00:00Z").unwrap();
         assert!(store.evidence_blob(&accepted.sha256).unwrap().is_none());
 
         // An image-capable profile, so modality is not what refuses.

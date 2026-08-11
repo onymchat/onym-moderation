@@ -24,6 +24,81 @@ pub struct ViolationClass {
     pub lawful_reporting: Option<String>,
 }
 
+/// What this authority preserves for a class beyond what its case
+/// requires, and where it refers the material.
+///
+/// Both halves or neither. A period with nowhere to refer to is
+/// retention with no purpose, and a referral destination with no period
+/// is a promise to hold material for an unstated time — the manifest is
+/// rejected either way.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreservationTerms {
+    /// `P<n>D`, measured from the moment the hold is placed.
+    pub period: String,
+    /// Content address of the referral procedure this authority follows.
+    pub referral: String,
+}
+
+/// The retention schedule, published so it can be consented to.
+///
+/// Every value is a **tail measured from a defined anchor**, not an
+/// absolute lifetime: what a period means is "this long after the thing
+/// it belongs to has finished". Anchors are documented in the published
+/// retention document and enforced in `deadlines::retention_sweep`.
+///
+/// It lives in the manifest rather than in the environment because the
+/// reference policy is explicit that retention is consented policy:
+/// a period may not be silently replaced under an existing mandate. A
+/// deployment that changes this publishes a new manifest and takes
+/// fresh consent, which is the same treatment the model profile gets.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionSchedule {
+    /// Content address of the published schedule document.
+    pub policy: String,
+    /// An upload no report ever named, from the upload.
+    pub unreferenced_upload: String,
+    /// A case's images, from the later of its appeal and decision
+    /// deadlines.
+    pub case_media: String,
+    /// Reports, responses, assessments and case documents, from the
+    /// same point.
+    pub case_record: String,
+    /// Non-content case events, from the same point.
+    pub audit_record: String,
+    /// Mandates and verdicts, from the point the last mark they justify
+    /// expires or is cleared — never while one is in force. A device's
+    /// marks are two bits with no explanation attached; this record is
+    /// the only thing that says what they mean and how to lift them.
+    pub sanction_record: String,
+    /// Classes this authority preserves and refers, keyed by class id.
+    /// A class absent here does not accept media evidence at all.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub preservation: std::collections::BTreeMap<String, PreservationTerms>,
+}
+
+impl RetentionSchedule {
+    /// Every declared period, with the field name for error messages.
+    fn periods(&self) -> Vec<(&'static str, &str)> {
+        vec![
+            ("unreferencedUpload", self.unreferenced_upload.as_str()),
+            ("caseMedia", self.case_media.as_str()),
+            ("caseRecord", self.case_record.as_str()),
+            ("auditRecord", self.audit_record.as_str()),
+            ("sanctionRecord", self.sanction_record.as_str()),
+        ]
+    }
+
+    /// The preservation terms for a class, if it declares any.
+    ///
+    /// Absence is what makes a class refuse media, so this is the one
+    /// question intake asks before accepting an image.
+    pub fn preservation_for(&self, class_id: &str) -> Option<&PreservationTerms> {
+        self.preservation.get(class_id)
+    }
+}
+
 /// The model profile a manifest declares: which published profile
 /// document, by id and digest.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -62,6 +137,14 @@ pub struct AuthorityManifest {
     pub appellate: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidentiality: Option<String>,
+    /// The retention schedule this authority actually applies.
+    ///
+    /// Optional on the wire so a manifest published before retention
+    /// was declared still parses — but a deployment without one keeps
+    /// today's behaviour: no scheduled deletion, and no class accepting
+    /// media evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionSchedule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statistics: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,6 +185,73 @@ impl AuthorityManifest {
                     "class {:?} has invalid appealEffect {:?}; expected suspensive or \
                      non-suspensive",
                     class.class_id, class.appeal_effect
+                ));
+            }
+        }
+
+        self.validate_retention()?;
+        Ok(())
+    }
+
+    /// Validate the retention schedule, if one is declared.
+    ///
+    /// Checked at boot, where the caller exits rather than warns. A
+    /// service that came up healthy while holding material against the
+    /// terms it publishes is the failure worth refusing to start over:
+    /// the people whose material it is would be relying on a deletion
+    /// that never happens, and the reference policy says outright that
+    /// is worse than promising nothing.
+    fn validate_retention(&self) -> Result<(), String> {
+        let Some(retention) = &self.retention else { return Ok(()) };
+
+        for (field, value) in retention.periods() {
+            crate::util::parse_days(value)
+                .map_err(|error| format!("retention.{field} is invalid: {error}"))?;
+        }
+
+        // The sanction record must outlive the case record and its audit
+        // trail.
+        //
+        // Not an aesthetic ordering: deleting the sanction record may
+        // drop the mandate row, and the mandate is how a case's consented
+        // schedule is resolved. A shorter sanction tail therefore removes
+        // the terms under which the record was still due to be deleted,
+        // and the record is then kept indefinitely against the very
+        // period this manifest publishes — announced by nothing louder
+        // than a warning. Rejecting the ordering at boot is cheaper than
+        // discovering it 400 days in.
+        let sanction = crate::util::parse_days(&retention.sanction_record)
+            .map_err(|error| format!("retention.sanctionRecord is invalid: {error}"))?;
+        for (field, value) in
+            [("caseRecord", &retention.case_record), ("auditRecord", &retention.audit_record)]
+        {
+            let other = crate::util::parse_days(value)
+                .map_err(|error| format!("retention.{field} is invalid: {error}"))?;
+            if sanction < other {
+                return Err(format!(
+                    "retention.sanctionRecord ({}) is shorter than retention.{field} ({}); the \
+                     sanction record carries the mandate a case's schedule is resolved from, so a \
+                     shorter tail would strand that case's record past the period this manifest \
+                     publishes",
+                    retention.sanction_record, value
+                ));
+            }
+        }
+
+        for (class_id, terms) in &retention.preservation {
+            if self.violation_class(class_id).is_none() {
+                return Err(format!(
+                    "retention.preservation names {class_id:?}, which this manifest does not \
+                     declare as a violation class"
+                ));
+            }
+            crate::util::parse_days(&terms.period).map_err(|error| {
+                format!("retention.preservation.{class_id}.period is invalid: {error}")
+            })?;
+            if terms.referral.trim().is_empty() {
+                return Err(format!(
+                    "retention.preservation.{class_id} declares a period but no referral; \
+                     holding material with nowhere to refer it is retention without a purpose"
                 ));
             }
         }
@@ -220,6 +370,102 @@ mod manifest_tests {
             "classes {permanent:?} carry a permanent ban with no `appellate` declared; that is a \
              sanction the interface must clear, so it is a promise rather than a term"
         );
+    }
+
+    /// A schedule the service cannot apply must stop it starting.
+    ///
+    /// `Config::from_env` propagates this and `main` exits on it. A
+    /// service that came up healthy while holding material against its
+    /// published terms is exactly the failure the reference policy calls
+    /// worse than promising nothing.
+    #[test]
+    fn a_preservation_period_without_a_referral_is_refused() {
+        let mut manifest = manifest();
+        manifest.retention = Some(RetentionSchedule {
+            policy: "https://authority.test/policy/retention".into(),
+            unreferenced_upload: "P1D".into(),
+            case_media: "P30D".into(),
+            case_record: "P400D".into(),
+            audit_record: "P400D".into(),
+            sanction_record: "P400D".into(),
+            preservation: [(
+                "csam".to_string(),
+                PreservationTerms { period: "P400D".into(), referral: "  ".into() },
+            )]
+            .into_iter()
+            .collect(),
+        });
+
+        let error = manifest.validate_class_terms().unwrap_err();
+        assert!(error.contains("no referral"), "{error}");
+    }
+
+    /// A sanction tail shorter than the case-record tail must not boot.
+    ///
+    /// The sanction record carries the mandate a case's schedule is
+    /// resolved from, so a shorter tail deletes the terms under which the
+    /// record was still due to go — leaving the content kept indefinitely
+    /// against the very period the manifest publishes.
+    #[test]
+    fn a_sanction_tail_shorter_than_the_record_tail_is_refused() {
+        let mut manifest = manifest();
+        manifest.retention = Some(RetentionSchedule {
+            policy: "https://authority.test/policy/retention".into(),
+            unreferenced_upload: "P1D".into(),
+            case_media: "P30D".into(),
+            case_record: "P400D".into(),
+            audit_record: "P400D".into(),
+            sanction_record: "P30D".into(),
+            preservation: Default::default(),
+        });
+
+        let error = manifest.validate_class_terms().unwrap_err();
+        assert!(error.contains("sanctionRecord"), "{error}");
+        assert!(error.contains("strand"), "{error}");
+    }
+
+    #[test]
+    fn an_unparseable_retention_period_is_refused() {
+        let mut manifest = manifest();
+        manifest.retention = Some(RetentionSchedule {
+            policy: "https://authority.test/policy/retention".into(),
+            unreferenced_upload: "one day".into(),
+            case_media: "P30D".into(),
+            case_record: "P400D".into(),
+            audit_record: "P400D".into(),
+            sanction_record: "P400D".into(),
+            preservation: Default::default(),
+        });
+
+        let error = manifest.validate_class_terms().unwrap_err();
+        assert!(error.contains("unreferencedUpload"), "{error}");
+    }
+
+    #[test]
+    fn preservation_for_an_undeclared_class_is_refused() {
+        // A duty over a class this manifest does not judge is a period
+        // nobody consented to, attached to nothing.
+        let mut manifest = manifest();
+        manifest.retention = Some(RetentionSchedule {
+            policy: "https://authority.test/policy/retention".into(),
+            unreferenced_upload: "P1D".into(),
+            case_media: "P30D".into(),
+            case_record: "P400D".into(),
+            audit_record: "P400D".into(),
+            sanction_record: "P400D".into(),
+            preservation: [(
+                "not-a-class".to_string(),
+                PreservationTerms {
+                    period: "P400D".into(),
+                    referral: "https://authority.test/policy/lawful-reporting".into(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+
+        let error = manifest.validate_class_terms().unwrap_err();
+        assert!(error.contains("not-a-class"), "{error}");
     }
 
     /// `published/` is a **serving root**, not a folder of sources.

@@ -81,17 +81,45 @@ const MAX_UNREFERENCED_UPLOADS_PER_KEY: usize = 16;
 /// can allocate it simultaneously.
 static DECODE_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
-/// Classes that do not accept media evidence.
+/// Classes whose media this authority will not take without a declared
+/// preservation duty.
 ///
-/// `csam` is refused on purpose, and the refusal is about this
-/// authority's readiness rather than the report's merit. Accepting the
-/// bytes would make it a custodian of illegal imagery — stored,
-/// rendered to human reviewers on appeal — while it still has no
-/// retention schedule, no deletion machinery beyond the minimum below,
-/// and no statutory-reporting path. The honest disposition is to say so
-/// and point at lawful reporting channels, not to take custody it
-/// cannot discharge. Text reports for the class are unaffected.
-const CLASSES_REFUSING_MEDIA: [&str; 1] = ["csam"];
+/// The refusal is about readiness, not about the report's merit. Taking
+/// the bytes makes this authority a custodian of illegal imagery, and
+/// custody without a published preservation period, a referral
+/// procedure and a deletion path is the wrong kind of promise to make
+/// silently.
+///
+/// So this is no longer the whole answer: a class listed here accepts
+/// media exactly when the *consented manifest* declares preservation
+/// terms for it. A deployment declaring none keeps today's behaviour
+/// unchanged — which is the safe default, and the one a deployment
+/// lands on by doing nothing.
+const CLASSES_REQUIRING_PRESERVATION: [&str; 1] = ["csam"];
+
+/// The preservation terms a class needs before its media is accepted.
+///
+/// `Ok(None)` means the class needs none. `Err` means it needs terms
+/// this manifest does not publish, which is a refusal.
+fn preservation_terms<'a>(
+    manifest: &'a AuthorityManifest,
+    class_id: &str,
+) -> Result<Option<&'a PreservationTerms>, Error> {
+    if !CLASSES_REQUIRING_PRESERVATION.contains(&class_id) {
+        return Ok(None);
+    }
+    manifest
+        .retention
+        .as_ref()
+        .and_then(|retention| retention.preservation_for(class_id))
+        .map(Some)
+        .ok_or_else(|| {
+            Error::MediaClassRefused(format!(
+                "class {class_id:?} does not accept media evidence at this authority: it \
+                 publishes no preservation period or referral procedure for it"
+            ))
+        })
+}
 
 /// Check every media commitment in a report against the bytes on file.
 ///
@@ -99,13 +127,14 @@ const CLASSES_REFUSING_MEDIA: [&str; 1] = ["csam"];
 /// caller can bind them to the case.
 fn verify_media_evidence(
     state: &AppState,
+    manifest: &AuthorityManifest,
     class_id: &str,
     evidence: &[EvidenceItem],
     already_on_case: usize,
     // `filer`: the key filing this report or response. A refusal may
     // delete only this key's own pending uploads.
     filer: &str,
-) -> Result<Vec<String>, Error> {
+) -> Result<MediaEvidence, Error> {
     // Three passes, in this order, and the order is the point.
     //
     // Everything here is attacker-chosen: the commitment is written by
@@ -133,7 +162,7 @@ fn verify_media_evidence(
         }
     }
     if committed.is_empty() {
-        return Ok(Vec::new());
+        return Ok(MediaEvidence::default());
     }
     // A ceiling across the case, not just this filing. Reports join an
     // open case and responses accumulate on one, so the per-filing
@@ -152,10 +181,8 @@ fn verify_media_evidence(
     // them for this request rather than for the expiry window. Only
     // blobs no case rests on: a digest a live case depends on is not
     // this filing's to take.
-    let refusal = if CLASSES_REFUSING_MEDIA.contains(&class_id) {
-        Some(Error::MediaClassRefused(format!(
-            "class {class_id:?} does not accept media evidence at this authority"
-        )))
+    let refusal = if let Err(refused) = preservation_terms(manifest, class_id) {
+        Some(refused)
     } else if state.config.triage.as_ref().is_some_and(|t| !t.profile.reviews_images()) {
         // The pinned model cannot inspect an image, so this authority
         // cannot adjudicate one. Refusing at intake — rather than
@@ -179,7 +206,11 @@ fn verify_media_evidence(
     if let Some(reason) = refusal {
         let named: Vec<String> =
             committed.iter().map(|(_, c)| c.plaintext_sha256.clone()).collect();
-        state.store.delete_own_unheld_evidence_blobs(filer, &named)?;
+        state.store.delete_own_unheld_evidence_blobs(
+            filer,
+            &named,
+            &util::format_timestamp(OffsetDateTime::now_utc()),
+        )?;
         return Err(reason);
     }
 
@@ -223,7 +254,80 @@ fn verify_media_evidence(
         }
         digests.push(stored.sha256);
     }
-    Ok(digests)
+    Ok(MediaEvidence {
+        digests,
+        // Resolved from the *consented* manifest, so a hold is placed
+        // against the terms this case's accused actually agreed to
+        // rather than whatever is published today.
+        preservation: preservation_terms(manifest, class_id)?.cloned(),
+    })
+}
+
+/// Place the preservation duty a filing's media carries, and destroy
+/// what nobody may look at.
+///
+/// Three things happen together, and the order matters less than the
+/// fact that none of them waits for the case:
+///
+/// The hold goes on the images and on the case, with its release date
+/// computed now from the period declared now. Nothing else in this
+/// service may delete a held subject.
+///
+/// The derivative is destroyed. It was built at upload, before anything
+/// knew what the bytes would be claimed as, and for a class nobody here
+/// may view it is a legible copy with no purpose. The original stays
+/// sealed, for the referral and for nothing else.
+///
+/// The case is left needing a referral. **This does not wait for the
+/// response window or the appeal.** Those exist to give an accused a
+/// fair chance to answer; they are not a reason to sit on a child-safety
+/// referral, and a deadline that delayed one would be the case
+/// machinery working against the thing it is for.
+fn place_preservation(
+    state: &AppState,
+    case_id: &str,
+    class_id: &str,
+    media: &MediaEvidence,
+    now: OffsetDateTime,
+) -> Result<(), Error> {
+    let Some(terms) = &media.preservation else { return Ok(()) };
+    let days = util::parse_days(&terms.period)
+        .map_err(|e| Error::Internal(format!("consented preservation period: {e}")))?;
+    let release_after = util::format_timestamp(now + time::Duration::days(days));
+    let placed_at = util::format_timestamp(now);
+    let reason = format!("class {class_id} preservation under this authority's published terms");
+
+    for digest in &media.digests {
+        state.store.place_preservation_hold(&crate::store::PreservationHold {
+            subject_kind: "blob".into(),
+            subject_id: digest.clone(),
+            class_id: class_id.to_string(),
+            reason: reason.clone(),
+            placed_at: placed_at.clone(),
+            release_after: release_after.clone(),
+        })?;
+        state.store.drop_derivative(digest)?;
+    }
+    state.store.place_preservation_hold(&crate::store::PreservationHold {
+        subject_kind: "case".into(),
+        subject_id: case_id.to_string(),
+        class_id: class_id.to_string(),
+        reason,
+        placed_at,
+        release_after,
+    })?;
+    state.store.record_event(case_id, &util::format_timestamp(now), "preservation_hold", &format!(
+        "{} image(s) preserved for {} pending referral", media.digests.len(), terms.period
+    ))?;
+    Ok(())
+}
+
+/// What a filing's media amounts to: the digests the case will rest on,
+/// and any preservation duty they carry.
+#[derive(Debug, Default)]
+struct MediaEvidence {
+    digests: Vec<String>,
+    preservation: Option<PreservationTerms>,
 }
 
 /// Accept the bytes of one reported image.
@@ -662,8 +766,9 @@ async fn file_report(
         Some(case) => state.store.case_media_count(&case.case_id)?,
         None => 0,
     };
-    let media_digests = verify_media_evidence(
+    let media = verify_media_evidence(
         &state,
+        &consented,
         &report.class_id,
         &report.evidence,
         already_on_case,
@@ -698,8 +803,8 @@ async fn file_report(
     // uploads' expiry clock so they survive that gap — including the
     // paths just below that return an error inside it, a lapsed
     // manifest and an expired mandate.
-    if !media_digests.is_empty() {
-        state.store.touch_evidence_blobs(&media_digests, &stamp)?;
+    if !media.digests.is_empty() {
+        state.store.touch_evidence_blobs(&media.digests, &stamp)?;
     }
 
     // Further reports join an open case rather than opening a second
@@ -757,8 +862,9 @@ async fn file_report(
     };
 
     state.store.attach_report_to_case(&report.reporter, &report.report_id, &case.case_id)?;
-    if !media_digests.is_empty() {
-        state.store.attach_evidence_blobs(&case.case_id, &media_digests)?;
+    if !media.digests.is_empty() {
+        state.store.attach_evidence_blobs(&case.case_id, &media.digests)?;
+        place_preservation(&state, &case.case_id, &report.class_id, &media, now)?;
     }
 
     Ok(Json(json!({
@@ -777,7 +883,7 @@ async fn file_report(
 /// The manifest a mandate consented to, parsed. A legacy mandate with
 /// no snapshot may use the published bytes only when they still hash to
 /// the mandate's reference; otherwise there is no safe reconstruction.
-fn consented_manifest(
+pub(crate) fn consented_manifest(
     state: &AppState,
     mandate: &crate::store::MandateRecord,
 ) -> Result<AuthorityManifest, Error> {
@@ -1097,8 +1203,29 @@ async fn respond(
     // Counter-evidence carrying media goes through exactly the checks
     // the report's evidence did. The accused answering a photo with a
     // photo is the same kind of claim, and it earns the same scrutiny.
-    let media_digests = verify_media_evidence(
+    // The case's *pinned* mandate, not the accused's latest one. A case
+    // is judged under the terms it was opened under, and the response is
+    // part of that case: re-consenting between opening and answering
+    // must not move the preservation period its media is held to, which
+    // is what `place_preservation`'s own contract requires. Resolving
+    // the newest mandate here also made an open case insufficient to
+    // answer — a user who withdrew consent after being reported would
+    // hit `no_jurisdiction` on their own defence.
+    //
+    // A case cannot exist without its mandate row, so absence is a
+    // broken invariant rather than a missing consent, and says so.
+    let consented = {
+        let mandate = state.store.mandate(&case.mandate_ref)?.ok_or_else(|| {
+            Error::Internal(format!(
+                "case {} pins mandate {} which is no longer stored",
+                case.case_id, case.mandate_ref
+            ))
+        })?;
+        consented_manifest(&state, &mandate)?
+    };
+    let media = verify_media_evidence(
         &state,
+        &consented,
         &case.class_id,
         &response.evidence,
         state.store.case_media_count(&case_id)?,
@@ -1124,9 +1251,10 @@ async fn respond(
         event_detail: &response.statement,
         limit: MAX_RESPONSES_PER_CASE,
     })?;
-    if !media_digests.is_empty() {
-        state.store.touch_evidence_blobs(&media_digests, &stamp)?;
-        state.store.attach_evidence_blobs(&case_id, &media_digests)?;
+    if !media.digests.is_empty() {
+        state.store.touch_evidence_blobs(&media.digests, &stamp)?;
+        state.store.attach_evidence_blobs(&case_id, &media.digests)?;
+        place_preservation(&state, &case_id, &case.class_id, &media, now)?;
     }
 
     Ok(Json(json!({ "caseId": case_id, "recorded": true, "late": late })))
@@ -1922,6 +2050,22 @@ mod tests {
             Self { state: Arc::new(AppState::for_tests(Store::in_memory().unwrap())) }
         }
 
+        /// A harness whose manifest declares preservation for `csam`,
+        /// which is what turns media acceptance on for that class.
+        fn preserving() -> Self {
+            let manifest = testing::MANIFEST_JSON.replace(
+                r#""sanctionRecord": "P400D""#,
+                r#""sanctionRecord": "P400D",
+    "preservation": { "csam": { "period": "P400D", "referral": "https://authority.test/policy/lawful-reporting" } }"#,
+            );
+            Self {
+                state: Arc::new(AppState::for_tests_with(
+                    Store::in_memory().unwrap(),
+                    &manifest,
+                )),
+            }
+        }
+
         /// A harness whose pinned profile is a real published one, so
         /// intake decisions that depend on the model's declared inputs
         /// are exercised against terms that actually exist.
@@ -2069,6 +2213,11 @@ mod tests {
             r#"{{"body":"","group_binding":"ab","media":[{{"blob_sha256":"cipher","height":{},"mime_type":"{}","plaintext_byte_length":{},"plaintext_sha256":"{}","width":{}}}],"message_id":"m-1","proof_version":2,"sent_at_millis":1}}"#,
             image.height, image.mime_type, image.byte_length, image.sha256, image.width
         )
+    }
+
+    /// The bytes a fixture image was built from.
+    fn accepted_bytes(image: &media::AcceptedImage) -> Vec<u8> {
+        media::tiny_jpeg(image.width, image.height)
     }
 
     /// A v2 preimage committing to several images at once.
@@ -2504,6 +2653,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_preserving_authority_accepts_csam_media_and_holds_it() {
+        let harness = Harness::preserving();
+        let (mandate, accepted, content) = seed_photo(&harness).await;
+        let mut report = photo_report_json(&mandate, "r-1", &content);
+        report["classId"] = json!("csam");
+
+        let (status, response) =
+            harness.post("/v1/reports", signed(report, "signature", &[REPORTER_SEED])).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let case_id = response["caseId"].as_str().unwrap();
+
+        // Held: the image and the case both, so no sweep can reach them.
+        assert!(harness
+            .state
+            .store
+            .preservation_hold("blob", &accepted.sha256)
+            .unwrap()
+            .is_some());
+        let hold = harness.state.store.preservation_hold("case", case_id).unwrap().unwrap();
+        assert_eq!(hold.class_id, "csam");
+
+        // The original survives for the referral; the derivative does
+        // not, because nobody here may look at it.
+        assert!(harness.state.store.evidence_blob(&accepted.sha256).unwrap().is_some());
+        // `None`, not `Some(vec![])`. Every consumer reads this as an
+        // Option and none checks the length, so a zero-length "image"
+        // was base64-encoded to the model and rendered as a broken
+        // `<img>` — a verdict that reads as though the picture had been
+        // reviewed.
+        assert_eq!(
+            harness.state.store.evidence_blob_derivative(&accepted.sha256).unwrap(),
+            None,
+            "the viewable copy must be destroyed as soon as the class is known"
+        );
+        assert_eq!(
+            harness.state.store.evidence_blob_original(&accepted.sha256).unwrap(),
+            Some(accepted_bytes(&accepted)),
+        );
+
+        // And it is in the referral queue, without waiting for any
+        // deadline.
+        let queue = harness.state.store.cases_awaiting_referral().unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].subject_id, case_id);
+    }
+
+    #[tokio::test]
+    async fn recording_a_referral_clears_it_from_the_queue() {
+        let harness = Harness::preserving();
+        let (mandate, _, content) = seed_photo(&harness).await;
+        let mut report = photo_report_json(&mandate, "r-1", &content);
+        report["classId"] = json!("csam");
+        let (_, response) =
+            harness.post("/v1/reports", signed(report, "signature", &[REPORTER_SEED])).await;
+        let case_id = response["caseId"].as_str().unwrap().to_string();
+
+        harness.state.store.record_referral_reference(&case_id, "REF-12345", "2026-08-10T00:00:00Z").unwrap();
+
+        assert!(harness.state.store.cases_awaiting_referral().unwrap().is_empty());
+        assert_eq!(
+            harness.state.store.referral_reference(&case_id).unwrap().as_deref(),
+            Some("REF-12345")
+        );
+    }
+
+    #[tokio::test]
     async fn a_refused_csam_report_does_not_leave_the_image_on_the_server() {
         // The upload route has no class context, so the bytes are on
         // disk before anything knows what they will be claimed as.
@@ -2573,7 +2788,7 @@ mod tests {
         let swept = harness
             .state
             .store
-            .sweep_unreferenced_evidence_blobs("2020-06-01T00:00:00Z")
+            .sweep_unreferenced_evidence_blobs("2020-06-01T00:00:00Z", "2099-01-01T00:00:00Z")
             .unwrap();
         assert_eq!(swept, 0, "the re-upload restarted the clock");
         assert!(harness.state.store.evidence_blob(&accepted.sha256).unwrap().is_some());
@@ -3360,6 +3575,69 @@ mod tests {
         );
         let (status, _) = harness.post(&format!("/v1/cases/{case_id}/respond"), body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A case is answered under the terms it was opened under.
+    ///
+    /// `mandate_for_user` returns the *newest* mandate, so re-consenting
+    /// between being reported and answering swapped the terms out from
+    /// under an open case — judging the response's media against a
+    /// snapshot the case was never opened on, and placing or withholding
+    /// a preservation hold against the wrong one. Resolving the case's
+    /// pinned `mandate_ref` is what keeps the two in step.
+    ///
+    /// The newer mandate here points at a snapshot that cannot be
+    /// resolved, so reading it is observable: the pinned path answers,
+    /// the latest-mandate path fails.
+    #[tokio::test]
+    async fn a_response_is_judged_under_the_mandate_the_case_pinned() {
+        let harness = Harness::new();
+        let case_id = open_case(&harness).await;
+        let pinned = harness.state.store.case(&case_id).unwrap().unwrap().mandate_ref;
+
+        // The accused re-consents. Newer row, so `mandate_for_user`
+        // would now return this one.
+        harness
+            .state
+            .store
+            .put_mandate(
+                &crate::store::MandateRecord {
+                    mandate_ref: "mandate-after-the-fact".into(),
+                    user_key: testing::key_reference(ACCUSED_SEED),
+                    device_binding: "device-2".into(),
+                    classes: vec!["csam".into()],
+                    manifest_hash: "0".repeat(64),
+                },
+                b"{}",
+                b"not-a-manifest",
+                "2026-08-02T00:00:00Z",
+            )
+            .unwrap();
+        assert_ne!(
+            harness
+                .state
+                .store
+                .mandate_for_user(&testing::key_reference(ACCUSED_SEED))
+                .unwrap()
+                .unwrap()
+                .mandate_ref,
+            pinned,
+            "the fixture must actually shadow the pinned mandate"
+        );
+
+        let body = signed(
+            json!({"caseId": case_id, "statement": "that is not mine", "evidence": []}),
+            "signature",
+            &[ACCUSED_SEED],
+        );
+        let (status, response) = harness.post(&format!("/v1/cases/{case_id}/respond"), body).await;
+
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(
+            harness.state.store.case(&case_id).unwrap().unwrap().mandate_ref,
+            pinned,
+            "answering must not repin the case"
+        );
     }
 
     #[tokio::test]

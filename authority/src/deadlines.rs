@@ -18,6 +18,7 @@ use time::OffsetDateTime;
 use crate::cases;
 use crate::error::Error;
 use crate::state::AppState;
+use crate::store::Store;
 use crate::util;
 
 /// Dismiss every open case whose decision deadline has passed. Returns
@@ -180,43 +181,167 @@ pub async fn triage_sweep(
     Ok(())
 }
 
-/// Background loop: sweep deadlines, run triage, then push any
-/// undelivered verdicts. All three are idempotent, so a missed tick
-/// costs nothing.
-/// How long an upload that never became evidence is kept.
+/// Apply the published retention schedule, and release holds that have
+/// run their course.
 ///
-/// Generous enough that a client can upload, prompt the user through
-/// the report screen, and file — and short enough that a photo somebody
-/// chose not to report does not sit on this server.
-const UNREFERENCED_UPLOAD_TTL: time::Duration = time::Duration::hours(24);
-
-/// Delete media the case and appeal no longer require.
+/// Everything here is driven by the manifest rather than by constants,
+/// because retention is consented policy: a period this service applied
+/// but never published would be exactly the promise the confidentiality
+/// document refuses to make. A deployment that publishes no schedule
+/// deletes nothing on a timer, which is what it did before this existed.
 ///
-/// Two disposals with one rule behind them: material is kept for the
-/// process that needs it and no longer. Uploads that never became
-/// evidence expire on a timer; a decided case's images go once its
-/// appeal window has closed.
-///
-/// Original and derivative always go together. Keeping the derivative
-/// would be keeping the picture, and a deletion that leaves a legible
-/// copy behind is not one.
+/// Holds outrank every period. The store enforces that per subject; this
+/// function's job is to release a hold whose duty has ended so the
+/// schedule can finally reach its material.
 pub fn retention_sweep(state: &AppState, now: OffsetDateTime) -> Result<usize, Error> {
-    let cutoff = util::format_timestamp(now - UNREFERENCED_UPLOAD_TTL);
-    let mut removed = state.store.sweep_unreferenced_evidence_blobs(&cutoff)?;
-    if removed > 0 {
-        tracing::info!(removed, "expired evidence uploads that were never reported");
+    let stamp = util::format_timestamp(now);
+
+    // A duty that has run out stops being a duty. Logged, because a
+    // preservation period ending is a fact somebody may be asked about.
+    for hold in state.store.released_holds(&stamp)? {
+        tracing::info!(
+            subject = %hold.subject_id,
+            kind = %hold.subject_kind,
+            class = %hold.class_id,
+            "preservation hold released; its material returns to the retention schedule"
+        );
+        state.store.drop_hold(&hold.subject_kind, &hold.subject_id)?;
     }
 
-    for case_id in state.store.cases_with_media_past_retention(&util::format_timestamp(now))? {
-        let gone = state.store.delete_evidence_blobs_for_case(&case_id)?;
+    // A duty whose period has passed with nothing recorded against it.
+    // Said every tick, at warn, because the alternative is a service
+    // quietly sitting on material it undertook to pass on. The hold is
+    // *not* released: the material stays, the case stays in the referral
+    // queue, and the reference can still be recorded.
+    for hold in state.store.overdue_unreferred_holds(&stamp)? {
+        tracing::warn!(
+            case_id = %hold.subject_id,
+            class = %hold.class_id,
+            held_since = %hold.placed_at,
+            due = %hold.release_after,
+            "preservation period has passed with no referral recorded; material is still held"
+        );
+    }
+
+    let mut removed = 0;
+
+    // Uploads nobody ever reported.
+    //
+    // The only deployment-wide period here, and deliberately so: an
+    // upload no report ever named belongs to no case, so there is no
+    // mandate whose terms could govern it. It is a bound on how long
+    // this service holds unclaimed bytes, not a term of anyone's
+    // adjudication, and the published schedule says that.
+    if let Some(schedule) = state.config.manifest.retention.as_ref() {
+        let days = util::parse_days(&schedule.unreferenced_upload)
+            .map_err(|e| Error::Internal(format!("retention.unreferencedUpload: {e}")))?;
+        let cutoff = util::format_timestamp(now - time::Duration::days(days));
+        let expired = state.store.sweep_unreferenced_evidence_blobs(&cutoff, &stamp)?;
+        if expired > 0 {
+            tracing::info!(removed = expired, "expired evidence uploads that were never reported");
+        }
+        removed += expired;
+    }
+
+    // Everything else is per case, against the schedule that case's
+    // accused actually consented to.
+    //
+    // Reading today's manifest for these was the bug: republishing with
+    // a shorter tail would have swept cases whose accused agreed to a
+    // longer one, under terms nobody accepted — while the published
+    // document said the periods "cannot be changed under an existing
+    // consent". The same substitution the mandate-pinned manifest exists
+    // to prevent, one field over.
+    for (case_id, anchor) in state.store.cases_eligible_for_media_retention(&stamp)? {
+        let Some(schedule) = consented_schedule(state, &case_id)? else { continue };
+        if !Store::tail_elapsed(&anchor, tail(&schedule.case_media, "caseMedia")?, &stamp)? {
+            continue;
+        }
+        let gone = state.store.delete_evidence_blobs_for_case(&case_id, &stamp)?;
         if gone > 0 {
-            tracing::info!(%case_id, images = gone, "deleted case media past its appeal window");
+            tracing::info!(%case_id, images = gone, "deleted case media past its consented tail");
         }
         removed += gone;
     }
+
+    for (case_id, anchor) in state.store.cases_eligible_for_record_retention(&stamp)? {
+        let Some(schedule) = consented_schedule(state, &case_id)? else { continue };
+        if Store::tail_elapsed(&anchor, tail(&schedule.case_record, "caseRecord")?, &stamp)? {
+            let gone = state.store.delete_case_record(&case_id)?;
+            if gone > 0 {
+                tracing::info!(%case_id, rows = gone, "deleted case record past its consented tail");
+            }
+            removed += gone;
+        }
+        if Store::tail_elapsed(&anchor, tail(&schedule.audit_record, "auditRecord")?, &stamp)? {
+            let gone = state.store.delete_case_events(&case_id)?;
+            if gone > 0 {
+                tracing::info!(%case_id, rows = gone, "deleted case audit trail past its consented tail");
+            }
+            removed += gone;
+        }
+    }
+
+    for (case_id, anchor) in state.store.cases_eligible_for_sanction_retention(&stamp)? {
+        let Some(schedule) = consented_schedule(state, &case_id)? else { continue };
+        if !Store::tail_elapsed(&anchor, tail(&schedule.sanction_record, "sanctionRecord")?, &stamp)?
+        {
+            continue;
+        }
+        // The record and its audit trail go first, while the mandate that
+        // resolves this case's schedule is still here to be read.
+        //
+        // `validate_retention` rejects a manifest whose sanction tail is
+        // shorter than these, so by the time a case reaches here both are
+        // provably due. Doing them in this order as well means a mandate
+        // that disappears for some other reason cannot strand the record:
+        // the alternative is a case whose terms can no longer be resolved
+        // and whose content is therefore kept forever, which is the
+        // failure the published schedule exists to rule out.
+        removed += state.store.delete_case_record(&case_id)?;
+        removed += state.store.delete_case_events(&case_id)?;
+
+        let gone = state.store.delete_sanction_record(&case_id, &stamp)?;
+        if gone > 0 {
+            tracing::info!(%case_id, rows = gone, "deleted sanction record; no mark it justifies remains");
+        }
+        removed += gone;
+    }
+
     Ok(removed)
 }
 
+/// The retention schedule the case's accused consented to.
+///
+/// `None` when that manifest declares none, which means this case's
+/// record is not on any timer — the same answer a deployment that
+/// publishes no schedule gets, applied per case rather than globally.
+fn consented_schedule(
+    state: &AppState,
+    case_id: &str,
+) -> Result<Option<crate::types::RetentionSchedule>, Error> {
+    let Some(case) = state.store.case(case_id)? else { return Ok(None) };
+    let Some(mandate) = state.store.mandate(&case.mandate_ref)? else {
+        // A case cannot exist without its mandate row. Keep the material
+        // rather than guess at terms: deleting under a schedule that
+        // cannot be produced is the failure this whole change is about.
+        tracing::warn!(
+            %case_id,
+            mandate_ref = %case.mandate_ref,
+            "case pins a mandate that is no longer stored; retaining its record"
+        );
+        return Ok(None);
+    };
+    Ok(crate::api::consented_manifest(state, &mandate)?.retention)
+}
+
+fn tail(raw: &str, field: &str) -> Result<i64, Error> {
+    util::parse_days(raw).map_err(|e| Error::Internal(format!("retention.{field}: {e}")))
+}
+
+/// Background loop: sweep deadlines, run triage and retention, then push
+/// any undelivered verdicts. All are idempotent, so a missed tick costs
+/// nothing.
 pub fn spawn(state: Arc<AppState>) {
     let interval = std::time::Duration::from_secs(state.config.deadline_sweep_secs);
 
@@ -266,6 +391,395 @@ mod tests {
         let accepted = crate::media::accept_image(&bytes).unwrap();
         store.put_evidence_blob(&accepted, &bytes, uploaded_at, "onym:key:uploader", usize::MAX).unwrap();
         accepted.sha256
+    }
+
+    /// A preservation hold outranks every period, asserted against each
+    /// sweep rather than against the idea.
+    ///
+    /// This is the test that matters most in the file. A retention sweep
+    /// that deletes material under a preservation duty is not untidy, it
+    /// is destruction of evidence — and the schedule would do exactly
+    /// that without the gate. Parameterised so a sweep added later that
+    /// forgets to consult holds fails here.
+    /// The periods are the ones the case's accused consented to, not the
+    /// ones published today.
+    ///
+    /// Reading today's manifest meant republishing a shorter tail swept
+    /// cases whose accused had agreed to a longer one — under terms
+    /// nobody accepted, while the published document said the periods
+    /// could not change under an existing consent.
+    #[tokio::test]
+    async fn a_case_is_swept_on_the_schedule_its_accused_consented_to() {
+        let store = Store::in_memory().unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+
+        let mut case = case_due("2026-08-20T00:00:00Z");
+        case.stage = "decided".into();
+        case.disposition = Some("dismiss".into());
+        store.put_case(&case).unwrap();
+        seed_mandate(&store, &case);
+        store.attach_evidence_blobs(&case.case_id, &[digest.clone()]).unwrap();
+
+        // The service is now running a manifest with a far shorter media
+        // tail than the one this case pinned (`P1D` in the test terms).
+        let republished = crate::testing::MANIFEST_JSON
+            .replace(r#""caseMedia": "P1D""#, r#""caseMedia": "P9000D""#);
+        let state = crate::state::AppState::for_tests_with(store, &republished);
+
+        // Past the consented tail, nowhere near the republished one.
+        retention_sweep(&state, util::parse_timestamp("2026-08-22T00:00:00Z").unwrap()).unwrap();
+
+        assert!(
+            state.store.evidence_blob(&digest).unwrap().is_none(),
+            "the consented tail governs, not the one published today"
+        );
+    }
+
+    /// A referral that was never made keeps its material, loudly.
+    ///
+    /// Releasing on the date alone took the case out of the referral
+    /// queue, made its media sweepable, and left nothing for the
+    /// operator to record the reference against — an unsubmitted
+    /// referral vanishing behind a log line that looked like a
+    /// discharged one.
+    #[tokio::test]
+    async fn an_unreferred_hold_is_not_released_when_its_period_passes() {
+        let store = Store::in_memory().unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+        let mut case = case_due("2026-08-05T00:00:00Z");
+        case.stage = "decided".into();
+        case.disposition = Some("dismiss".into());
+        store.put_case(&case).unwrap();
+        seed_mandate(&store, &case);
+        store.attach_evidence_blobs(&case.case_id, &[digest.clone()]).unwrap();
+        store
+            .place_preservation_hold(&crate::store::PreservationHold {
+                subject_kind: "case".into(),
+                subject_id: case.case_id.clone(),
+                class_id: "csam".into(),
+                reason: "preservation".into(),
+                placed_at: "2026-08-01T00:00:00Z".into(),
+                release_after: "2026-09-01T00:00:00Z".into(),
+            })
+            .unwrap();
+        let state = crate::state::AppState::for_tests(store);
+
+        retention_sweep(&state, util::parse_timestamp("2027-01-01T00:00:00Z").unwrap()).unwrap();
+
+        assert!(
+            state.store.evidence_blob(&digest).unwrap().is_some(),
+            "material with an outstanding referral is not discarded on a date"
+        );
+        assert!(
+            state.store.preservation_hold("case", &case.case_id).unwrap().is_some(),
+            "the hold survives, so the reference can still be recorded"
+        );
+        assert_eq!(
+            state.store.cases_awaiting_referral().unwrap().len(),
+            1,
+            "and the case stays in the queue rather than disappearing"
+        );
+        assert_eq!(state.store.overdue_unreferred_holds("2027-01-01T00:00:00Z").unwrap().len(), 1);
+    }
+
+    /// Once the referral is recorded, the period governs normally.
+    #[tokio::test]
+    async fn a_referred_hold_releases_on_its_date() {
+        let store = Store::in_memory().unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+        let mut case = case_due("2026-08-05T00:00:00Z");
+        case.stage = "decided".into();
+        case.disposition = Some("dismiss".into());
+        store.put_case(&case).unwrap();
+        seed_mandate(&store, &case);
+        store.attach_evidence_blobs(&case.case_id, &[digest.clone()]).unwrap();
+        store
+            .place_preservation_hold(&crate::store::PreservationHold {
+                subject_kind: "case".into(),
+                subject_id: case.case_id.clone(),
+                class_id: "csam".into(),
+                reason: "preservation".into(),
+                placed_at: "2026-08-01T00:00:00Z".into(),
+                release_after: "2026-09-01T00:00:00Z".into(),
+            })
+            .unwrap();
+        store.record_referral_reference(&case.case_id, "REF-1", "2026-08-10T00:00:00Z").unwrap();
+        let state = crate::state::AppState::for_tests(store);
+
+        retention_sweep(&state, util::parse_timestamp("2026-09-02T00:00:00Z").unwrap()).unwrap();
+
+        assert!(state.store.preservation_hold("case", &case.case_id).unwrap().is_none());
+        assert!(state.store.evidence_blob(&digest).unwrap().is_none());
+    }
+
+    /// The record and audit sweep, driven through `retention_sweep`
+    /// rather than by calling the store directly.
+    ///
+    /// The direct-call test could not see the interaction that mattered:
+    /// the sweep has to resolve each case's schedule from its mandate,
+    /// and the sanction loop may delete that mandate.
+    #[tokio::test]
+    async fn the_record_and_audit_sweep_runs_end_to_end() {
+        let store = Store::in_memory().unwrap();
+        let mut case = case_due("2026-08-05T00:00:00Z");
+        case.stage = "decided".into();
+        case.disposition = Some("dismiss".into());
+        store.put_case(&case).unwrap();
+        seed_mandate(&store, &case);
+        let report = serde_json::json!({
+            "reportVersion": 1, "reportId": "r1", "reporter": "onym:key:rep",
+            "reporterMandate": "m0", "accused": "onym:key:acc", "classId": "csam",
+            "evidence": [{"disclosedContent": "the material", "authenticityProof": "sig"}],
+            "filedAt": "2026-08-02T00:00:00Z",
+        });
+        store
+            .put_report("r1", "onym:key:rep", "onym:key:acc", "csam", Some("c1"), 1.0,
+                        &serde_json::to_vec(&report).unwrap(), "2026-08-02T00:00:00Z")
+            .unwrap();
+        store.record_event("c1", "2026-08-02T00:00:00Z", "case_opened", "").unwrap();
+        let state = crate::state::AppState::for_tests(store);
+
+        // Inside the consented 400-day tail: nothing goes.
+        retention_sweep(&state, util::parse_timestamp("2026-09-01T00:00:00Z").unwrap()).unwrap();
+        assert!(!state.store.evidence_for_case("c1").unwrap().is_empty());
+        assert!(!state.store.events("c1").unwrap().is_empty());
+
+        // Past it: content and audit trail go, through the sweep.
+        retention_sweep(&state, util::parse_timestamp("2027-10-01T00:00:00Z").unwrap()).unwrap();
+        assert!(state.store.evidence_for_case("c1").unwrap().is_empty());
+        assert!(state.store.events("c1").unwrap().is_empty());
+    }
+
+    /// A case must not survive its own schedule because the mandate that
+    /// resolves it was deleted first.
+    ///
+    /// `validate_retention` rejects the ordering that causes it, and the
+    /// sanction loop deletes the record before the mandate as well — so
+    /// even a mandate lost some other way cannot strand the content.
+    #[tokio::test]
+    async fn a_swept_sanction_record_does_not_strand_the_case_record() {
+        let store = Store::in_memory().unwrap();
+        let mut case = case_due("2026-08-05T00:00:00Z");
+        case.stage = "decided".into();
+        case.disposition = Some("dismiss".into());
+        store.put_case(&case).unwrap();
+        seed_mandate(&store, &case);
+        let report = serde_json::json!({
+            "reportVersion": 1, "reportId": "r1", "reporter": "onym:key:rep",
+            "reporterMandate": "m0", "accused": "onym:key:acc", "classId": "csam",
+            "evidence": [{"disclosedContent": "the material", "authenticityProof": "sig"}],
+            "filedAt": "2026-08-02T00:00:00Z",
+        });
+        store
+            .put_report("r1", "onym:key:rep", "onym:key:acc", "csam", Some("c1"), 1.0,
+                        &serde_json::to_vec(&report).unwrap(), "2026-08-02T00:00:00Z")
+            .unwrap();
+        // The sanction sweep works off verdicts, so the case needs the one
+        // that ended it.
+        store
+            .put_verdict_for_tests(
+                "c1",
+                "v-dismiss",
+                "dismiss",
+                br#"{"disposition":"dismiss"}"#,
+                "2026-08-05T00:00:00Z",
+            )
+            .unwrap();
+        let state = crate::state::AppState::for_tests(store);
+
+        // Far past every tail, so the sanction loop runs in the same tick.
+        retention_sweep(&state, util::parse_timestamp("2030-01-01T00:00:00Z").unwrap()).unwrap();
+
+        assert!(state.store.mandate("m1").unwrap().is_none(), "the mandate goes");
+        assert!(
+            state.store.evidence_for_case("c1").unwrap().is_empty(),
+            "and the content it resolved the terms for went with it, not after it"
+        );
+    }
+
+    /// The media eligibility list must agree with the single gate for an
+    /// overdue, unreferred case — the state the inline join could not see.
+    #[tokio::test]
+    async fn media_eligibility_agrees_with_the_hold_gate_when_a_referral_is_outstanding() {
+        let store = Store::in_memory().unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+        let mut case = case_due("2026-08-05T00:00:00Z");
+        case.stage = "decided".into();
+        case.disposition = Some("dismiss".into());
+        store.put_case(&case).unwrap();
+        seed_mandate(&store, &case);
+        store.attach_evidence_blobs(&case.case_id, &[digest.clone()]).unwrap();
+        store
+            .place_preservation_hold(&crate::store::PreservationHold {
+                subject_kind: "case".into(),
+                subject_id: case.case_id.clone(),
+                class_id: "csam".into(),
+                reason: "preservation".into(),
+                placed_at: "2026-08-01T00:00:00Z".into(),
+                // Deliberately a date in the past, unlike the 2099 used
+                // elsewhere: a future date cannot tell the two halves of
+                // the predicate apart.
+                release_after: "2026-09-01T00:00:00Z".into(),
+            })
+            .unwrap();
+
+        let now = "2027-01-01T00:00:00Z";
+        assert!(store.is_preserved("case", &case.case_id, now).unwrap());
+        let eligible = store.cases_eligible_for_media_retention(now).unwrap();
+        assert!(
+            !eligible.iter().any(|(id, _)| id == &case.case_id),
+            "the list must not offer a case the gate still preserves"
+        );
+    }
+
+    /// Retention takes the content and leaves the identity, so an
+    /// expired report id cannot be re-filed under.
+    #[tokio::test]
+    async fn a_swept_case_record_keeps_its_replay_guard() {
+        let store = Store::in_memory().unwrap();
+        let mut case = case_due("2026-08-05T00:00:00Z");
+        case.stage = "decided".into();
+        case.disposition = Some("dismiss".into());
+        store.put_case(&case).unwrap();
+        seed_mandate(&store, &case);
+        let report = serde_json::json!({
+            "reportVersion": 1, "reportId": "r1", "reporter": "onym:key:rep",
+            "reporterMandate": "m0", "accused": "onym:key:acc", "classId": "csam",
+            "evidence": [{"disclosedContent": "the material", "authenticityProof": "sig"}],
+            "filedAt": "2026-08-02T00:00:00Z",
+        });
+        store
+            .put_report("r1", "onym:key:rep", "onym:key:acc", "csam", Some("c1"), 1.0,
+                        &serde_json::to_vec(&report).unwrap(), "2026-08-02T00:00:00Z")
+            .unwrap();
+
+        store.delete_case_record(&case.case_id).unwrap();
+
+        // The content is gone.
+        assert!(store.evidence_for_case(&case.case_id).unwrap().is_empty());
+        // The identity is not, so the id is still taken.
+        let stored = store.report("onym:key:rep", "r1").unwrap();
+        assert!(stored.is_some(), "the id must stay claimed after its content expires");
+    }
+
+    #[tokio::test]
+    async fn a_preservation_hold_survives_every_sweep() {
+        let store = Store::in_memory().unwrap();
+
+        // An unreported upload, a decided case with media, its record,
+        // its audit trail and its sanction record — every artifact class
+        // the schedule can reach.
+        let orphan = store_image(&store, "2020-01-01T00:00:00Z");
+        let attached = store_image(&store, "2020-01-01T00:00:00Z");
+
+        let mut case = case_due("2020-02-01T00:00:00Z");
+        case.stage = "decided".into();
+        case.disposition = Some("dismiss".into());
+        store.put_case(&case).unwrap();
+        seed_mandate(&store, &case);
+        store.attach_evidence_blobs(&case.case_id, &[attached.clone()]).unwrap();
+        store.record_event(&case.case_id, "2020-01-02T00:00:00Z", "case_opened", "").unwrap();
+
+        for (kind, id) in
+            [("blob", orphan.as_str()), ("blob", attached.as_str()), ("case", case.case_id.as_str())]
+        {
+            store
+                .place_preservation_hold(&crate::store::PreservationHold {
+                    subject_kind: kind.into(),
+                    subject_id: id.into(),
+                    class_id: "csam".into(),
+                    reason: "preservation".into(),
+                    placed_at: "2020-01-02T00:00:00Z".into(),
+                    release_after: "2099-01-01T00:00:00Z".into(),
+                })
+                .unwrap();
+        }
+        let state = crate::state::AppState::for_tests(store);
+
+        // Far past every declared tail.
+        retention_sweep(&state, util::parse_timestamp("2030-01-01T00:00:00Z").unwrap()).unwrap();
+
+        assert!(state.store.evidence_blob(&orphan).unwrap().is_some(), "held upload");
+        assert!(state.store.evidence_blob(&attached).unwrap().is_some(), "held case media");
+        assert_eq!(state.store.case_media_count(&case.case_id).unwrap(), 1, "still attached");
+        assert!(!state.store.events(&case.case_id).unwrap().is_empty(), "held audit trail");
+    }
+
+    /// A hold's release date is fixed when it is placed. A later, shorter
+    /// period must not cut a running duty short — the same reasoning that
+    /// makes a mandate pin its manifest snapshot.
+    #[tokio::test]
+    async fn a_running_hold_is_not_shortened() {
+        let store = Store::in_memory().unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+        let hold = |release: &str| crate::store::PreservationHold {
+            subject_kind: "blob".into(),
+            subject_id: digest.clone(),
+            class_id: "csam".into(),
+            reason: "preservation".into(),
+            placed_at: "2026-08-01T00:00:00Z".into(),
+            release_after: release.into(),
+        };
+        store.place_preservation_hold(&hold("2027-08-01T00:00:00Z")).unwrap();
+        // A second filing, or a manifest since publishing less time.
+        store.place_preservation_hold(&hold("2026-09-01T00:00:00Z")).unwrap();
+
+        let stored = store.preservation_hold("blob", &digest).unwrap().unwrap();
+        assert_eq!(stored.release_after, "2027-08-01T00:00:00Z", "the later date wins");
+    }
+
+    /// Once the duty ends the material rejoins the schedule — a hold is
+    /// a delay, not an exemption.
+    #[tokio::test]
+    async fn a_released_hold_returns_its_material_to_the_schedule() {
+        let store = Store::in_memory().unwrap();
+        let digest = store_image(&store, "2026-08-01T00:00:00Z");
+        store
+            .place_preservation_hold(&crate::store::PreservationHold {
+                subject_kind: "blob".into(),
+                subject_id: digest.clone(),
+                class_id: "csam".into(),
+                reason: "preservation".into(),
+                placed_at: "2026-08-01T00:00:00Z".into(),
+                release_after: "2026-09-01T00:00:00Z".into(),
+            })
+            .unwrap();
+        let state = crate::state::AppState::for_tests(store);
+
+        retention_sweep(&state, util::parse_timestamp("2026-08-15T00:00:00Z").unwrap()).unwrap();
+        assert!(state.store.evidence_blob(&digest).unwrap().is_some(), "still held");
+
+        retention_sweep(&state, util::parse_timestamp("2026-09-02T00:00:00Z").unwrap()).unwrap();
+        assert!(state.store.evidence_blob(&digest).unwrap().is_none(), "duty over, period applies");
+        assert!(state.store.preservation_hold("blob", &digest).unwrap().is_none());
+    }
+
+    /// A permanent ban's record is never swept, whatever the schedule
+    /// says. It is the only thing that explains a live mark or lets one
+    /// be lifted.
+    #[tokio::test]
+    async fn a_permanent_ban_keeps_its_sanction_record_forever() {
+        let store = Store::in_memory().unwrap();
+        let mut case = case_due("2026-08-01T00:00:00Z");
+        case.stage = "decided".into();
+        case.disposition = Some("ban".into());
+        store.put_case(&case).unwrap();
+        seed_mandate(&store, &case);
+        // A ban verdict with no expiry is a permanent one.
+        store
+            .put_verdict_for_tests(
+                &case.case_id,
+                "v-permanent",
+                "ban",
+                br#"{"disposition":"ban"}"#,
+                "2026-08-01T00:00:00Z",
+            )
+            .unwrap();
+
+        let eligible = store
+            .cases_eligible_for_sanction_retention("2099-01-01T00:00:00Z")
+            .unwrap();
+        assert!(eligible.is_empty(), "a permanent ban outlives every period");
     }
 
     #[tokio::test]
@@ -329,6 +843,7 @@ mod tests {
         case.disposition = Some("dismiss".into());
         case.appeal_deadline = Some("2026-08-06T00:00:00Z".into());
         store.put_case(&case).unwrap();
+        seed_mandate(&store, &case);
         store.attach_evidence_blobs(&case.case_id, &[digest.clone()]).unwrap();
         let state = crate::state::AppState::for_tests(store);
 
@@ -360,12 +875,14 @@ mod tests {
         finished.stage = "decided".into();
         finished.disposition = Some("dismiss".into());
         store.put_case(&finished).unwrap();
+        seed_mandate(&store, &finished);
         store.attach_evidence_blobs("finished", &[digest.clone()]).unwrap();
 
         // Still open, and resting on the same bytes.
         let mut live = case_due("2026-12-01T00:00:00Z");
         live.case_id = "live".into();
         store.put_case(&live).unwrap();
+        seed_mandate(&store, &live);
         store.attach_evidence_blobs("live", &[digest.clone()]).unwrap();
 
         let state = crate::state::AppState::for_tests(store);
@@ -399,6 +916,7 @@ mod tests {
         case.disposition = Some("dismiss".into());
         case.appeal_deadline = None;
         store.put_case(&case).unwrap();
+        seed_mandate(&store, &case);
         store.attach_evidence_blobs(&case.case_id, &[digest.clone()]).unwrap();
         let state = crate::state::AppState::for_tests(store);
 
@@ -422,6 +940,7 @@ mod tests {
         case.appeal_deadline = Some("2026-08-06T00:00:00Z".into());
         case.appeal_state = "pending".into();
         store.put_case(&case).unwrap();
+        seed_mandate(&store, &case);
         store.attach_evidence_blobs(&case.case_id, &[digest.clone()]).unwrap();
         let state = crate::state::AppState::for_tests(store);
 
@@ -431,6 +950,30 @@ mod tests {
             state.store.evidence_blob(&digest).unwrap().is_some(),
             "deleting the material under a pending review would decide it by attrition"
         );
+    }
+
+    /// Store the mandate a case pins, with the published test manifest
+    /// as its consented snapshot.
+    ///
+    /// Required now that the schedule is resolved per case: without a
+    /// mandate there are no consented terms, and the sweep keeps the
+    /// material rather than guessing — so a fixture missing this looks
+    /// like a retention bug.
+    fn seed_mandate(store: &Store, case: &CaseRecord) {
+        store
+            .put_mandate(
+                &crate::store::MandateRecord {
+                    mandate_ref: case.mandate_ref.clone(),
+                    user_key: case.accused.clone(),
+                    device_binding: case.device_binding.clone(),
+                    classes: vec![case.class_id.clone()],
+                    manifest_hash: util::sha256_hex(crate::testing::MANIFEST_JSON.as_bytes()),
+                },
+                b"{}",
+                crate::testing::MANIFEST_JSON.as_bytes(),
+                "2026-08-01T00:00:00Z",
+            )
+            .unwrap();
     }
 
     fn case_due(decision_deadline: &str) -> CaseRecord {

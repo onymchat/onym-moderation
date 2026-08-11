@@ -39,5 +39,13 @@
   "newHolderAppeal": "https://authority.onym.app/policy/new-holder",
   "confidentiality": "https://authority.onym.app/policy/confidentiality",
   "statistics": "https://authority.onym.app/policy/transparency",
+  "retention": {
+    "policy": "https://authority.onym.app/policy/retention",
+    "unreferencedUpload": "P1D",
+    "caseMedia": "P30D",
+    "caseRecord": "P400D",
+    "auditRecord": "P400D",
+    "sanctionRecord": "P400D"
+  },
   "validUntil": "2027-08-31T23:59:59Z"
 }

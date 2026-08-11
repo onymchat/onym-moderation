@@ -43,6 +43,21 @@
   "newHolderAppeal": "https://example-authority.org/new-holder",
   "appellate": "onym:component:example-appellate",
   "confidentiality": "https://example-authority.org/confidentiality",
+  "retention": {
+    "policy": "https://authority.example/policy/retention",
+    "unreferencedUpload": "P1D",
+    "caseMedia": "P30D",
+    "caseRecord": "P400D",
+    "auditRecord": "P400D",
+    "sanctionRecord": "P400D",
+    "_preservation_example": "Delete this key and uncomment the block below only with legal advice. Declaring preservation for a class makes this authority accept that class's image evidence, take custody of it, and owe a referral. An operator who is not a service provider with the protections and reporting relationship that role carries may commit an offence simply by holding it. Absent this block the class refuses media, which is the safe default.",
+    "_preservation": {
+      "csam": {
+        "period": "P400D",
+        "referral": "https://authority.example/policy/lawful-reporting"
+      }
+    }
+  },
   "statistics": "https://example-authority.org/transparency",
   "validUntil": "2027-06-30T23:59:59Z"
 }
