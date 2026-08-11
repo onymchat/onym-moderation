@@ -237,8 +237,66 @@ impl Triage {
             );
         }
 
+        // Modality is a term, not a capability flag. The profile
+        // document a mandate pinned states the inputs it enables, so a
+        // case whose evidence this model cannot see is one it must not
+        // decide. The failure mode this prevents is specific and quiet:
+        // the image would otherwise be dropped, the caption classified
+        // alone, and the verdict would read as though the picture had
+        // been reviewed.
+        if !document.images.is_empty()
+            && (!profile.supports_images || document.images.len() as u32 > profile.max_images)
+        {
+            return self.record(
+                state,
+                case,
+                profile,
+                "",
+                &document,
+                Assessed {
+                    outcome: Outcome::NoDecision,
+                    score: None,
+                    labels: Vec::new(),
+                    note: if profile.supports_images {
+                        format!(
+                            "case {} carries {} images but profile {} takes at most {}; it will \
+                             not be decided on part of its evidence",
+                            case.case_id,
+                            document.images.len(),
+                            profile.id,
+                            profile.max_images
+                        )
+                    } else {
+                        format!(
+                            "case {} carries image evidence and profile {} cannot inspect \
+                             images; classifying only the text would misrepresent what was \
+                             reviewed",
+                            case.case_id, profile.id
+                        )
+                    },
+                },
+                now,
+            );
+        }
+
+        let derivatives = document
+            .images
+            .iter()
+            .map(|image| {
+                state
+                    .store
+                    .evidence_blob_derivative(&image.sha256)?
+                    .ok_or_else(|| {
+                        Error::Internal(format!(
+                            "case {} names image {} which is no longer stored",
+                            case.case_id, image.sha256
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
         let body = profile
-            .request_body(&case.class_id, &document.text)
+            .request_body(&case.class_id, &document.text, &derivatives)
             .map_err(Error::Internal)?;
 
         // A failed round-trip is an *attempt*, and has to be recorded
@@ -995,6 +1053,121 @@ mod tests {
                         &serde_json::to_vec(&report).unwrap(), "2026-08-02T00:00:00Z")
             .unwrap();
         case
+    }
+
+    /// Replace a case's text evidence with a reported photo: store the
+    /// image, then rewrite the report to commit to it.
+    fn attach_photo(store: &crate::store::Store, class_id: &str) -> crate::media::AcceptedImage {
+        let bytes = crate::media::tiny_jpeg(20, 12);
+        let accepted = crate::media::accept_image(&bytes).unwrap();
+        store.put_evidence_blob(&accepted, &bytes, "2026-08-02T00:00:00Z").unwrap();
+        store.mark_evidence_blobs_referenced(&[accepted.sha256.clone()]).unwrap();
+        store.attach_evidence_blobs("c1", &[accepted.sha256.clone()]).unwrap();
+        let content = format!(
+            r#"{{"body":"","group_binding":"ab","media":[{{"blob_sha256":"cipher","height":{},"mime_type":"image/jpeg","plaintext_byte_length":{},"plaintext_sha256":"{}","width":{}}}],"message_id":"m-1","proof_version":2,"sent_at_millis":1}}"#,
+            accepted.height, accepted.byte_length, accepted.sha256, accepted.width
+        );
+        // A second report joining the case, which is also how a photo
+        // realistically arrives: the case already holds text, and the
+        // picture comes with a later filing.
+        let report = serde_json::json!({
+            "reportVersion": 1, "reportId": "r2", "reporter": "onym:key:rep",
+            "reporterMandate": "m0", "accused": "onym:key:acc", "classId": class_id,
+            "evidence": [{"disclosedContent": content, "authenticityProof": "sig"}],
+            "filedAt": "2026-08-03T00:00:00Z",
+        });
+        store
+            .put_report("r2", "onym:key:rep", "onym:key:acc", class_id, Some("c1"), 1.0,
+                        &serde_json::to_vec(&report).unwrap(), "2026-08-03T00:00:00Z")
+            .unwrap();
+        accepted
+    }
+
+    /// The invariant the whole feature rests on. A profile that cannot
+    /// see an image must not answer about one — and specifically must
+    /// not answer about its caption and have that recorded as a review
+    /// of the picture.
+    #[tokio::test]
+    async fn a_text_only_profile_returns_no_decision_and_is_never_asked() {
+        let (url, seen) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "Safety: Unsafe\nCategories: Sexual"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "unsolicited-pornography", "2026-08-04T00:00:00Z");
+        attach_photo(&store, "unsolicited-pornography");
+        // qwen3guard-8b's published terms say it cannot inspect images.
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "qwen3guard-8b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let case = state.store.case("c1").unwrap().unwrap();
+        assert_eq!(case.disposition, None, "a model that cannot see the evidence must not ban");
+
+        // Not merely "did not ban": the model was never consulted. A
+        // request would have meant sending disclosed evidence to a model
+        // whose answer could not be about it.
+        assert!(seen.lock().unwrap().is_empty(), "the image must not be sent, nor the caption");
+
+        let (raw, applied) = state.store.assessment("c1").unwrap().unwrap();
+        assert!(!applied);
+        let assessment: Assessment = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(assessment.outcome, "no-decision");
+        assert!(assessment.note.contains("cannot inspect"), "{}", assessment.note);
+    }
+
+    /// And the other half: a profile whose terms enable images is sent
+    /// the normalized derivative, inline.
+    #[tokio::test]
+    async fn an_image_capable_profile_is_sent_the_derivative() {
+        let (url, seen) = stub_model(serde_json::json!({
+            "choices": [{"message": {"content": "unsafe\nS12"}}]
+        }))
+        .await;
+        let store = crate::store::Store::in_memory().unwrap();
+        open_case(&store, "unsolicited-pornography", "2026-08-04T00:00:00Z");
+        let accepted = attach_photo(&store, "unsolicited-pornography");
+        let state = std::sync::Arc::new(AppState::for_tests_with_triage(
+            store,
+            "llama-guard-4-12b",
+            &url,
+            TriageMode::Autonomous,
+        ));
+        let now = util::parse_timestamp("2026-08-10T00:00:00Z").unwrap();
+
+        assess_and_maybe_decide(&state, "c1", now).await;
+
+        let request = &seen.lock().unwrap()[0];
+        let parts = request["messages"][0]["content"].as_array().expect("a multimodal turn");
+        // Llama Guard 4's document puts images before the text.
+        assert_eq!(parts[0]["type"], "image_url");
+        assert_eq!(parts[1]["type"], "text");
+
+        // Inline, never a URL: a link would make the inference server
+        // fetch evidence over a network this authority does not control.
+        let url_field = parts[0]["image_url"]["url"].as_str().unwrap();
+        assert!(url_field.starts_with("data:image/jpeg;base64,"));
+        let encoded = url_field.trim_start_matches("data:image/jpeg;base64,");
+        let sent = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.decode(encoded).unwrap()
+        };
+        // The derivative, not the original: the model sees normalized
+        // bytes, and the record says which.
+        assert_eq!(util::sha256_hex(&sent), accepted.derivative_sha256);
+        assert_ne!(util::sha256_hex(&sent), accepted.sha256);
+
+        // The text still carries the document, including the media line
+        // that ties the picture to the digest.
+        let text = parts[1]["text"].as_str().unwrap();
+        assert!(text.contains(&accepted.sha256));
+        assert!(text.contains(&accepted.derivative_sha256));
     }
 
     /// The whole path for a native-taxonomy profile: build the

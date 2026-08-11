@@ -618,10 +618,26 @@ Reference implementation. Known limits:
   hand. For a class with a `permanent` term the contract *requires* an
   external appellate, so that gap matters most exactly where the
   sanction is heaviest.
-- **Triage classifies text.** Evidence that is an image or a video is
-  not scored; those cases come back inconclusive and wait for a human,
-  which is the safe direction but leaves the most serious classes least
-  automated.
+- **Triage classifies text and reported images; video, album and voice
+  evidence are still unscored.** A reported photo is uploaded to
+  `PUT /v1/evidence-blobs/{sha256}`, authenticated against the digest
+  the accused signed in a version 2 proof preimage, normalized into a
+  derivative, and sent to profiles whose published terms enable images.
+  A profile whose terms are text-only returns `no-decision` for a case
+  carrying images rather than classifying its captions. Video, album
+  and voice attachments are signed at send time but no authority
+  accepts them yet, so those cases still wait for a human.
+- **`csam` does not accept image evidence.** The class is refused with
+  `media_class_refused` and text reports for it are unaffected. Taking
+  the bytes would make this authority a custodian of illegal imagery
+  while its retention machinery is still the minimum below and it has
+  no statutory-reporting path — so the refusal is about readiness, not
+  about the report.
+- **Media retention is a sweep, not a published schedule.** Uploads
+  nobody reported expire after 24 hours; a decided case's images are
+  deleted once its appeal window closes and no claim is pending, with
+  original and derivative removed together. There is still no declared
+  retention period for the rest of the case record.
 - **Notices are returned to the reporter's call and stored, not pushed
   to the accused.** Serving them is the interface's job (§5.5), and it
   reads them from the gate check.

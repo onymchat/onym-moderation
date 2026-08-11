@@ -617,6 +617,7 @@ async fn case_detail(
         body.push_str("<p class=empty>No stored evidence.</p>");
     } else {
         for item in evidence {
+            body.push_str(&render_evidence_images(&state, &item, &case.class_id)?);
             body.push_str(&format!("<pre class=evidence>{}</pre>", escape(&item)));
         }
     }
@@ -713,6 +714,75 @@ async fn initial_decision(
     .await?;
 
     Ok(Redirect::to(&format!("/admin/cases/{case_id}")).into_response())
+}
+
+/// Classes whose evidence a reviewer should choose to look at, rather
+/// than have appear because they opened a page.
+const BLURRED_CLASSES: [&str; 2] = ["unsolicited-pornography", "csam"];
+
+/// Render an evidence item's images above its text.
+///
+/// Three deliberate constraints:
+///
+/// The **derivative** is shown, never the original. It is bounded,
+/// re-encoded, and metadata-free, so opening a case page cannot hand a
+/// reviewer's browser an attacker-chosen original to parse.
+///
+/// It is inlined as a `data:` URI rather than served from a route. The
+/// panel's standing rule is that it fetches nothing, which is why logout
+/// is POST-only — an image tag in disclosed evidence would otherwise
+/// issue a GET. Inlining keeps that literally true and means no
+/// blob-serving endpoint exists to be found.
+///
+/// Nothing attacker-controlled reaches the markup. The MIME type is a
+/// fixed literal, not the stored string, and every number is formatted
+/// from an integer, so there is no path by which a report's contents
+/// become HTML.
+fn render_evidence_images(
+    state: &AppState,
+    disclosed_content: &str,
+    class_id: &str,
+) -> Result<String, Error> {
+    let Ok(crate::media::Disclosed::Media(commitments)) =
+        crate::media::parse_disclosed(disclosed_content)
+    else {
+        return Ok(String::new());
+    };
+
+    let mut out = String::new();
+    for commitment in commitments {
+        let Some(stored) = state.store.evidence_blob(&commitment.plaintext_sha256)? else {
+            out.push_str("<p class=empty>This image is no longer retained.</p>");
+            continue;
+        };
+        let Some(derivative) = state.store.evidence_blob_derivative(&stored.sha256)? else {
+            out.push_str("<p class=empty>This image is no longer retained.</p>");
+            continue;
+        };
+        let encoded = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(&derivative)
+        };
+        let blurred = BLURRED_CLASSES.contains(&class_id);
+        out.push_str(&format!(
+            "<figure class=\"evidence-image{}\"{}>\
+             <img src=\"data:image/jpeg;base64,{}\" alt=\"reported image\">\
+             <figcaption>original sha256 {} · {}×{} · shown as sha256 {} · transform v{}{}</figcaption>\
+             </figure>",
+            if blurred { " reveal" } else { "" },
+            // Focusable so the reveal is a click or a keypress rather
+            // than something the pointer does by passing over it.
+            if blurred { " tabindex=0" } else { "" },
+            encoded,
+            escape(&stored.sha256),
+            stored.width,
+            stored.height,
+            escape(&stored.derivative_sha256),
+            stored.derivative_version,
+            if blurred { " · click to reveal" } else { "" },
+        ));
+    }
+    Ok(out)
 }
 
 fn assessment_section(state: &AppState, case_id: &str) -> String {
@@ -1121,8 +1191,16 @@ fn escape(raw: &str) -> String {
 /// header chrome included — because the signed-in pages carry one and
 /// the sign-in gate deliberately does not.
 fn page(title: &str, body: &str) -> String {
+    // The panel's rule that it fetches nothing, stated to the browser
+    // rather than only to the reader. Evidence is untrusted text that a
+    // reviewer's browser parses as part of a page, so the policy that
+    // stops it reaching the network belongs where the browser enforces
+    // it: no scripts at all, images only from this document's own
+    // `data:` URIs, and no connections anywhere.
     format!(
         "<!doctype html><html lang=en><head><meta charset=utf-8>\
+         <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; \
+         img-src data:; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'\">\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <title>{title}</title><style>{STYLE}</style></head><body>{body}</body></html>",
         title = escape(title),

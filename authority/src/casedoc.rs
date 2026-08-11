@@ -24,14 +24,38 @@ use crate::error::Error;
 use crate::store::{CaseRecord, Store};
 use crate::util;
 
+/// One image the document refers to, in the order it appears.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentImage {
+    /// The exact bytes the accused committed to.
+    pub sha256: String,
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+    /// What the model is actually shown.
+    pub derivative_sha256: String,
+    pub derivative_version: u32,
+}
+
 /// The assembled document, plus what a verdict needs to record about it.
 pub struct CaseDocument {
     pub text: String,
     /// SHA-256 of `text`. The reference policy calls this the
     /// input-evidence digest.
+    ///
+    /// Media is covered by this digest because each image's identity —
+    /// original hash, derivative hash, transform version, dimensions,
+    /// and position — is written *into* the text below. Hashing only a
+    /// textual rendering that omitted the pictures would let the record
+    /// claim to pin what the model saw while pinning only its captions;
+    /// putting the media line inside the document instead keeps one
+    /// digest meaning one thing.
     pub digest: String,
     pub evidence_items: usize,
     pub response_items: usize,
+    /// Ordered derivatives to send alongside the text, empty for a
+    /// text-only case.
+    pub images: Vec<DocumentImage>,
 }
 
 const FENCE_OPEN: &str = "<<<";
@@ -48,9 +72,29 @@ pub fn build(store: &Store, case: &CaseRecord) -> Result<CaseDocument, Error> {
     let context = store.report_context_for_case(&case.case_id)?;
     let responses = store.responses(&case.case_id)?;
 
+    let mut images: Vec<DocumentImage> = Vec::new();
     let mut reported = String::new();
     for (index, item) in evidence.iter().enumerate() {
-        reported.push_str(&format!("[item {}]\n{}\n", index + 1, fence(item)));
+        reported.push_str(&format!("[item {}]\n", index + 1));
+        // The media line sits outside the fence because it is this
+        // authority's own statement about the bytes, not disclosed
+        // text — and it must not be something a reporter can forge by
+        // writing it into their own content.
+        for image in resolve_images(store, item)? {
+            images.push(image.clone());
+            reported.push_str(&format!(
+                "[image {} of item {}: sha256 {} mime {} {}x{} shown-as sha256 {} transform v{}]\n",
+                images.len(),
+                index + 1,
+                image.sha256,
+                image.mime_type,
+                image.width,
+                image.height,
+                image.derivative_sha256,
+                image.derivative_version,
+            ));
+        }
+        reported.push_str(&format!("{}\n", fence(item)));
     }
     if evidence.is_empty() {
         // Should be unreachable — a case cannot open without verified
@@ -110,7 +154,37 @@ pub fn build(store: &Store, case: &CaseRecord) -> Result<CaseDocument, Error> {
         digest,
         evidence_items: evidence.len(),
         response_items,
+        images,
     })
+}
+
+/// The images one evidence item commits to, in commitment order.
+///
+/// A commitment whose blob is no longer on file yields nothing rather
+/// than failing: retention deletes media once a case is over, and a
+/// later rebuild of a finished case's document should say the picture is
+/// gone, not refuse to render the record at all.
+fn resolve_images(store: &Store, disclosed_content: &str) -> Result<Vec<DocumentImage>, Error> {
+    let Ok(crate::media::Disclosed::Media(commitments)) =
+        crate::media::parse_disclosed(disclosed_content)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for commitment in commitments {
+        let Some(stored) = store.evidence_blob(&commitment.plaintext_sha256)? else {
+            continue;
+        };
+        out.push(DocumentImage {
+            sha256: stored.sha256,
+            mime_type: stored.mime_type,
+            width: stored.width,
+            height: stored.height,
+            derivative_sha256: stored.derivative_sha256,
+            derivative_version: stored.derivative_version,
+        });
+    }
+    Ok(out)
 }
 
 /// The same document with the reporter's own explanation withheld.
@@ -275,6 +349,67 @@ mod tests {
             )
             .unwrap();
         store
+    }
+
+    /// A store holding one photo report: the image, and a report whose
+    /// disclosed content is the v2 preimage committing to it.
+    fn store_with_photo_report(width: u32, height: u32) -> (Store, crate::media::AcceptedImage) {
+        let bytes = crate::media::tiny_jpeg(width, height);
+        let accepted = crate::media::accept_image(&bytes).unwrap();
+        let content = format!(
+            r#"{{"body":"","group_binding":"ab","media":[{{"blob_sha256":"cipher","height":{},"mime_type":"image/jpeg","plaintext_byte_length":{},"plaintext_sha256":"{}","width":{}}}],"message_id":"m-1","proof_version":2,"sent_at_millis":1}}"#,
+            accepted.height, accepted.byte_length, accepted.sha256, accepted.width
+        );
+        let store = store_with_report(&content, None);
+        store.put_evidence_blob(&accepted, &bytes, "2026-08-02T00:00:00Z").unwrap();
+        (store, accepted)
+    }
+
+    /// The digest has to mean "what the model was shown". Hashing only
+    /// the textual rendering would let the picture change underneath a
+    /// digest that never moved.
+    #[test]
+    fn the_input_digest_covers_the_image_and_not_only_its_caption() {
+        let (store_a, image_a) = store_with_photo_report(20, 12);
+        let (store_b, image_b) = store_with_photo_report(21, 12);
+
+        let a = build(&store_a, &case()).unwrap();
+        let b = build(&store_b, &case()).unwrap();
+
+        assert_eq!(a.images.len(), 1);
+        assert_eq!(a.images[0].sha256, image_a.sha256);
+        assert_ne!(image_a.sha256, image_b.sha256);
+        assert_ne!(a.digest, b.digest, "a different picture must be a different input");
+
+        // Original and derivative identity, dimensions, and position are
+        // all in the text, which is what makes one digest cover them.
+        assert!(b.text.contains(&image_b.sha256));
+        assert!(b.text.contains(&image_b.derivative_sha256));
+        assert!(b.text.contains("21x12"));
+        assert!(b.text.contains("transform v"));
+    }
+
+    /// A case whose media retention already ran still renders. The
+    /// record should say the picture is gone, not refuse to show
+    /// anything.
+    #[test]
+    fn a_document_survives_its_images_being_deleted() {
+        let (store, image) = store_with_photo_report(20, 12);
+        assert_eq!(build(&store, &case()).unwrap().images.len(), 1);
+
+        store.delete_evidence_blobs_for_case("c1").unwrap();
+        // Not attached to the case in this fixture, so remove directly.
+        store.sweep_unreferenced_evidence_blobs("2030-01-01T00:00:00Z").unwrap();
+
+        let doc = build(&store, &case()).unwrap();
+        assert!(doc.images.is_empty());
+        // The authority's own media line is gone, because it can no
+        // longer make that statement. The reporter's disclosed
+        // commitment stays — it is what they filed, and it still names
+        // the digest even though the bytes are gone.
+        assert!(!doc.text.contains("shown-as"));
+        assert!(doc.text.contains(&image.sha256), "the signed commitment is still on the record");
+        assert!(doc.text.contains("REPORTED MATERIAL:"), "the record still renders");
     }
 
     #[test]

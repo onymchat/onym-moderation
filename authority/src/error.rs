@@ -49,6 +49,34 @@ pub enum Error {
     #[error("case_state: {0}")]
     CaseState(String),
 
+    /// Evidence names a blob this authority does not hold. The bytes
+    /// travel on their own content-addressed route, so a report can
+    /// legitimately arrive before its upload finished — the client's
+    /// remedy is to upload and re-file the identical report.
+    #[error("media_missing: {0}")]
+    MediaMissing(String),
+
+    /// The uploaded bytes are not something this authority will decode:
+    /// a media type outside the allowlist, an image it cannot parse, or
+    /// dimensions outside the declared bounds. Note that a *mismatch*
+    /// against the sender's signed commitment is not this — that is
+    /// `authenticity_unverified`, because the failure is the proof, not
+    /// the format.
+    #[error("media_unsupported: {0}")]
+    MediaUnsupported(String),
+
+    /// The upload exceeds the evidence-blob ceiling.
+    #[error("media_too_large: {0}")]
+    MediaTooLarge(String),
+
+    /// The class does not accept media evidence at this authority.
+    /// `csam` is refused deliberately: accepting the bytes would make
+    /// this authority a custodian of illegal imagery before it has the
+    /// retention, deletion, and statutory-reporting machinery that
+    /// custody requires. Refusing is not a judgement about the report.
+    #[error("media_class_refused: {0}")]
+    MediaClassRefused(String),
+
     #[error("not found: {0}")]
     NotFound(String),
 
@@ -67,6 +95,10 @@ impl Error {
             Error::ClassOutsideMandate(_) => "class_outside_mandate",
             Error::WindowClosed(_) => "window_closed",
             Error::CaseState(_) => "case_state",
+            Error::MediaMissing(_) => "media_missing",
+            Error::MediaUnsupported(_) => "media_unsupported",
+            Error::MediaTooLarge(_) => "media_too_large",
+            Error::MediaClassRefused(_) => "media_class_refused",
             Error::NotFound(_) => "not_found",
             Error::Internal(_) => "internal_error",
         }
@@ -97,6 +129,13 @@ impl Error {
             Error::ReporterUnconsented | Error::NoJurisdiction | Error::ClassOutsideMandate(_) => {
                 StatusCode::FORBIDDEN
             }
+            // The report is well-formed and the proof is fine; the
+            // bytes it names simply are not here yet. Retryable after
+            // an upload, which 422 would not suggest.
+            Error::MediaMissing(_) => StatusCode::CONFLICT,
+            Error::MediaUnsupported(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Error::MediaTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            Error::MediaClassRefused(_) => StatusCode::FORBIDDEN,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
