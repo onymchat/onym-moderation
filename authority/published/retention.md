@@ -41,6 +41,13 @@ force would leave someone marked with no way to show why or to have it
 cleared, so a permanent ban means the record stays permanently. That is
 not an exception to this schedule; it is what the schedule is for.
 
+One of those is not pinned by your consent, and it is the only one: an
+upload no report ever named belongs to no case, so there is no mandate
+whose terms could govern it. It is a bound on how long this service
+holds unclaimed bytes. Every other period above is read from the
+manifest the case's accused agreed to, so republishing a shorter one
+does not reach back into cases already open.
+
 ## What is not on a timer
 
 The `cases` row itself — that a case existed, its class, and how it
@@ -58,6 +65,13 @@ A hold's release date is fixed when the hold is placed, from the period
 published at that moment. A later version of this document naming a
 shorter period does not shorten a hold already running — the same way a
 mandate is judged by the terms it pinned rather than by today's.
+
+A hold is not released by its date alone. If no referral has been
+recorded against it, the material stays and the case stays in the
+operator's queue: the period bounds how long material must be kept
+*after* it has been referred, and it is not permission to discard
+evidence nobody ever passed on. That can mean material is held longer
+than this schedule wants, which is the direction to err in.
 
 Holds only exist for classes this manifest declares preservation terms
 for. **This manifest declares none.** No class here accepts media

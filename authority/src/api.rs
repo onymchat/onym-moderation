@@ -883,7 +883,7 @@ async fn file_report(
 /// The manifest a mandate consented to, parsed. A legacy mandate with
 /// no snapshot may use the published bytes only when they still hash to
 /// the mandate's reference; otherwise there is no safe reconstruction.
-fn consented_manifest(
+pub(crate) fn consented_manifest(
     state: &AppState,
     mandate: &crate::store::MandateRecord,
 ) -> Result<AuthorityManifest, Error> {

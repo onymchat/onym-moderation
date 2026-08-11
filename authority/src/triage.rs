@@ -237,13 +237,6 @@ impl Triage {
             );
         }
 
-        // Modality is a term, not a capability flag. The profile
-        // document a mandate pinned states the inputs it enables, so a
-        // case whose evidence this model cannot see is one it must not
-        // decide. The failure mode this prevents is specific and quiet:
-        // the image would otherwise be dropped, the caption classified
-        // alone, and the verdict would read as though the picture had
-        // been reviewed.
         // A case under a preservation duty is not classified here at
         // all.
         //
@@ -302,6 +295,13 @@ impl Triage {
             );
         }
 
+        // Modality is a term, not a capability flag. The profile document
+        // a mandate pinned states the inputs it enables, so a case whose
+        // evidence this model cannot see is one it must not decide. The
+        // failure mode this prevents is specific and quiet: the image
+        // would otherwise be dropped, the caption classified alone, and
+        // the verdict would read as though the picture had been reviewed.
+        //
         // A model that cannot inspect an image at all cannot judge a
         // case that rests on one, so this stays a refusal to decide.
         // Intake now declines image evidence outright when the pinned

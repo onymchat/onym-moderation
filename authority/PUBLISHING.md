@@ -27,11 +27,24 @@ undertakings, and that is not a decision code inspection can make.
 
 Two in particular deserve a careful read:
 
-- **`published/confidentiality.md`** names no deletion schedule, on purpose. §7 of
-  the reference policy argues that a period nobody keeps is worse than
-  naming none, and this service deletes nothing on a timer. If Onym
-  wants to commit to a retention period, the deletion has to be built
-  first and the document changed second.
+- **`published/retention.md`** and the `retention` block in
+  `manifest/manifest.json` are a live commitment. §7 of the reference
+  policy argues that a period nobody keeps is worse than naming none, so
+  these were built before they were published — the sweep in
+  `deadlines::retention_sweep` enforces every period named, and the
+  per-case tails are read from the manifest each case's accused
+  consented to rather than from whatever is published today. Changing a
+  period is therefore a new manifest and fresh consent, not an edit.
+
+  What this file used to say — that no schedule is named and none is
+  kept — was true until media retention shipped and stayed on the page
+  afterwards. Read the schedule against the sweep before changing
+  either.
+- **`published/lawful-reporting.md`** states what happens to preserved
+  material: nobody here views it, no model is shown it, the case is not
+  decided on it, and it is referred by an operator rather than
+  submitted by this service. Each of those is a property of the code,
+  not an aspiration; check them before editing the sentence.
 - **The three class documents** — `published/csam.md`,
   `credible-violence.md`, `unsolicited-pornography.md` — are what the
   manifest's `definition` URLs resolve to, and they are the text an

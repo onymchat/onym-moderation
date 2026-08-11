@@ -43,10 +43,18 @@ and it is not shown to any classifier. The normalized copy that would
 make either possible is destroyed as soon as the class is known; only the
 original is kept, sealed, for the referral.
 
-**It is not classified.** A case under a preservation hold is not decided
-by a model at this authority. The material is held for a body equipped
-to act on it, and this authority's opinion about it is not the useful
-output.
+**It is not classified, and the case ends in dismissal.** A case under a
+preservation hold is not decided by a model here, and no moderator can
+decide it on the material either, because the material is not displayed.
+Nothing therefore decides it — and this authority's rule is that an
+undecided case is dismissed at its decision deadline, with the
+case-open mark cleared.
+
+So a referred case ends with no sanction from this authority. That is
+worth stating plainly rather than leaving to be inferred: the referral
+is the consequence that matters, and it is independent of the case. This
+authority is not the body that acts on this material, and a ban it
+issued would be neither the remedy nor a substitute for one.
 
 **It is referred, and the referral does not wait for the case.** Response
 windows and appeal windows exist to give an accused a fair chance to

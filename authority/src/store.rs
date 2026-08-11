@@ -1635,23 +1635,82 @@ impl Store {
     }
 
     fn preserved(conn: &Connection, kind: &str, id: &str, now: &str) -> Result<bool, Error> {
+        // A hold is active while its period runs — and, for a case, also
+        // while its referral is outstanding.
+        //
+        // The second clause is not a courtesy. The period bounds how long
+        // material must be kept *after* being referred; it does not
+        // authorise discarding evidence nobody ever passed on. Without
+        // it, keeping the hold row past its date achieved nothing: the
+        // gate read the date alone and let the sweep through.
+        //
+        // Blob holds carry no reference of their own and expire on their
+        // date. A blob attached to an unreferred case is still protected,
+        // because deletion for a case goes through the case's own gate.
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM preservation_holds \
-             WHERE subject_kind = ?1 AND subject_id = ?2 AND release_after > ?3",
+             WHERE subject_kind = ?1 AND subject_id = ?2 \
+               AND (release_after > ?3 \
+                    OR (subject_kind = 'case' AND referral_ref IS NULL))",
             params![kind, id, now],
             |row| row.get(0),
         )?;
         Ok(count > 0)
     }
 
-    /// Holds whose duty has run out, so their material becomes
-    /// sweepable. Returned rather than deleted silently: an expiring
-    /// hold is a fact worth logging.
+    /// Holds whose duty has run out **and whose referral was made**, so
+    /// their material becomes sweepable.
+    ///
+    /// The referral condition is the important half. A release date
+    /// bounds how long material must be kept *after* it has been
+    /// referred; it is not permission to discard evidence that was never
+    /// referred at all. Dropping those holds took the case out of the
+    /// referral queue, made its media sweepable, and left
+    /// `record_referral_reference` with no row to write to — so an
+    /// unsubmitted referral disappeared behind a log line indis-
+    /// tinguishable from a discharged one.
+    ///
+    /// An outstanding referral therefore holds forever, loudly. That can
+    /// mean material is kept longer than the schedule wants, which is
+    /// the right side to err on: the alternative is destroying something
+    /// nobody ever passed on. `overdue_unreferred_holds` is what makes
+    /// it visible rather than silent.
     pub fn released_holds(&self, now: &str) -> Result<Vec<PreservationHold>, Error> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(
             "SELECT subject_kind, subject_id, class_id, reason, placed_at, release_after \
-             FROM preservation_holds WHERE release_after <= ?1",
+             FROM preservation_holds \
+             WHERE release_after <= ?1 \
+               AND (subject_kind != 'case' OR referral_ref IS NOT NULL)",
+        )?;
+        let rows = statement.query_map(params![now], |row| {
+            Ok(PreservationHold {
+                subject_kind: row.get(0)?,
+                subject_id: row.get(1)?,
+                class_id: row.get(2)?,
+                reason: row.get(3)?,
+                placed_at: row.get(4)?,
+                release_after: row.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Holds whose period has passed with no referral recorded.
+    ///
+    /// Surfaced so the sweep can say so every tick and the panel can
+    /// keep showing the case. This is the state where this authority is
+    /// holding material it undertook to pass on and has not.
+    pub fn overdue_unreferred_holds(&self, now: &str) -> Result<Vec<PreservationHold>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT subject_kind, subject_id, class_id, reason, placed_at, release_after \
+             FROM preservation_holds \
+             WHERE subject_kind = 'case' AND referral_ref IS NULL AND release_after <= ?1",
         )?;
         let rows = statement.query_map(params![now], |row| {
             Ok(PreservationHold {
@@ -1931,9 +1990,10 @@ impl Store {
         rows.next().transpose().map_err(Into::into)
     }
 
-    /// The normalized derivative's bytes — what the model is sent and
-    /// what the moderator panel renders. The original is never served.
     /// The viewable derivative, or `None` when there is nothing to view.
+    ///
+    /// This is what the model is sent and what the panel renders; the
+    /// original is never served through here.
     ///
     /// A dropped derivative (`drop_derivative`) leaves a zero-length blob
     /// on the row rather than deleting it, so the empty case is mapped to
@@ -2046,11 +2106,10 @@ impl Store {
     /// The anchor is the later of the appeal and decision deadlines —
     /// the same point the media sweep uses, because it is the moment the
     /// process the material was disclosed for is actually over.
-    pub fn cases_past_record_retention(
+    pub fn cases_eligible_for_record_retention(
         &self,
         now: &str,
-        tail_days: i64,
-    ) -> Result<Vec<String>, Error> {
+    ) -> Result<Vec<(String, String)>, Error> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(
             "SELECT case_id, decision_deadline, appeal_deadline FROM cases \
@@ -2072,13 +2131,13 @@ impl Store {
             let anchor = appeal_deadline
                 .filter(|appeal| appeal.as_str() > decision_deadline.as_str())
                 .unwrap_or(decision_deadline);
-            if !Self::tail_elapsed(&anchor, tail_days, now)? {
-                continue;
-            }
             if Self::preserved(&conn, "case", &case_id, now)? {
                 continue;
             }
-            out.push(case_id);
+            // The anchor travels with the case; the *tail* is resolved by
+            // the caller from the manifest that case's accused
+            // consented to, not from whatever is published today.
+            out.push((case_id, anchor));
         }
         Ok(out)
     }
@@ -2087,7 +2146,7 @@ impl Store {
     ///
     /// An unparseable anchor keeps the material. A corrupt timestamp is
     /// a reason to look, not a reason to delete.
-    fn tail_elapsed(anchor: &str, tail_days: i64, now: &str) -> Result<bool, Error> {
+    pub fn tail_elapsed(anchor: &str, tail_days: i64, now: &str) -> Result<bool, Error> {
         let Ok(anchor) = crate::util::parse_timestamp(anchor) else { return Ok(false) };
         let Ok(now) = crate::util::parse_timestamp(now) else { return Ok(false) };
         Ok(now >= anchor + time::Duration::days(tail_days))
@@ -2099,10 +2158,28 @@ impl Store {
     pub fn delete_case_record(&self, case_id: &str) -> Result<usize, Error> {
         let conn = self.conn.lock().unwrap();
         let mut removed = 0;
-        for table in ["reports", "responses", "assessments"] {
+        for table in ["responses", "assessments"] {
             removed +=
                 conn.execute(&format!("DELETE FROM {table} WHERE case_id = ?1"), params![case_id])?;
         }
+
+        // Reports keep their row and lose their content.
+        //
+        // `(reporter, report_id)` is the replay guard: `put_report`
+        // refuses a second filing under an id already on file. Deleting
+        // the row outright freed the id, so a report could be re-filed
+        // under it — a small window at 400 days, but the guard exists
+        // precisely so a filing cannot be rewritten, and expiry is not a
+        // reason to allow it.
+        //
+        // The disclosed content is what retention is about, and that
+        // goes: `raw` is emptied, which `evidence_for_case` and
+        // `report_context_for_case` both skip because they parse it as
+        // JSON. What remains is the fact that a report existed.
+        removed += conn.execute(
+            "UPDATE reports SET raw = x'' WHERE case_id = ?1 AND LENGTH(raw) > 0",
+            params![case_id],
+        )?;
         Ok(removed)
     }
 
@@ -2125,11 +2202,10 @@ impl Store {
     /// schedule says. A case with a timed ban becomes eligible only once
     /// the tail has elapsed **since the ban expired**, not since the
     /// case ended. Anything unparseable keeps the record.
-    pub fn cases_past_sanction_retention(
+    pub fn cases_eligible_for_sanction_retention(
         &self,
         now: &str,
-        tail_days: i64,
-    ) -> Result<Vec<String>, Error> {
+    ) -> Result<Vec<(String, String)>, Error> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(
             "SELECT c.case_id, c.decision_deadline, v.disposition, v.raw FROM cases c \
@@ -2179,13 +2255,10 @@ impl Store {
             if endless.contains(&case_id) {
                 continue;
             }
-            if !Self::tail_elapsed(&anchor, tail_days, now)? {
-                continue;
-            }
             if Self::preserved(&conn, "case", &case_id, now)? {
                 continue;
             }
-            out.push(case_id);
+            out.push((case_id, anchor));
         }
         Ok(out)
     }
@@ -2272,11 +2345,10 @@ impl Store {
     /// somebody may still be asking about. The decision deadline is a
     /// signed, already-authenticated horizon, so it gives that grace
     /// without inventing new state.
-    pub fn cases_with_media_past_retention(
+    pub fn cases_eligible_for_media_retention(
         &self,
         now: &str,
-        tail_days: i64,
-    ) -> Result<Vec<String>, Error> {
+    ) -> Result<Vec<(String, String)>, Error> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(
             "SELECT DISTINCT b.case_id, c.decision_deadline, c.appeal_deadline \
@@ -2303,9 +2375,7 @@ impl Store {
             let anchor = appeal_deadline
                 .filter(|appeal| appeal.as_str() > decision_deadline.as_str())
                 .unwrap_or(decision_deadline);
-            if Self::tail_elapsed(&anchor, tail_days, now)? {
-                out.push(case_id);
-            }
+            out.push((case_id, anchor));
         }
         Ok(out)
     }
