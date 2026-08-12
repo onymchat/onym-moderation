@@ -589,12 +589,6 @@ See [SKILL.md](SKILL.md).
 
 Reference implementation. Known limits:
 
-- **Nothing calls `accept-mandate` yet.** The endpoint is implemented
-  and tested here, but the interface (`../apple`) does not POST the
-  countersigned mandate to the authority, and the iOS client has no
-  registration operation. Until that lands, jurisdiction has to be
-  seeded by hand — which means the end-to-end consent path is not
-  closed, across all three repos.
 - **The new-holder path cannot be authenticated here.** A new owner is
   by definition not the mandated identity, so their claim cannot be
   signature-checked. It answers every caller identically — filed or
@@ -604,13 +598,18 @@ Reference implementation. Known limits:
   this service has no ownership proof or claim-resolution lifecycle.
   That is an accepted limitation, not a complete anti-burning remedy.
   Real attestation that a device changed hands needs the interface,
-  which holds the device key.
+  which holds the device key. The separate `/v1/recovery-claims` path
+  is stronger — signed by the claimant's new key, decided by a human,
+  ending in an operator-signed single-use grant the interface
+  verifies — but that proves key possession and human judgment, not
+  device ownership.
 
-- **Prompt delivery is detached and not single-flight.** Case openings,
-  decisions, and the sweep may drain the same backlog concurrently.
-  The interface store is idempotent, but duplicate attempts and
-  piled-up timeouts remain an accepted operational limitation of this
-  reference service.
+- **The delivery drain is single-flight, but the sweep may overlap
+  it.** Case openings, decisions, and requeues share one gated
+  background flight; the independent deadline sweep calls the same
+  flush directly and can overlap an in-flight drain. The interface
+  store is idempotent, but duplicate attempts and piled-up timeouts
+  remain an accepted operational limitation of this reference service.
 
 - **The manifest's `appellate` is published but not routed to.** An
   appeal is reviewed by this authority's own moderator in the panel; a
