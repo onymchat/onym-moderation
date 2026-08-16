@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "componentId": "onym:component:onym-authority",
+  "seat": "moderation",
+  "operator": "onym:key:d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+  "name": "Onym Authority",
+  "endpoints": [
+    {
+      "uri": "https://authority.onym.app"
+    }
+  ],
+  "moderationProfileId": "onym:moderation-profile:consent-bound-v1",
+  "violationClasses": [
+    {
+      "classId": "csam",
+      "definition": "https://authority.onym.app/policy/csam",
+      "responseWindow": "P3D",
+      "decisionDeadline": "P7D",
+      "banTerm": "P365D",
+      "appealWindow": "P30D",
+      "appealEffect": "non-suspensive",
+      "lawfulReporting": "https://authority.onym.app/policy/lawful-reporting"
+    }
+  ],
+  "validUntil": "2027-08-31T23:59:59Z"
+}

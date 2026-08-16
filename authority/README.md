@@ -95,6 +95,17 @@ worth stating:
   open still run to their deadlines: an expiry must not strand someone
   under a case-open mark.
 
+A deployment finalizes the manifest before publishing it with
+`finalize-manifest <path>`: it injects a top-level `name`
+(`AUTHORITY_MANIFEST_NAME`, default "Onym Authority") and `endpoints`
+(`AUTHORITY_PUBLIC_URL`, default `https://authority.onym.app`) when the
+source omits them, and embeds the operator's Ed25519 `signature` over
+the discovery profile's canonical signing bytes — what the Onym
+clients' destination-manifest review requires before a discovery
+catalog row for this authority is trusted. The detached
+`manifest.json.sig` (`sign-manifest`) still covers the final file's
+exact bytes and is produced **after** finalizing.
+
 ## How a case is decided
 
 Three configurations, chosen with `AUTHORITY_TRIAGE_MODE`:

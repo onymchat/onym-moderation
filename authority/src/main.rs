@@ -20,6 +20,7 @@ mod deadlines;
 mod decisions;
 mod delivery;
 mod error;
+mod materialize;
 mod media;
 mod policy;
 mod profiles;
@@ -109,8 +110,61 @@ fn sign_manifest(path: &str) -> ! {
     std::process::exit(0);
 }
 
+/// Finalize a materialized manifest **in place** for discovery-seat
+/// review: inject a top-level `name` (`AUTHORITY_MANIFEST_NAME`, or
+/// "Onym Authority") and `endpoints` (`AUTHORITY_PUBLIC_URL`, or
+/// `https://authority.onym.app`) when absent, and embed the operator's
+/// Ed25519 `signature` over the canonical signing bytes the discovery
+/// profile defines — the same key `sign-manifest` uses, over different
+/// bytes: the embedded signature covers the canonical form (document
+/// minus `signature`, compact, keys sorted), while the detached `.sig`
+/// covers the final file's exact bytes and must therefore be produced
+/// AFTER this step.
+///
+/// Runs before publication, so the seed stays in its secret store and
+/// the rewritten file is what `sign-manifest` then signs and mandates
+/// then pin.
+fn finalize_manifest(path: &str) -> ! {
+    let seed = seed_from_env();
+    let non_empty = |var: &str| std::env::var(var).ok().filter(|value| !value.is_empty());
+    let name =
+        non_empty("AUTHORITY_MANIFEST_NAME").unwrap_or_else(|| materialize::DEFAULT_MANIFEST_NAME.into());
+    let endpoint =
+        non_empty("AUTHORITY_PUBLIC_URL").unwrap_or_else(|| materialize::DEFAULT_PUBLIC_URL.into());
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) => {
+            eprintln!("could not read {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let finalized = match materialize::finalize_manifest(&raw, &name, &endpoint, &seed) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("could not finalize {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    // Write-then-rename: a crash mid-write must leave the staged
+    // manifest either untouched or fully finalized, never truncated
+    // bytes a later `sign-manifest` would faithfully sign.
+    let staged = format!("{path}.finalizing");
+    if let Err(e) =
+        std::fs::write(&staged, &finalized).and_then(|()| std::fs::rename(&staged, path))
+    {
+        eprintln!("could not write {path}: {e}");
+        std::process::exit(1);
+    }
+    println!(
+        "finalized {path} ({} bytes, sha256:{})",
+        finalized.len(),
+        util::sha256_hex(&finalized)
+    );
+    std::process::exit(0);
+}
+
 /// `AUTHORITY_SIGNING_SEED` as raw bytes, or a usage error. Shared by
-/// both operator subcommands so their seed handling cannot drift.
+/// the operator subcommands so their seed handling cannot drift.
 fn seed_from_env() -> [u8; 32] {
     let Ok(hex_seed) = std::env::var("AUTHORITY_SIGNING_SEED") else {
         eprintln!(
@@ -144,6 +198,13 @@ async fn main() {
             std::process::exit(1);
         };
         sign_manifest(&path);
+    }
+    if std::env::args().nth(1).as_deref() == Some("finalize-manifest") {
+        let Some(path) = std::env::args().nth(2) else {
+            eprintln!("usage: onym-moderation-authority finalize-manifest <manifest-path>");
+            std::process::exit(1);
+        };
+        finalize_manifest(&path);
     }
 
     tracing_subscriber::fmt()
