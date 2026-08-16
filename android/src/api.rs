@@ -674,6 +674,7 @@ mod tests {
             play_package_name: None,
             play_cert_sha256_digests: vec![],
             play_token_max_age_secs: 600,
+            require_recall: true,
             challenge_ttl_secs: 600,
             propagation_grace_secs: 60,
             interface_signing_seed: [11u8; 32],

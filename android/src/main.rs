@@ -70,6 +70,7 @@ async fn main() {
                 package_name: package,
                 cert_sha256_digests: config.play_cert_sha256_digests.clone(),
                 token_max_age_secs: config.play_token_max_age_secs,
+                require_recall: config.require_recall,
             })
         });
         match built {

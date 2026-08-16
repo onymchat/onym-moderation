@@ -23,6 +23,9 @@ pub struct Config {
     pub play_cert_sha256_digests: Vec<String>,
     /// Freshness window for a token's `requestDetails.timestampMillis`.
     pub play_token_max_age_secs: i64,
+    /// Whether the gate refuses tokens without a deviceRecall object
+    /// (the strict profile). See MODERATION_REQUIRE_RECALL above.
+    pub require_recall: bool,
 
     /// How long an issued challenge stays presentable, seconds.
     pub challenge_ttl_secs: i64,
@@ -109,6 +112,16 @@ impl Config {
             .map(str::to_string)
             .collect();
         let play_token_max_age_secs = parse_secs("MODERATION_PLAY_TOKEN_MAX_AGE_SECS", 600)?;
+        // INTERIM, pre-device-recall-grant: "false" lets the GATE
+        // tolerate an absent deviceRecall object (prerequisites 1-4
+        // still enforced) instead of answering checkRequired to every
+        // device on Earth. Default TRUE — the strict profile — and
+        // flipped back the day Google's grant lands. See
+        // classifier::classify_enrollment for the enrollment-side
+        // rationale this extends, and the README's disclosure.
+        let require_recall = env::var("MODERATION_REQUIRE_RECALL")
+            .map(|v| !(v == "false" || v == "0"))
+            .unwrap_or(true);
         let challenge_ttl_secs = parse_secs("MODERATION_CHALLENGE_TTL_SECS", 600)?;
         let propagation_grace_secs = parse_secs("MODERATION_PROPAGATION_GRACE_SECS", 60)?;
 
@@ -152,6 +165,7 @@ impl Config {
             play_package_name,
             play_cert_sha256_digests,
             play_token_max_age_secs,
+            require_recall,
             challenge_ttl_secs,
             propagation_grace_secs,
             interface_signing_seed,
