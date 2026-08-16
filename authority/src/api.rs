@@ -555,7 +555,21 @@ async fn accept_mandate(
     // The interface's countersignature is what makes it a mandate
     // rather than a unilateral claim — it says the interface witnessed
     // the consent and will execute verdicts under it.
-    match (state.config.interface_keys.as_slice(), mandate.signatures.get(1)) {
+    //
+    // Which keys may witness is scoped to the interface the mandate
+    // NAMES when AUTHORITY_INTERFACE_KEYS_BY_COMPONENT lists it: with
+    // several backends, the flat AUTHORITY_INTERFACE_KEY union would
+    // let one backend's key witness a mandate declaring the other —
+    // and delivery routing later reads that same declared field, so
+    // an unbound `interface` would be attacker-chosen routing input.
+    // Interfaces without an entry keep the flat-list behavior.
+    let accepted_interface_keys: &[String] = state
+        .config
+        .interface_keys_by_component
+        .get(&mandate.interface)
+        .map(|keys| keys.as_slice())
+        .unwrap_or(state.config.interface_keys.as_slice());
+    match (accepted_interface_keys, mandate.signatures.get(1)) {
         // No interface key configured, so a countersignature cannot be
         // checked — and an unverifiable designation is exactly the
         // forgery this check exists to catch. Refuse. Accepting here
@@ -3103,6 +3117,51 @@ mod tests {
 
         let (status, _) = harness.post("/v1/mandates", body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// The per-interface binding: when the mandate's declared
+    /// `interface` has an AUTHORITY_INTERFACE_KEYS_BY_COMPONENT entry,
+    /// ONLY that entry's keys may witness it — a countersignature by
+    /// the other backend's key (still on the flat union) is refused.
+    /// Without the binding, `interface` is attacker-chosen routing
+    /// input: any listed key would register a mandate naming any
+    /// interface, and delivery would route the verdict off that
+    /// unvalidated field.
+    #[tokio::test]
+    async fn a_scoped_interface_only_accepts_its_own_keys() {
+        const OTHER_INTERFACE_SEED: [u8; 32] = [29u8; 32];
+        let other_key = crate::testing::key_reference(OTHER_INTERFACE_SEED);
+
+        let mut state = AppState::for_tests(Store::in_memory().unwrap());
+        // The flat union lists both backends' keys (the pre-binding
+        // deployment shape)...
+        state.config.interface_keys.push(other_key.clone());
+        // ...but the test interface is scoped to its own key.
+        state.config.interface_keys_by_component.insert(
+            "onym:component:test-interface".to_string(),
+            vec![crate::testing::interface_key_reference()],
+        );
+        let harness = Harness { state: Arc::new(state) };
+        let manifest_hash = util::sha256_hex(&harness.state.config.manifest_raw);
+
+        // Countersigned by the OTHER backend's key: refused, even
+        // though that key is on the flat union.
+        let forged = signed(
+            mandate_json(ACCUSED_SEED, json!(["csam"]), &manifest_hash),
+            "signatures",
+            &[ACCUSED_SEED, OTHER_INTERFACE_SEED],
+        );
+        let (status, response) = harness.post("/v1/mandates", forged).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{response}");
+
+        // Countersigned by the scoped interface's own key: registers.
+        let genuine = signed(
+            mandate_json(ACCUSED_SEED, json!(["csam"]), &manifest_hash),
+            "signatures",
+            &[ACCUSED_SEED, INTERFACE_SEED],
+        );
+        let (status, response) = harness.post("/v1/mandates", genuine).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
     }
 
     /// The reason `interface_keys` is a list.

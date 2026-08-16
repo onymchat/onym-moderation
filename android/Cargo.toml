@@ -16,7 +16,8 @@ hex = "0.4"
 # rustls-tls keeps us off OpenSSL — the runtime image is debian:bookworm-slim
 # without libssl, exactly as onym-relayer does it.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-# ES256 JWTs for the DeviceCheck API, signed with the vendor's .p8 key.
+# RS256 service-account JWTs for the Play Integrity API's OAuth
+# exchange (google_auth.rs).
 jsonwebtoken = "9"
 # Ed25519 for user mandate/session signatures and the interface
 # countersignature.

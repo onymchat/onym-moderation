@@ -32,7 +32,38 @@ pub struct AppState {
     pub config: Config,
     pub engine: Engine,
     pub countersigning: crate::countersigning::CountersigningKeys,
+    /// Fixed-window counter for the unauthenticated challenge
+    /// endpoint: (window start, issues so far). See `challenge` for
+    /// why the endpoint needs its own throttle at all.
+    pub challenge_window: std::sync::Mutex<(OffsetDateTime, u32)>,
 }
+
+impl AppState {
+    pub fn new(
+        config: Config,
+        engine: Engine,
+        countersigning: crate::countersigning::CountersigningKeys,
+    ) -> Self {
+        Self {
+            config,
+            engine,
+            countersigning,
+            challenge_window: std::sync::Mutex::new((OffsetDateTime::UNIX_EPOCH, 0)),
+        }
+    }
+}
+
+/// Issues per fixed one-minute window before `/v1/challenge` answers
+/// 429. Generous against real clients (one challenge per session; the
+/// app's scheduler coalesces), tight against a loop hammering an
+/// unauthenticated endpoint.
+const MAX_CHALLENGES_PER_MINUTE: u32 = 600;
+
+/// Unexpired, unconsumed challenges the store will hold before
+/// issuance pauses. Bounds the table at cap × row size regardless of
+/// request rate; legitimate load never approaches it (challenges live
+/// `MODERATION_CHALLENGE_TTL_SECS` and are single-use).
+const MAX_OUTSTANDING_CHALLENGES: i64 = 10_000;
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -85,6 +116,13 @@ struct IssuedChallenge {
 /// Unauthenticated by design — a challenge authorizes nothing by
 /// itself; it only lets the later signed request prove freshness and
 /// give Play's `requestHash` something server-chosen to bind.
+///
+/// Unauthenticated also means abusable: without a bound, a loop grows
+/// the challenges table at request-rate × TTL. Two caps close that —
+/// a fixed-window issue rate (429, which the app treats as a
+/// retryable backoff and the authority's delivery classifier already
+/// files under retry), and a ceiling on outstanding rows so the table
+/// stays bounded even if the window constant is ever raised.
 async fn challenge(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ChallengeRequest>,
@@ -95,6 +133,7 @@ async fn challenge(
             request.purpose
         )));
     }
+    claim_challenge_issue_slot(&state, OffsetDateTime::now_utc())?;
     let mut raw = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut raw);
     let challenge = util::base64_encode(&raw);
@@ -490,6 +529,34 @@ fn decode_challenge(raw: &str) -> Result<Vec<u8>, Error> {
     util::base64_decode(raw).ok_or_else(|| Error::BadRequest("challenge is not base64".into()))
 }
 
+/// One issue slot from the fixed window, plus the outstanding-rows
+/// ceiling. Split from the handler so the arithmetic is testable with
+/// an injected `now`.
+fn claim_challenge_issue_slot(state: &AppState, now: OffsetDateTime) -> Result<(), Error> {
+    {
+        let mut window = state.challenge_window.lock().unwrap();
+        if now - window.0 >= time::Duration::minutes(1) {
+            *window = (now, 0);
+        }
+        if window.1 >= MAX_CHALLENGES_PER_MINUTE {
+            return Err(Error::RateLimited(
+                "challenge issuance is throttled; retry shortly".into(),
+            ));
+        }
+        window.1 += 1;
+    }
+    let outstanding = state
+        .engine
+        .store
+        .outstanding_challenges(&util::format_timestamp(now))?;
+    if outstanding >= MAX_OUTSTANDING_CHALLENGES {
+        return Err(Error::RateLimited(
+            "too many unconsumed challenges outstanding; retry shortly".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Consume the presented challenge. Refusal is retryable from the
 /// client's side — it fetches a fresh challenge and re-signs — so this
 /// is a 400, not a gate result.
@@ -619,15 +686,15 @@ mod tests {
             config.interface_signing_seed,
             config.interface_key_epochs.clone(),
         );
-        Arc::new(AppState {
+        Arc::new(AppState::new(
             config,
-            engine: crate::enforcement::Engine {
+            crate::enforcement::Engine {
                 store: crate::store::Store::in_memory().unwrap(),
                 play: None,
                 propagation_grace_secs: 60,
             },
             countersigning,
-        })
+        ))
     }
 
     /// Ask the handler to countersign a mandate naming `authority`,
@@ -805,6 +872,41 @@ mod tests {
         request.challenge = issued.challenge; // signed over `other`
         let result = enroll(State(Arc::clone(&state)), Json(request)).await;
         assert!(matches!(&result, Err(Error::SignatureInvalid(_))), "{result:?}");
+    }
+
+    /// The fixed window: the cap-plus-first refusal answers 429, and a
+    /// fresh window opens slots again.
+    #[test]
+    fn challenge_issuance_is_throttled_per_window() {
+        let state = state_with(&[]);
+        let start = util::parse_timestamp("2026-08-08T12:00:00Z").unwrap();
+        for _ in 0..MAX_CHALLENGES_PER_MINUTE {
+            claim_challenge_issue_slot(&state, start).unwrap();
+        }
+        let refused = claim_challenge_issue_slot(&state, start);
+        assert!(matches!(refused, Err(Error::RateLimited(_))), "{refused:?}");
+
+        let next_window = start + time::Duration::seconds(61);
+        assert!(claim_challenge_issue_slot(&state, next_window).is_ok());
+    }
+
+    /// The table ceiling: outstanding unconsumed rows pause issuance
+    /// regardless of the window, so an attacker cannot grow the store
+    /// past cap × row size.
+    #[test]
+    fn challenge_issuance_pauses_at_the_outstanding_ceiling() {
+        let state = state_with(&[]);
+        let now = "2026-08-08T12:00:00Z";
+        for i in 0..MAX_OUTSTANDING_CHALLENGES {
+            state
+                .engine
+                .store
+                .issue_challenge(&format!("challenge-{i}"), "gate", now, "2026-08-08T12:10:00Z")
+                .unwrap();
+        }
+        let refused =
+            claim_challenge_issue_slot(&state, util::parse_timestamp(now).unwrap());
+        assert!(matches!(refused, Err(Error::RateLimited(_))), "{refused:?}");
     }
 
     #[test]

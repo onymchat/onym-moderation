@@ -7,9 +7,10 @@ Android sibling of [`apple/`](../apple/README.md).
 
 Spec: `onym-system/moderation/Moderation-Device-Recall.md` (the profile)
 over `Moderation.md` (the abstract contract). The two backends agree by
-bytes, not by shared libraries: `canonical.rs`, `countersigning.rs`,
-`verdict.rs`, and `util.rs` are verbatim copies whose tests are the
-agreement pins.
+bytes, not by shared libraries: `countersigning.rs`, `verdict.rs`, and
+`util.rs` are verbatim copies whose tests are the agreement pins;
+`canonical.rs` is the same minus `grant_signing_bytes` (recovery is
+deferred here — see below).
 
 ## The boundary
 
@@ -128,6 +129,9 @@ back until this lands — re-adding it must also reintroduce `apple/`'s
 named volume `moderation-data` — back it up: the recall values alone
 are uninterpretable without the verdict store). Default host:
 `moderation-android.onym.app`. The authority routes verdicts for
-mandates naming `onym:component:onym-android` here (see
-`authority/` interface routing), and adds this service's countersigning
-key (from `/health`) to its `AUTHORITY_INTERFACE_KEY` list.
+mandates naming `onym:component:onym-android` here
+(`AUTHORITY_INTERFACE_ROUTES`), and scopes this service's
+countersigning key (from `/health`) to that componentId via
+`AUTHORITY_INTERFACE_KEYS_BY_COMPONENT` — the flat
+`AUTHORITY_INTERFACE_KEY` union must not be shared across backends, or
+one backend's key could witness mandates naming the other.

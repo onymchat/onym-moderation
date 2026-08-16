@@ -97,7 +97,11 @@ impl Engine {
                             && r.write_dates.yyyymm_third.is_none()
                     })
                 {
-                    tracing::debug!(monitor = "recall_empty_result", "recall object present and empty");
+                    // info!, not debug!: this is the §8-gap-6
+                    // monitoring signal the profile mandates, and the
+                    // deployment pins RUST_LOG=info — at debug it
+                    // would never fire in production.
+                    tracing::info!(monitor = "recall_empty_result", "recall object present and empty");
                 }
                 Ok(Some(bits))
             }

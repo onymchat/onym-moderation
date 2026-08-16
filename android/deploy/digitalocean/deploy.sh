@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# deploy.sh — Deploy the Apple DeviceCheck enforcement backend to
+# deploy.sh — Deploy the Play Integrity device-recall enforcement backend to
 # DigitalOcean.
 #
 # Stack: Caddy (auto-HTTPS) + the moderation service. Idempotent:
@@ -45,7 +45,7 @@ for c in doctl ssh rsync curl dig; do
 done
 [ -f "$SSH_KEY_PATH" ] || { err "SSH key not found at $SSH_KEY_PATH"; exit 1; }
 
-# The service runs without DeviceCheck credentials, but then it can
+# The service runs without Play Integrity credentials, but then it can
 # never clear anyone — every gate check answers `checkRequired`. That
 # is a safe failure, not a useful deployment, so say so loudly.
 if [ ! -f "$SECRET_KEY" ]; then

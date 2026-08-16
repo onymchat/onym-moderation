@@ -115,11 +115,11 @@ async fn main() {
 
     let bind_addr = config.bind_addr.clone();
     let propagation_grace_secs = config.propagation_grace_secs;
-    let state = Arc::new(AppState {
+    let state = Arc::new(AppState::new(
         config,
-        engine: Engine { store, play, propagation_grace_secs },
+        Engine { store, play, propagation_grace_secs },
         countersigning,
-    });
+    ));
 
     let app = api::router(state).layer(tower_http::limit::RequestBodyLimitLayer::new(256 * 1024));
 

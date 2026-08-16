@@ -90,6 +90,7 @@ impl AppState {
             interface_base_url: None,
             interface_token: None,
             interface_routes: Default::default(),
+            interface_keys_by_component: Default::default(),
             // Tests exercise the fail-closed path deliberately, so the
             // default fixture is a *configured* deployment; the
             // unconfigured one gets its own test.

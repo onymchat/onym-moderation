@@ -73,11 +73,28 @@ impl Config {
 
         // The key may arrive as a path (compose secret/volume) or
         // inline (env var), because deployment shapes differ.
+        //
+        // A path that does not exist is NOT fatal: docker-compose
+        // always sets MODERATION_PLAY_SA_KEY_PATH, so treating the
+        // missing secret as a boot error would turn "deploy without
+        // the key, run degraded, every gate answers checkRequired" —
+        // the behavior the README and deploy script promise — into a
+        // restart crash-loop. A file that exists but will not read or
+        // parse still fails loudly below: that is a real
+        // misconfiguration, not an intentionally keyless deployment.
         let play_sa_raw = match env::var("MODERATION_PLAY_SA_KEY_PATH") {
-            Ok(path) => Some(
+            Ok(path) if std::path::Path::new(&path).exists() => Some(
                 std::fs::read(&path)
                     .map_err(|e| format!("MODERATION_PLAY_SA_KEY_PATH {path}: {e}"))?,
             ),
+            Ok(path) => {
+                tracing::warn!(
+                    %path,
+                    "MODERATION_PLAY_SA_KEY_PATH does not exist — running without Play \
+                     credentials; every gate check will answer checkRequired"
+                );
+                env::var("MODERATION_PLAY_SA_KEY_JSON").ok().map(String::into_bytes)
+            }
             Err(_) => env::var("MODERATION_PLAY_SA_KEY_JSON").ok().map(String::into_bytes),
         };
         let play_sa_key = play_sa_raw

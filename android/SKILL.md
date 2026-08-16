@@ -28,10 +28,12 @@ Check each. Do not improvise around a missing one.
    service has ever run, reuse the existing seed: rotating it
    invalidates every countersignature already issued, so every existing
    mandate stops verifying.
-6. **`secrets/play-sa.json`** — the service-account JSON key from the
-   Apple developer portal, plus its key id and team id in `.env`.
-   Without it the service still starts, but every gate check answers
-   `checkRequired` and no user can use the app.
+6. **`secrets/play-sa.json`** — the service-account JSON key of the
+   Google Cloud project linked in the Play Console, plus
+   `MODERATION_PLAY_PACKAGE_NAME` and
+   `MODERATION_PLAY_CERT_SHA256_DIGESTS` in `.env`. Without it the
+   service still starts, but every gate check answers `checkRequired`
+   and no user can use the app.
 
 ## Deploy
 
@@ -63,8 +65,8 @@ curl -s https://$MODERATION_HOST/health
 
 `/health` reports whether Play Integrity is configured, whether signature
 enforcement is on, and the interface's public countersigning key.
-Confirm all three are what you expect — `deviceCheck: false` means the
-deployment is inert.
+Confirm all three are what you expect — `playIntegrity: false` means
+the deployment is inert.
 
 Then check the write log's hash chain is intact:
 

@@ -2,7 +2,7 @@
 //!
 //! The interface "validates verdict shape … never the verdict's
 //! wisdom" (§5.7). This is the same rule set the iOS client applies to
-//! verdicts it displays, applied here before anything reaches Apple —
+//! verdicts it displays, applied here before anything reaches Google —
 //! because here it is load-bearing: a verdict that passes gets written
 //! to a device.
 

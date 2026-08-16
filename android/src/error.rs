@@ -37,11 +37,19 @@ pub enum Error {
     #[error("class_outside_mandate: {0}")]
     ClassOutsideMandate(String),
 
-    /// Contract error `mark_write_failed` — Apple refused the write.
-    /// The verdict remains valid and the write is retried on the next
-    /// token presentation.
+    /// Contract error `mark_write_failed` — Google refused the write
+    /// (or the Play Integrity API was unreachable). The verdict
+    /// remains valid and the write is retried on the next token
+    /// presentation.
     #[error("mark_write_failed: {0}")]
     MarkWriteFailed(String),
+
+    /// The caller is issuing requests faster than this deployment
+    /// serves them (the challenge endpoint's throttle). Retryable
+    /// after backing off; the authority's delivery classifier already
+    /// treats `rate_limited` as a retry, never a refusal.
+    #[error("rate limited: {0}")]
+    RateLimited(String),
 
     #[error("internal error: {0}")]
     Internal(String),
@@ -59,6 +67,7 @@ impl Error {
             Error::NoMandate => "no_mandate",
             Error::ClassOutsideMandate(_) => "class_outside_mandate",
             Error::MarkWriteFailed(_) => "mark_write_failed",
+            Error::RateLimited(_) => "rate_limited",
             Error::Internal(_) => "internal_error",
         }
     }
@@ -71,8 +80,9 @@ impl Error {
             | Error::ClassOutsideMandate(_) => StatusCode::BAD_REQUEST,
             Error::VerdictNotYetValid(_) => StatusCode::TOO_EARLY,
             Error::SignatureInvalid(_) => StatusCode::UNAUTHORIZED,
-            // The verdict is valid; Apple is unavailable. Retryable.
+            // The verdict is valid; Google is unavailable. Retryable.
             Error::MarkWriteFailed(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Error::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
