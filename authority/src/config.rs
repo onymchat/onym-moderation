@@ -54,8 +54,17 @@ pub struct Config {
     pub signing_seed: [u8; 32],
 
     /// Where to deliver verdicts, and the token that endpoint expects.
+    /// The default route, used when a mandate's interface component has
+    /// no entry in `interface_routes`.
     pub interface_base_url: Option<String>,
     pub interface_token: Option<String>,
+    /// Per-interface delivery routes, keyed by the componentId a
+    /// mandate names in its `interface` field. One authority can serve
+    /// several interface backends (the iOS DeviceCheck service and the
+    /// Android device-recall service are separate deployments), and a
+    /// verdict must reach the backend that countersigned its mandate —
+    /// delivered elsewhere it fails `no_mandate` forever.
+    pub interface_routes: std::collections::BTreeMap<String, InterfaceRoute>,
     /// The interface's countersigning key(s), used to check that a
     /// registered mandate really was countersigned by the interface
     /// that claims to have witnessed it.
@@ -290,6 +299,9 @@ impl Config {
             signing_seed,
             interface_base_url: env::var("AUTHORITY_INTERFACE_URL").ok().filter(|v| !v.is_empty()),
             interface_token: env::var("AUTHORITY_INTERFACE_TOKEN").ok().filter(|v| !v.is_empty()),
+            interface_routes: parse_interface_routes(
+                &env::var("AUTHORITY_INTERFACE_ROUTES").unwrap_or_default(),
+            )?,
             // Comma-separated so a rotation can list both keys at
             // once. Order is irrelevant; each is tried.
             interface_keys: env::var("AUTHORITY_INTERFACE_KEY")
@@ -464,8 +476,14 @@ impl Config {
 
 Delivering verdicts to the interface:
   AUTHORITY_INTERFACE_URL      Base URL of the enforcement backend (e.g.
-                               https://moderation.onym.app)
+                               https://moderation.onym.app). The default route when a
+                               mandate's interface has no AUTHORITY_INTERFACE_ROUTES entry
   AUTHORITY_INTERFACE_TOKEN    Its MODERATION_AUTHORITY_TOKEN
+  AUTHORITY_INTERFACE_ROUTES   Per-interface routes, comma separated:
+                                 <componentId>=<url>|<token>,...
+                               e.g. onym:component:onym-android=https://moderation-android.onym.app|<token>
+                               The |<token> part is optional. Verdicts for a mandate naming
+                               that interface are delivered there instead of the default
   AUTHORITY_INTERFACE_KEY      onym:key:<hex> of the interface's countersigning key for
                                this authority, used to check registered mandates were
                                really countersigned. From the interface's /health:
@@ -726,5 +744,76 @@ mod tests {
         let remote = triage("https://api.example.com/v1/chat/completions");
         assert!(Config::triage_leaves_this_host(&remote));
         assert!(!Config::triage_host_resolves_local(&remote));
+    }
+}
+
+/// One per-interface delivery target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceRoute {
+    pub base_url: String,
+    pub token: Option<String>,
+}
+
+/// Parse `AUTHORITY_INTERFACE_ROUTES`: comma-separated
+/// `<componentId>=<url>|<token>` entries, the token optional. Component
+/// ids contain colons, so the first `=` splits id from target and the
+/// first `|` splits url from token.
+pub fn parse_interface_routes(
+    raw: &str,
+) -> Result<std::collections::BTreeMap<String, InterfaceRoute>, String> {
+    let mut routes = std::collections::BTreeMap::new();
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let Some((component, target)) = entry.split_once('=') else {
+            return Err(format!(
+                "AUTHORITY_INTERFACE_ROUTES entry {entry:?} is not <componentId>=<url>[|<token>]"
+            ));
+        };
+        let (url, token) = match target.split_once('|') {
+            Some((url, token)) => (url, Some(token.to_string()).filter(|t| !t.is_empty())),
+            None => (target, None),
+        };
+        if component.trim().is_empty() || url.trim().is_empty() {
+            return Err(format!("AUTHORITY_INTERFACE_ROUTES entry {entry:?} has an empty part"));
+        }
+        routes.insert(
+            component.trim().to_string(),
+            InterfaceRoute { base_url: url.trim().to_string(), token },
+        );
+    }
+    Ok(routes)
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn routes_parse_component_ids_with_colons_and_optional_tokens() {
+        let routes = parse_interface_routes(
+            "onym:component:onym-android=https://moderation-android.onym.app|secret, \
+             onym:component:onym-ios=https://moderation.onym.app",
+        )
+        .unwrap();
+        assert_eq!(
+            routes.get("onym:component:onym-android"),
+            Some(&InterfaceRoute {
+                base_url: "https://moderation-android.onym.app".into(),
+                token: Some("secret".into()),
+            })
+        );
+        assert_eq!(
+            routes.get("onym:component:onym-ios"),
+            Some(&InterfaceRoute {
+                base_url: "https://moderation.onym.app".into(),
+                token: None,
+            })
+        );
+    }
+
+    #[test]
+    fn an_entry_without_a_url_is_refused() {
+        assert!(parse_interface_routes("just-a-name").is_err());
+        assert!(parse_interface_routes("id=").is_err());
+        assert!(parse_interface_routes("").unwrap().is_empty());
     }
 }

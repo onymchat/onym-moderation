@@ -125,6 +125,11 @@ pub struct UndeliveredVerdict {
     pub raw: Vec<u8>,
     pub consented_manifest: Option<Vec<u8>>,
     pub manifest_hash: Option<String>,
+    /// The componentId the case's mandate names as its interface, so
+    /// delivery can route the verdict to the backend that countersigned
+    /// that mandate. `None` when the mandate is gone or unreadable —
+    /// such a verdict rides the default route.
+    pub interface: Option<String>,
 }
 
 pub struct MandateRecord {
@@ -3318,7 +3323,7 @@ impl Store {
         // user's mandate pinned, which is not necessarily what this
         // authority publishes today.
         let mut statement = conn.prepare(
-            "SELECT v.verdict_ref, v.raw, mf.raw, m.manifest_hash
+            "SELECT v.verdict_ref, v.raw, mf.raw, m.manifest_hash, m.raw
                FROM verdicts v
                LEFT JOIN cases c    ON c.case_id = v.case_id
                LEFT JOIN mandates m ON m.mandate_ref = c.mandate_ref
@@ -3327,11 +3332,22 @@ impl Store {
               ORDER BY v.issued_at",
         )?;
         let rows = statement.query_map([], |row| {
+            // The interface componentId lives inside the mandate's own
+            // signed bytes, which is exactly where routing should read
+            // it from: the countersigning interface named itself there.
+            let mandate_raw: Option<Vec<u8>> = row.get(4)?;
+            let interface = mandate_raw
+                .as_deref()
+                .and_then(|raw| serde_json::from_slice::<serde_json::Value>(raw).ok())
+                .and_then(|mandate| {
+                    mandate.get("interface").and_then(|v| v.as_str()).map(str::to_string)
+                });
             Ok(UndeliveredVerdict {
                 verdict_ref: row.get(0)?,
                 raw: row.get(1)?,
                 consented_manifest: row.get(2)?,
                 manifest_hash: row.get(3)?,
+                interface,
             })
         })?;
         let mut out = Vec::new();

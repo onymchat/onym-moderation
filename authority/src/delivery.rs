@@ -129,8 +129,14 @@ fn truncate(value: &str) -> String {
 
 pub struct Delivery {
     client: reqwest::Client,
+    /// The default route, for mandates whose interface has no entry in
+    /// `routes`.
     base_url: Option<String>,
     token: Option<String>,
+    /// Per-interface routes, keyed by the componentId the mandate
+    /// names. A verdict must reach the backend that countersigned its
+    /// mandate; anywhere else it fails `no_mandate` forever.
+    routes: std::collections::BTreeMap<String, crate::config::InterfaceRoute>,
     /// Base64 of the currently published manifest. A fallback only
     /// when those exact bytes still hash to the mandate's reference.
     published_manifest: String,
@@ -147,7 +153,12 @@ pub struct Delivery {
 }
 
 impl Delivery {
-    pub fn new(base_url: Option<String>, token: Option<String>, manifest_raw: &[u8]) -> Self {
+    pub fn new(
+        base_url: Option<String>,
+        token: Option<String>,
+        routes: std::collections::BTreeMap<String, crate::config::InterfaceRoute>,
+        manifest_raw: &[u8],
+    ) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
@@ -155,6 +166,7 @@ impl Delivery {
                 .unwrap_or_default(),
             base_url,
             token,
+            routes,
             published_manifest: util::base64_encode(manifest_raw),
             published_manifest_hash: util::sha256_hex(manifest_raw),
             flush_in_flight: std::sync::atomic::AtomicBool::new(false),
@@ -163,7 +175,20 @@ impl Delivery {
     }
 
     pub fn configured(&self) -> bool {
-        self.base_url.is_some()
+        self.base_url.is_some() || !self.routes.is_empty()
+    }
+
+    /// The (url, token) a verdict for `interface` goes to: its route,
+    /// else the default. `None` when neither exists — the verdict then
+    /// stays queued rather than being delivered to a backend that
+    /// never countersigned its mandate.
+    fn route_for(&self, interface: Option<&str>) -> Option<(&str, Option<&str>)> {
+        if let Some(route) = interface.and_then(|id| self.routes.get(id)) {
+            return Some((route.base_url.as_str(), route.token.as_deref()));
+        }
+        self.base_url
+            .as_deref()
+            .map(|url| (url, self.token.as_deref()))
     }
 
     /// Deliver one verdict. `Ok(Retry)` means "not delivered, try
@@ -175,9 +200,13 @@ impl Delivery {
         raw_verdict: &[u8],
         consented_manifest: Option<&[u8]>,
         mandate_manifest_hash: Option<&str>,
+        interface: Option<&str>,
     ) -> Result<Attempt, Error> {
-        let Some(base_url) = self.base_url.as_deref() else {
-            return Ok(Attempt::Retry("no interface URL configured".into()));
+        let Some((base_url, token)) = self.route_for(interface) else {
+            return Ok(Attempt::Retry(format!(
+                "no interface URL configured for {}",
+                interface.unwrap_or("the default route")
+            )));
         };
         let verdict: serde_json::Value = serde_json::from_slice(raw_verdict)
             .map_err(|e| Error::Internal(format!("stored verdict unparseable: {e}")))?;
@@ -208,7 +237,7 @@ impl Delivery {
             .client
             .post(format!("{}/v1/verdicts", base_url.trim_end_matches('/')))
             .json(&submission);
-        if let Some(token) = self.token.as_deref() {
+        if let Some(token) = token {
             request = request.bearer_auth(token);
         }
 
@@ -248,6 +277,7 @@ impl Delivery {
                     &queued.raw,
                     queued.consented_manifest.as_deref(),
                     queued.manifest_hash.as_deref(),
+                    queued.interface.as_deref(),
                 )
                 .await?
             {

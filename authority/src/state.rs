@@ -64,6 +64,7 @@ impl AppState {
         let delivery = Delivery::new(
             config.interface_base_url.clone(),
             config.interface_token.clone(),
+            config.interface_routes.clone(),
             &config.manifest_raw,
         );
         let signing_key = SigningKey::from_bytes(&config.signing_seed);
@@ -88,6 +89,7 @@ impl AppState {
             signing_seed: [7u8; 32],
             interface_base_url: None,
             interface_token: None,
+            interface_routes: Default::default(),
             // Tests exercise the fail-closed path deliberately, so the
             // default fixture is a *configured* deployment; the
             // unconfigured one gets its own test.
