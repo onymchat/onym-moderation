@@ -174,9 +174,14 @@ async fn enroll(
             ));
         };
         let request_hash = payload::request_hash(&signed);
-        let Some(bits) = state
+        // The ENROLLMENT classifier: prerequisites 1–4, recall marks
+        // read only when the object exists — a pre-recall-grant token
+        // (no deviceRecall anywhere yet) still enrolls, and the gate
+        // answers checkRequired until the grant lands. See
+        // classifier::classify_enrollment for the full rationale.
+        let Some(marks) = state
             .engine
-            .verified_bits(play, token, &request_hash, OffsetDateTime::now_utc())
+            .enrollment_attestation(play, token, &request_hash, OffsetDateTime::now_utc())
             .await?
         else {
             return Err(Error::SignatureInvalid(
@@ -186,8 +191,9 @@ async fn enroll(
         // A device already carrying the banned mark does not get a
         // fresh enrollment; the gate would refuse it anyway, and the
         // route out is the authority's re-identification/new-holder
-        // procedure, not a new binding.
-        if bits.banned {
+        // procedure, not a new binding. Readable only when the recall
+        // object exists — absent recall cannot prove a ban.
+        if marks.is_some_and(|bits| bits.banned) {
             return Err(Error::BadRequest(
                 "this device carries a banned mark; enrollment cannot proceed — contact \
                  the authority named in the verification screen"

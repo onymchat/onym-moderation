@@ -73,6 +73,53 @@ pub struct Expected<'a> {
 /// recall values into the profile's mark pair. `bit_third` is read but
 /// deliberately ignored — it is reserved and outside `markBindings`.
 pub fn classify(decoded: &DecodedVerdict, expected: &Expected) -> Result<Bits, ClassifierFailure> {
+    prerequisites(decoded, expected)?;
+
+    // 5. The deviceRecall object itself.
+    let Some(recall) = decoded.device_integrity.device_recall.as_ref() else {
+        return Err(ClassifierFailure::DeviceRecallMissing);
+    };
+
+    // All five hold: absent bit fields are false, and empty maps are
+    // the clean never-written state (subject to the disclosed §8
+    // ambiguity — the caller's monitoring event, not a refusal).
+    Ok(Bits {
+        case_open: recall.values.bit_first,
+        banned: recall.values.bit_second,
+    })
+}
+
+/// The ENROLLMENT profile of the same check: prerequisites 1–4 must
+/// hold — the token must be real, fresh, minted for exactly this
+/// request, by the Play-recognized, licensed app on an
+/// integrity-passing device — but an ABSENT `deviceRecall` object is
+/// tolerated, answering `Ok(None)`.
+///
+/// Deliberately weaker than [classify], and only here: until Google
+/// grants device-recall access, no token carries the object, and the
+/// strict rule made enrollment impossible for every device — consent
+/// could never complete, stranding every new user at onboarding.
+/// Enrollment's job is binding a real device to a real request, not
+/// evaluating marks; the GATE keeps the strict five, so a pre-recall
+/// device enrolls, consents, and then answers `checkRequired` — never
+/// unmoderated, and never `clear` without a readable recall object.
+/// When the object IS present its marks are returned so a banned
+/// device is still refused a fresh binding.
+pub fn classify_enrollment(
+    decoded: &DecodedVerdict,
+    expected: &Expected,
+) -> Result<Option<Bits>, ClassifierFailure> {
+    prerequisites(decoded, expected)?;
+    Ok(decoded.device_integrity.device_recall.as_ref().map(|recall| Bits {
+        case_open: recall.values.bit_first,
+        banned: recall.values.bit_second,
+    }))
+}
+
+/// Prerequisites 1–4, shared by [classify] (which adds the recall
+/// object as its fifth) and [classify_enrollment] (which reads it
+/// only when present).
+fn prerequisites(decoded: &DecodedVerdict, expected: &Expected) -> Result<(), ClassifierFailure> {
     // 1. Fresh, matching requestDetails — package, hash, timestamp.
     let details = &decoded.request_details;
     match details.timestamp_millis {
@@ -118,18 +165,7 @@ pub fn classify(decoded: &DecodedVerdict, expected: &Expected) -> Result<Bits, C
         return Err(ClassifierFailure::DeviceIntegrityMissing);
     }
 
-    // 5. The deviceRecall object itself.
-    let Some(recall) = decoded.device_integrity.device_recall.as_ref() else {
-        return Err(ClassifierFailure::DeviceRecallMissing);
-    };
-
-    // All five hold: absent bit fields are false, and empty maps are
-    // the clean never-written state (subject to the disclosed §8
-    // ambiguity — the caller's monitoring event, not a refusal).
-    Ok(Bits {
-        case_open: recall.values.bit_first,
-        banned: recall.values.bit_second,
-    })
+    Ok(())
 }
 
 #[cfg(test)]
@@ -284,6 +320,80 @@ mod tests {
         let mut token = conforming_token();
         token["deviceIntegrity"].as_object_mut().unwrap().remove("deviceRecall");
         assert_eq!(classify_value(token), Err(ClassifierFailure::DeviceRecallMissing));
+    }
+
+    // ─── The enrollment profile ──────────────────────────────────────
+
+    fn classify_enrollment_value(
+        value: serde_json::Value,
+    ) -> Result<Option<Bits>, ClassifierFailure> {
+        let decoded: DecodedVerdict = serde_json::from_value(value).unwrap();
+        let digests = digests();
+        classify_enrollment(
+            &decoded,
+            &Expected {
+                package_name: "app.onym.android",
+                cert_sha256_digests: &digests,
+                request_hash: "expected-hash",
+                now_millis: NOW,
+                max_age_millis: MAX_AGE,
+            },
+        )
+    }
+
+    /// The pre-recall-grant reality: prerequisites 1–4 hold, no
+    /// deviceRecall object anywhere — enrollable, no marks to read.
+    #[test]
+    fn enrollment_tolerates_an_absent_device_recall_object() {
+        let mut token = conforming_token();
+        token["deviceIntegrity"].as_object_mut().unwrap().remove("deviceRecall");
+        assert_eq!(classify_enrollment_value(token), Ok(None));
+    }
+
+    /// When the object IS present its marks are read, so a banned
+    /// device is still refused a fresh binding by the caller.
+    #[test]
+    fn enrollment_reads_marks_when_recall_is_present() {
+        let mut token = conforming_token();
+        token["deviceIntegrity"]["deviceRecall"]["values"] =
+            serde_json::json!({"bitSecond": true});
+        assert_eq!(
+            classify_enrollment_value(token),
+            Ok(Some(Bits { case_open: false, banned: true }))
+        );
+    }
+
+    /// Tolerance stops at the recall object: every OTHER prerequisite
+    /// refuses enrollment exactly as it refuses the gate — the
+    /// weakening is "marks may be unavailable", never "the token may
+    /// be someone else's".
+    #[test]
+    fn enrollment_still_requires_prerequisites_one_through_four() {
+        let failures: [(&str, Box<dyn Fn(&mut serde_json::Value)>, ClassifierFailure); 5] = [
+            ("stale", Box::new(|t| {
+                t["requestDetails"]["timestampMillis"] =
+                    (NOW - MAX_AGE - 1).to_string().into();
+            }), ClassifierFailure::RequestStale),
+            ("hash", Box::new(|t| {
+                t["requestDetails"]["requestHash"] = "someone-elses-hash".into();
+            }), ClassifierFailure::RequestHashMismatch),
+            ("unrecognized", Box::new(|t| {
+                t["appIntegrity"]["appRecognitionVerdict"] = "UNRECOGNIZED_VERSION".into();
+            }), ClassifierFailure::AppNotPlayRecognized),
+            ("unlicensed", Box::new(|t| {
+                t["accountDetails"]["appLicensingVerdict"] = "UNLICENSED".into();
+            }), ClassifierFailure::NotLicensed),
+            ("integrity", Box::new(|t| {
+                t["deviceIntegrity"]["deviceRecognitionVerdict"] =
+                    serde_json::json!(["MEETS_BASIC_INTEGRITY"]);
+            }), ClassifierFailure::DeviceIntegrityMissing),
+        ];
+        for (label, mutate, expected) in failures {
+            let mut token = conforming_token();
+            token["deviceIntegrity"].as_object_mut().unwrap().remove("deviceRecall");
+            mutate(&mut token);
+            assert_eq!(classify_enrollment_value(token), Err(expected), "{label}");
+        }
     }
 
     /// Marked values behind a failed prerequisite are never read: the

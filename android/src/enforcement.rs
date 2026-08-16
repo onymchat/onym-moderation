@@ -112,6 +112,54 @@ impl Engine {
         }
     }
 
+    /// Enrollment-time token verification: decode, then the
+    /// enrollment classifier — prerequisites 1–4 with the recall
+    /// marks read only when the object exists (see
+    /// [classifier::classify_enrollment] for why enrollment tolerates
+    /// its absence and the gate does not). `Ok(None)` means "no
+    /// trustworthy answer" and the caller must refuse the enrollment;
+    /// `Ok(Some(None))` is a trusted token with no recall object
+    /// (pre-approval, or recall unavailable) — enrollable, with the
+    /// gate left to answer `checkRequired`.
+    pub async fn enrollment_attestation(
+        &self,
+        play: &PlayEnforcement,
+        integrity_token: &str,
+        request_hash: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<Option<Bits>>, Error> {
+        let Some(decoded) = play.client.decode(integrity_token).await? else {
+            return Ok(None);
+        };
+        let expected = Expected {
+            package_name: &play.package_name,
+            cert_sha256_digests: &play.cert_sha256_digests,
+            request_hash,
+            now_millis: (now.unix_timestamp_nanos() / 1_000_000) as i64,
+            max_age_millis: play.token_max_age_secs * 1000,
+        };
+        match classifier::classify_enrollment(&decoded, &expected) {
+            Ok(marks) => {
+                if marks.is_none() {
+                    // Expected until the device-recall grant lands;
+                    // once it has, this firing means recall regressed.
+                    tracing::info!(
+                        monitor = "enroll_without_recall",
+                        "enrollment token carries no deviceRecall object"
+                    );
+                }
+                Ok(Some(marks))
+            }
+            Err(failure) => {
+                tracing::warn!(
+                    reason = failure.describe(),
+                    "enrollment token failed the classifier"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     /// Answer a gate check for a device. The caller has already
     /// verified the identity signature, claimed the session and
     /// challenge, and recomputed `request_hash` from the signed
@@ -1531,6 +1579,70 @@ mod tests {
                 )
                 .unwrap();
             binding
+        }
+
+        // ─── Enrollment attestation ──────────────────────────────
+
+        /// The pre-recall-grant path end to end: a conforming token
+        /// with NO deviceRecall object enrolls (trusted, no marks),
+        /// while the same token at the gate answers checkRequired —
+        /// enrollable but never unmoderated.
+        #[tokio::test]
+        async fn enrollment_tolerates_absent_recall_but_the_gate_does_not() {
+            let mut payload = conforming_payload(serde_json::json!({}));
+            payload["deviceIntegrity"]
+                .as_object_mut()
+                .unwrap()
+                .remove("deviceRecall");
+            let (engine, _fake) = engine_with_play(payload).await;
+            let play = engine.play.as_ref().unwrap();
+
+            let attestation = engine
+                .enrollment_attestation(play, "token", REQUEST_HASH, now())
+                .await
+                .unwrap();
+            assert_eq!(attestation, Some(None));
+
+            let result = engine
+                .gate_check(Some("token"), REQUEST_HASH, USER, now())
+                .await
+                .unwrap();
+            assert!(
+                matches!(result, GateCheckResult::CheckRequired { .. }),
+                "{result:?}"
+            );
+        }
+
+        /// A present recall object still surfaces its marks, so the
+        /// enroll handler can refuse a banned device a fresh binding.
+        #[tokio::test]
+        async fn enrollment_reads_banned_marks_when_recall_is_present() {
+            let (engine, _fake) =
+                engine_with_play(conforming_payload(serde_json::json!({"bitSecond": true}))).await;
+            let play = engine.play.as_ref().unwrap();
+            let attestation = engine
+                .enrollment_attestation(play, "token", REQUEST_HASH, now())
+                .await
+                .unwrap();
+            assert_eq!(
+                attestation,
+                Some(Some(Bits { case_open: false, banned: true }))
+            );
+        }
+
+        /// The weakening stops at the recall object: any 1–4 failure
+        /// is still an untrusted token, refused.
+        #[tokio::test]
+        async fn enrollment_refuses_a_token_failing_the_shared_prerequisites() {
+            let mut payload = conforming_payload(serde_json::json!({}));
+            payload["accountDetails"]["appLicensingVerdict"] = "UNLICENSED".into();
+            let (engine, _fake) = engine_with_play(payload).await;
+            let play = engine.play.as_ref().unwrap();
+            let attestation = engine
+                .enrollment_attestation(play, "token", REQUEST_HASH, now())
+                .await
+                .unwrap();
+            assert_eq!(attestation, None);
         }
 
         #[tokio::test]
