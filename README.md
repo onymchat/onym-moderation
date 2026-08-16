@@ -34,9 +34,12 @@ exactly the power this contract splits. The two services deliberately
 do not share a library — they must agree on *bytes*, not on code, and
 each pins that agreement with its own tests.
 
-Android's sibling profile (Play Integrity device recall) would live
-here too, as `android/`, and deliberately shares the enforcement
-backend's requirements so one backend can serve both.
+Android's sibling profile (Play Integrity device recall) lives here as
+[`android/`](android/README.md) — a by-copy sibling of `apple/` that
+swaps DeviceCheck for server-decoded integrity tokens, a challenge/
+`requestHash` binding, and `deviceRecall:write`. Its `fixtures/` are
+the normative Android wire contract: the backend generated them, and
+the Kotlin client reproduces them.
 
 ## Why a reference implementation
 

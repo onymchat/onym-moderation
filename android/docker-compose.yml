@@ -1,0 +1,69 @@
+name: onym-moderation-android
+
+# The enforcement backend behind Caddy, which terminates TLS and
+# provisions/renews Let's Encrypt certificates automatically — the same
+# shape onym-infra uses, so operating this is not a new skill.
+#
+# Only Caddy publishes ports. The service itself is reachable solely on
+# the private `internal` network, which matters here more than usual:
+# the container holds the Google service-account key of the Cloud
+# project linked in the Play Console, and the only write path to any
+# device's recall values runs through it.
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3 (QUIC)
+    environment:
+      - CADDY_EMAIL=${CADDY_EMAIL:-}
+      - MODERATION_HOST=${MODERATION_HOST:-moderation-android.onym.app}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Persists issued certificates + the ACME account across restarts.
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [internal]
+    depends_on: [moderation]
+
+  moderation:
+    build: .
+    image: onym-moderation-android:latest
+    restart: unless-stopped
+    environment:
+      - MODERATION_BIND=0.0.0.0:8080
+      - MODERATION_STORE_PATH=/data/moderation.sqlite
+      - MODERATION_PLAY_SA_KEY_PATH=/secrets/play-sa.json
+      - MODERATION_PLAY_PACKAGE_NAME=${MODERATION_PLAY_PACKAGE_NAME:-}
+      - MODERATION_PLAY_CERT_SHA256_DIGESTS=${MODERATION_PLAY_CERT_SHA256_DIGESTS:-}
+      - MODERATION_PLAY_TOKEN_MAX_AGE_SECS=${MODERATION_PLAY_TOKEN_MAX_AGE_SECS:-600}
+      - MODERATION_CHALLENGE_TTL_SECS=${MODERATION_CHALLENGE_TTL_SECS:-600}
+      - MODERATION_PROPAGATION_GRACE_SECS=${MODERATION_PROPAGATION_GRACE_SECS:-60}
+      - MODERATION_INTERFACE_SIGNING_SEED=${MODERATION_INTERFACE_SIGNING_SEED:?set in .env}
+      - MODERATION_INTERFACE_COMPONENT_ID=${MODERATION_INTERFACE_COMPONENT_ID:-onym:component:onym-android}
+      - MODERATION_ENFORCE_SIGNATURES=${MODERATION_ENFORCE_SIGNATURES:-false}
+      - MODERATION_AUTHORITY_TOKEN=${MODERATION_AUTHORITY_TOKEN:-}
+      - MODERATION_ALLOW_UNAUTHENTICATED_AUTHORITY=${MODERATION_ALLOW_UNAUTHENTICATED_AUTHORITY:-false}
+      - MODERATION_AUDIT_TOKEN=${MODERATION_AUDIT_TOKEN:-}
+      - MODERATION_SESSION_MAX_SKEW_SECS=${MODERATION_SESSION_MAX_SKEW_SECS:-300}
+      - RUST_LOG=${RUST_LOG:-info}
+    volumes:
+      # The verdict record and the write log. Losing this volume loses
+      # the meaning behind every value Google is holding — the values
+      # alone cannot be reconstructed into verdicts (profile §8 gap 7),
+      # so back it up.
+      - moderation-data:/data
+      # The service-account key never enters the image.
+      - ./secrets:/secrets:ro
+    networks: [internal]
+
+networks:
+  internal:
+
+volumes:
+  caddy-data:
+  caddy-config:
+  moderation-data:
