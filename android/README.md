@@ -135,3 +135,26 @@ countersigning key (from `/health`) to that componentId via
 `AUTHORITY_INTERFACE_KEYS_BY_COMPONENT` — the flat
 `AUTHORITY_INTERFACE_KEY` union must not be shared across backends, or
 one backend's key could witness mandates naming the other.
+
+## The `MODERATION_REQUIRE_RECALL` interim (pre-grant)
+
+Until Google grants device-recall access, no integrity token carries a
+`deviceRecall` object, so the strict gate answers `checkRequired` to
+every device. Setting `MODERATION_REQUIRE_RECALL=false` (exactly
+`false` or `0`; any other spelling stays strict) lets the gate answer
+from prerequisites 1–4 alone when the object is absent.
+
+Disclosed plainly: **while the flag is off, device-level ban
+persistence — the property device recall exists to provide — is off,
+not merely degraded.** No recall writes happen, a wipe or reinstall
+sheds the device's marks (an unenrolled device resolves no verdicts
+and gates `Clear`), and enforcement rests on the identity-level
+refusal alone: a device with a pending ban verdict still answers
+`banned` from the verdict record (without attempting a write Google
+would refuse), and the banned identity is refused on every surface.
+A present `deviceRecall` object is always read strictly regardless of
+the flag.
+
+Flip back to `true` the day the grant lands — `requireRecall` on
+`/health` confirms the redeploy took, and every carve-out use emits a
+`gate_without_recall` monitoring event in the meantime.

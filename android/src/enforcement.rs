@@ -40,6 +40,16 @@ pub struct PlayEnforcement {
     pub require_recall: bool,
 }
 
+/// A gate token that passed verification, with the provenance the
+/// reconciler needs: whether recall values were actually READ, or the
+/// clean default was synthesized by the `require_recall` carve-out —
+/// in which case no recall write can succeed and none is attempted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateAttestation {
+    pub bits: Bits,
+    pub recall_available: bool,
+}
+
 pub struct Engine {
     pub store: Store,
     pub play: Option<PlayEnforcement>,
@@ -76,7 +86,7 @@ impl Engine {
         integrity_token: &str,
         request_hash: &str,
         now: OffsetDateTime,
-    ) -> Result<Option<Bits>, Error> {
+    ) -> Result<Option<GateAttestation>, Error> {
         let Some(decoded) = play.client.decode(integrity_token).await? else {
             return Ok(None);
         };
@@ -108,24 +118,25 @@ impl Engine {
                     // would never fire in production.
                     tracing::info!(monitor = "recall_empty_result", "recall object present and empty");
                 }
-                Ok(Some(bits))
+                Ok(Some(GateAttestation { bits, recall_available: true }))
             }
             Err(classifier::ClassifierFailure::DeviceRecallMissing) if !play.require_recall => {
                 // The interim pre-grant carve-out: prerequisites 1-4
                 // held (this arm is unreachable otherwise — classify
                 // checks them first), only the recall object is
                 // missing, and the deployment has explicitly opted
-                // out of requiring it. No marks are READABLE, which
-                // is exactly the never-written clean state; a device
-                // with a pending ban verdict still blocks, because
-                // executing the ban needs a recall write Google will
-                // refuse. Monitored so the flip-back day has a
-                // signal trail.
+                // out of requiring it. No marks are READABLE — the
+                // never-written clean state for this DEVICE — and
+                // `recall_available: false` tells reconciliation not
+                // to attempt writes Google would refuse: a pending
+                // ban answers Banned from the verdict record instead
+                // of erroring on the write. Monitored so the
+                // flip-back day has a signal trail.
                 tracing::info!(
                     monitor = "gate_without_recall",
                     "gate token carries no deviceRecall object (MODERATION_REQUIRE_RECALL=false)"
                 );
-                Ok(Some(Bits::default()))
+                Ok(Some(GateAttestation { bits: Bits::default(), recall_available: false }))
             }
             Err(failure) => {
                 tracing::warn!(reason = failure.describe(), "integrity token failed the classifier");
@@ -206,10 +217,12 @@ impl Engine {
             ));
         };
 
-        let Some(bits) = self.verified_bits(play, integrity_token, request_hash, now).await? else {
+        let Some(attestation) =
+            self.verified_bits(play, integrity_token, request_hash, now).await?
+        else {
             return Ok(GateCheckResult::check_required(CheckRequiredReason::TokenInvalid));
         };
-        self.reconcile(play, integrity_token, user_key, bits, now).await
+        self.reconcile(play, integrity_token, user_key, attestation, now).await
     }
 
     /// Session-mediated reconciliation: with a live verified token in
@@ -220,9 +233,10 @@ impl Engine {
         play: &PlayEnforcement,
         integrity_token: &str,
         user_key: &str,
-        bits: Bits,
+        attestation: GateAttestation,
         now: OffsetDateTime,
     ) -> Result<GateCheckResult, Error> {
+        let bits = attestation.bits;
         let binding = self.store.device_binding_for_user(user_key)?;
         let intended = match binding.as_deref() {
             Some(binding) => self.intended_marks(binding, now)?,
@@ -267,7 +281,21 @@ impl Engine {
                     None => false,
                 };
 
-                if would_brand_another_device {
+                if !attestation.recall_available {
+                    // The carve-out's synthetic clean default is not a
+                    // divergence to repair: there is no recall object
+                    // to write to, and attempting it would turn a
+                    // pending ban into a 5xx instead of the Banned
+                    // answer below (`effective` comes from `intended`).
+                    // The verdicts stay unexecuted — device branding
+                    // waits for the grant; the identity-level refusal
+                    // is what this gate can enforce today.
+                    tracing::info!(
+                        monitor = "gate_without_recall_pending_marks",
+                        binding = %binding.as_deref().unwrap_or("unresolved"),
+                        "intended marks pending but no recall object to write; answering from                          the verdict record"
+                    );
+                } else if would_brand_another_device {
                     tracing::warn!(
                         binding = %binding.as_deref().unwrap_or("unresolved"),
                         "banned identity presented a device with clean values; refusing the \
@@ -1623,6 +1651,36 @@ mod tests {
                 .await
                 .unwrap();
             assert!(matches!(result, GateCheckResult::Clear { .. }), "{result:?}");
+        }
+
+        /// The reviewer's case: a PENDING (not-yet-executed) ban with
+        /// no recall object must answer Banned from the verdict
+        /// record — not attempt a write Google will refuse and turn
+        /// the answer into a 5xx. The verdict stays unexecuted (no
+        /// write was accepted), and nothing reaches the write API.
+        #[tokio::test]
+        async fn without_require_recall_a_pending_ban_blocks_without_writing() {
+            let mut payload = conforming_payload(serde_json::json!({}));
+            payload["deviceIntegrity"].as_object_mut().unwrap().remove("deviceRecall");
+            let (mut engine, fake) = engine_with_play(payload).await;
+            engine.play.as_mut().unwrap().require_recall = false;
+            enroll_and_store(&engine, "ban-1", verdict("case-1", Disposition::Ban, "csam"), false);
+
+            let result = engine
+                .gate_check(Some("token"), REQUEST_HASH, USER, now())
+                .await
+                .unwrap();
+            assert!(matches!(result, GateCheckResult::Banned { .. }), "{result:?}");
+
+            // No write attempted, and the verdict is still pending.
+            assert!(fake.lock().unwrap().writes.is_empty());
+            let stored = engine
+                .store
+                .verdicts_for_device(
+                    &engine.store.device_binding_for_user(USER).unwrap().unwrap(),
+                )
+                .unwrap();
+            assert!(!stored.iter().any(|v| v.executed), "{stored:?}");
         }
 
         /// The opt-out weakens ONLY the recall-object requirement:

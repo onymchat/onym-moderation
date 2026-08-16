@@ -84,6 +84,10 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
         "playIntegrity": state.config.play_configured(),
         "packageName": state.config.play_package_name,
         "enforceSignatures": state.config.enforce_signatures,
+        // Flip-back-day confirmation: strict-profile gates require a
+        // readable deviceRecall object; false is the disclosed
+        // pre-grant interim (see MODERATION_REQUIRE_RECALL).
+        "requireRecall": state.config.require_recall,
         "interface": state.config.interface_component_id,
         "interfaceKey": state.countersigning.root_reference(),
         "rotatedInterfaceKeys": state.countersigning.rotated().into_iter()
