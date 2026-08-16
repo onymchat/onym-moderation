@@ -54,8 +54,27 @@ pub struct Config {
     pub signing_seed: [u8; 32],
 
     /// Where to deliver verdicts, and the token that endpoint expects.
+    /// The default route, used when a mandate's interface component has
+    /// no entry in `interface_routes`.
     pub interface_base_url: Option<String>,
     pub interface_token: Option<String>,
+    /// Per-interface delivery routes, keyed by the componentId a
+    /// mandate names in its `interface` field. One authority can serve
+    /// several interface backends (the iOS DeviceCheck service and the
+    /// Android device-recall service are separate deployments), and a
+    /// verdict must reach the backend that countersigned its mandate —
+    /// delivered elsewhere it fails `no_mandate` forever.
+    pub interface_routes: std::collections::BTreeMap<String, InterfaceRoute>,
+    /// Per-interface countersigning keys, keyed the same way. When a
+    /// mandate's `interface` has an entry, its countersignature is
+    /// checked against exactly these keys — never the flat
+    /// [`Config::interface_keys`] union — so one backend's key cannot
+    /// witness a mandate naming the other backend, and the unvalidated
+    /// `interface` field the delivery routing later reads is bound to
+    /// the key that actually countersigned. Interfaces without an
+    /// entry fall back to the flat list, so a single-interface
+    /// deployment needs no change.
+    pub interface_keys_by_component: std::collections::BTreeMap<String, Vec<String>>,
     /// The interface's countersigning key(s), used to check that a
     /// registered mandate really was countersigned by the interface
     /// that claims to have witnessed it.
@@ -290,6 +309,12 @@ impl Config {
             signing_seed,
             interface_base_url: env::var("AUTHORITY_INTERFACE_URL").ok().filter(|v| !v.is_empty()),
             interface_token: env::var("AUTHORITY_INTERFACE_TOKEN").ok().filter(|v| !v.is_empty()),
+            interface_routes: parse_interface_routes(
+                &env::var("AUTHORITY_INTERFACE_ROUTES").unwrap_or_default(),
+            )?,
+            interface_keys_by_component: parse_interface_keys_by_component(
+                &env::var("AUTHORITY_INTERFACE_KEYS_BY_COMPONENT").unwrap_or_default(),
+            )?,
             // Comma-separated so a rotation can list both keys at
             // once. Order is irrelevant; each is tried.
             interface_keys: env::var("AUTHORITY_INTERFACE_KEY")
@@ -464,8 +489,22 @@ impl Config {
 
 Delivering verdicts to the interface:
   AUTHORITY_INTERFACE_URL      Base URL of the enforcement backend (e.g.
-                               https://moderation.onym.app)
+                               https://moderation.onym.app). The default route when a
+                               mandate's interface has no AUTHORITY_INTERFACE_ROUTES entry
   AUTHORITY_INTERFACE_TOKEN    Its MODERATION_AUTHORITY_TOKEN
+  AUTHORITY_INTERFACE_ROUTES   Per-interface routes, comma separated:
+                                 <componentId>=<url>|<token>,...
+                               e.g. onym:component:onym-android=https://moderation-android.onym.app|<token>
+                               The |<token> part is optional. Verdicts for a mandate naming
+                               that interface are delivered there instead of the default
+  AUTHORITY_INTERFACE_KEYS_BY_COMPONENT
+                               Per-interface countersigning keys, comma separated:
+                                 <componentId>=<onym:key:hex>[;<onym:key:hex>],...
+                               A mandate naming a listed interface must be countersigned by
+                               one of ITS keys — the flat AUTHORITY_INTERFACE_KEY union is
+                               not consulted for it. List two keys (semicolon) during a
+                               rotation. Serving several backends without this lets one
+                               backend's key witness mandates naming the other
   AUTHORITY_INTERFACE_KEY      onym:key:<hex> of the interface's countersigning key for
                                this authority, used to check registered mandates were
                                really countersigned. From the interface's /health:
@@ -726,5 +765,171 @@ mod tests {
         let remote = triage("https://api.example.com/v1/chat/completions");
         assert!(Config::triage_leaves_this_host(&remote));
         assert!(!Config::triage_host_resolves_local(&remote));
+    }
+}
+
+/// One per-interface delivery target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceRoute {
+    pub base_url: String,
+    pub token: Option<String>,
+}
+
+/// Parse `AUTHORITY_INTERFACE_ROUTES`: comma-separated
+/// `<componentId>=<url>|<token>` entries, the token optional. Component
+/// ids contain colons, so the first `=` splits id from target and the
+/// first `|` splits url from token.
+pub fn parse_interface_routes(
+    raw: &str,
+) -> Result<std::collections::BTreeMap<String, InterfaceRoute>, String> {
+    let mut routes = std::collections::BTreeMap::new();
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let Some((component, target)) = entry.split_once('=') else {
+            return Err(format!(
+                "AUTHORITY_INTERFACE_ROUTES entry {entry:?} is not <componentId>=<url>[|<token>]"
+            ));
+        };
+        let component = validated_component(component, "AUTHORITY_INTERFACE_ROUTES", entry)?;
+        let (url, token) = match target.split_once('|') {
+            Some((url, token)) => (url, Some(token.to_string()).filter(|t| !t.is_empty())),
+            None => (target, None),
+        };
+        if url.trim().is_empty() {
+            return Err(format!("AUTHORITY_INTERFACE_ROUTES entry {entry:?} has an empty part"));
+        }
+        routes.insert(
+            component,
+            InterfaceRoute { base_url: url.trim().to_string(), token },
+        );
+    }
+    Ok(routes)
+}
+
+/// Parse `AUTHORITY_INTERFACE_KEYS_BY_COMPONENT`: comma-separated
+/// `<componentId>=<onym:key:hex>[;<onym:key:hex>]` entries. Semicolons
+/// separate a rotation's keys; the first `=` splits id from keys
+/// (component ids and key references both contain colons, neither
+/// contains `=` or `;`).
+pub fn parse_interface_keys_by_component(
+    raw: &str,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, String> {
+    let mut map = std::collections::BTreeMap::new();
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let Some((component, keys)) = entry.split_once('=') else {
+            return Err(format!(
+                "AUTHORITY_INTERFACE_KEYS_BY_COMPONENT entry {entry:?} is not \
+                 <componentId>=<onym:key:hex>[;<onym:key:hex>]"
+            ));
+        };
+        let component =
+            validated_component(component, "AUTHORITY_INTERFACE_KEYS_BY_COMPONENT", entry)?;
+        let keys: Vec<String> = keys
+            .split(';')
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_string)
+            .collect();
+        if keys.is_empty() {
+            return Err(format!(
+                "AUTHORITY_INTERFACE_KEYS_BY_COMPONENT entry {entry:?} lists no keys"
+            ));
+        }
+        if let Some(bad) = keys.iter().find(|key| !key.starts_with("onym:key:")) {
+            return Err(format!(
+                "AUTHORITY_INTERFACE_KEYS_BY_COMPONENT entry {entry:?}: {bad:?} is not an \
+                 onym:key: reference"
+            ));
+        }
+        map.insert(component, keys);
+    }
+    Ok(map)
+}
+
+/// A typo'd component id here does not error at use — it silently
+/// falls through to the default route or the flat key list, which is
+/// exactly the misdelivery/mis-trust these maps exist to prevent. So
+/// the half of the typo space that CAN be checked without an
+/// allowlist — the prefix — is checked at boot (the same posture as
+/// the interface's `parse_epochs`).
+fn validated_component(component: &str, var: &str, entry: &str) -> Result<String, String> {
+    let component = component.trim();
+    if component.is_empty() {
+        return Err(format!("{var} entry {entry:?} names no component"));
+    }
+    if !component.starts_with("onym:component:") {
+        return Err(format!(
+            "{var} entry {entry:?} does not name a component (expected onym:component:<id>=...)"
+        ));
+    }
+    Ok(component.to_string())
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn routes_parse_component_ids_with_colons_and_optional_tokens() {
+        let routes = parse_interface_routes(
+            "onym:component:onym-android=https://moderation-android.onym.app|secret, \
+             onym:component:onym-ios=https://moderation.onym.app",
+        )
+        .unwrap();
+        assert_eq!(
+            routes.get("onym:component:onym-android"),
+            Some(&InterfaceRoute {
+                base_url: "https://moderation-android.onym.app".into(),
+                token: Some("secret".into()),
+            })
+        );
+        assert_eq!(
+            routes.get("onym:component:onym-ios"),
+            Some(&InterfaceRoute {
+                base_url: "https://moderation.onym.app".into(),
+                token: None,
+            })
+        );
+    }
+
+    #[test]
+    fn an_entry_without_a_url_is_refused() {
+        assert!(parse_interface_routes("just-a-name").is_err());
+        assert!(parse_interface_routes("onym:component:x=").is_err());
+        assert!(parse_interface_routes("").unwrap().is_empty());
+    }
+
+    /// A typo'd component id would silently fall through to the
+    /// default route at delivery time — the misrouted verdict then
+    /// fails no_mandate and is retired after MAX_REFUSALS. Catch the
+    /// checkable half of that typo space at boot.
+    #[test]
+    fn a_route_key_that_is_not_a_component_id_is_refused_at_boot() {
+        let err = parse_interface_routes(
+            "onym:compnent:onym-android=https://moderation-android.onym.app",
+        )
+        .unwrap_err();
+        assert!(err.contains("does not name a component"), "{err}");
+    }
+
+    #[test]
+    fn per_interface_keys_parse_and_validate() {
+        let map = parse_interface_keys_by_component(
+            "onym:component:onym-android=onym:key:aa;onym:key:bb, \
+             onym:component:onym-ios=onym:key:cc",
+        )
+        .unwrap();
+        assert_eq!(
+            map.get("onym:component:onym-android"),
+            Some(&vec!["onym:key:aa".to_string(), "onym:key:bb".to_string()])
+        );
+        assert_eq!(
+            map.get("onym:component:onym-ios"),
+            Some(&vec!["onym:key:cc".to_string()])
+        );
+
+        assert!(parse_interface_keys_by_component("onym:component:x=").is_err());
+        assert!(parse_interface_keys_by_component("onym:component:x=not-a-key").is_err());
+        assert!(parse_interface_keys_by_component("typo:component=onym:key:aa").is_err());
+        assert!(parse_interface_keys_by_component("").unwrap().is_empty());
     }
 }

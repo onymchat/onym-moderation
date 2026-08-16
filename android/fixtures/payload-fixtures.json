@@ -1,0 +1,44 @@
+{
+  "profile": "onym:moderation-enforcement-profile:google-device-recall-v1",
+  "generator": "onym-moderation-android src/payload.rs (normative)",
+  "layout": "for each field in order [context, challenge, userKey, timestamp, mandateRef|''] a big-endian u32 length prefix followed by the raw bytes",
+  "requestHash": "base64url-nopad(SHA-256(payloadBytes))",
+  "inputs": {
+    "timestamp": "2026-08-08T12:00:00Z",
+    "userKey": "onym:key:aabb",
+    "challengeHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "mandateRef": "mandate-ref-1"
+  },
+  "vectors": [
+    {
+      "name": "enrollment",
+      "context": "onym-moderation-android-enroll-v1",
+      "mandateRef": null,
+      "payloadHex": "000000216f6e796d2d6d6f6465726174696f6e2d616e64726f69642d656e726f6c6c2d763100000020000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0000000d6f6e796d3a6b65793a6161626200000014323032362d30382d30385431323a30303a30305a00000000",
+      "requestHash": "MjdGYuAzA2yGT0TFKvav9Iopz4YbP0keGnh61SJ1QPU"
+    },
+    {
+      "name": "gate-check",
+      "context": "onym-moderation-android-gate-v1",
+      "mandateRef": "mandate-ref-1",
+      "payloadHex": "0000001f6f6e796d2d6d6f6465726174696f6e2d616e64726f69642d676174652d763100000020000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0000000d6f6e796d3a6b65793a6161626200000014323032362d30382d30385431323a30303a30305a0000000d6d616e646174652d7265662d31",
+      "requestHash": "faELd9vZwOtBP14VochzXfc08GopZmrZCc8XeVD6jkY"
+    },
+    {
+      "name": "gate-check-without-mandate-ref",
+      "context": "onym-moderation-android-gate-v1",
+      "mandateRef": null,
+      "payloadHex": "0000001f6f6e796d2d6d6f6465726174696f6e2d616e64726f69642d676174652d763100000020000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0000000d6f6e796d3a6b65793a6161626200000014323032362d30382d30385431323a30303a30305a00000000",
+      "requestHash": "kuaMPqtf-bLFKROyTPUnD_4TdyJ9ImSQOuEDzMbbfK4"
+    }
+  ],
+  "gateResultSchema": {
+    "id": "onym-moderation-google-device-recall-gate-result-v1",
+    "examples": [
+      {"status": "clear"},
+      {"status": "caseOpen", "notices": []},
+      {"status": "banned", "ban": {"verdictRef": "…", "authorityContact": "…"}},
+      {"status": "checkRequired", "reason": "tokenInvalid"}
+    ]
+  }
+}
