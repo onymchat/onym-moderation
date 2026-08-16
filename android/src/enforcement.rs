@@ -33,6 +33,11 @@ pub struct PlayEnforcement {
     pub cert_sha256_digests: Vec<String>,
     /// Freshness window for `requestDetails.timestampMillis`, seconds.
     pub token_max_age_secs: i64,
+    /// Strict profile: refuse gate tokens without a deviceRecall
+    /// object. INTERIM `false` (pre-recall-grant) answers such tokens
+    /// from prerequisites 1-4 alone, with no marks readable — see
+    /// `MODERATION_REQUIRE_RECALL` in config.rs.
+    pub require_recall: bool,
 }
 
 pub struct Engine {
@@ -104,6 +109,23 @@ impl Engine {
                     tracing::info!(monitor = "recall_empty_result", "recall object present and empty");
                 }
                 Ok(Some(bits))
+            }
+            Err(classifier::ClassifierFailure::DeviceRecallMissing) if !play.require_recall => {
+                // The interim pre-grant carve-out: prerequisites 1-4
+                // held (this arm is unreachable otherwise — classify
+                // checks them first), only the recall object is
+                // missing, and the deployment has explicitly opted
+                // out of requiring it. No marks are READABLE, which
+                // is exactly the never-written clean state; a device
+                // with a pending ban verdict still blocks, because
+                // executing the ban needs a recall write Google will
+                // refuse. Monitored so the flip-back day has a
+                // signal trail.
+                tracing::info!(
+                    monitor = "gate_without_recall",
+                    "gate token carries no deviceRecall object (MODERATION_REQUIRE_RECALL=false)"
+                );
+                Ok(Some(Bits::default()))
             }
             Err(failure) => {
                 tracing::warn!(reason = failure.describe(), "integrity token failed the classifier");
@@ -1534,6 +1556,7 @@ mod tests {
                     package_name: PACKAGE.to_string(),
                     cert_sha256_digests: vec!["expected-digest".to_string()],
                     token_max_age_secs: 600,
+                    require_recall: true,
                 }),
                 propagation_grace_secs: 60,
             };
@@ -1579,6 +1602,64 @@ mod tests {
                 )
                 .unwrap();
             binding
+        }
+
+        // ─── The interim require-recall opt-out ──────────────────
+
+        /// MODERATION_REQUIRE_RECALL=false: a token passing 1-4 with
+        /// no recall object gates CLEAN (nothing readable = the
+        /// never-written state), instead of checkRequired for every
+        /// device until Google's grant lands.
+        #[tokio::test]
+        async fn without_require_recall_an_absent_object_gates_clean() {
+            let mut payload = conforming_payload(serde_json::json!({}));
+            payload["deviceIntegrity"].as_object_mut().unwrap().remove("deviceRecall");
+            let (mut engine, _fake) = engine_with_play(payload).await;
+            engine.play.as_mut().unwrap().require_recall = false;
+            engine.store.enrollment_for(USER, "2026-08-08T00:00:00Z").unwrap();
+
+            let result = engine
+                .gate_check(Some("token"), REQUEST_HASH, USER, now())
+                .await
+                .unwrap();
+            assert!(matches!(result, GateCheckResult::Clear { .. }), "{result:?}");
+        }
+
+        /// The opt-out weakens ONLY the recall-object requirement:
+        /// prerequisites 1-4 still refuse, exactly as strict mode.
+        #[tokio::test]
+        async fn without_require_recall_prerequisites_still_refuse() {
+            let mut payload = conforming_payload(serde_json::json!({}));
+            payload["deviceIntegrity"].as_object_mut().unwrap().remove("deviceRecall");
+            payload["accountDetails"]["appLicensingVerdict"] = "UNLICENSED".into();
+            let (mut engine, _fake) = engine_with_play(payload).await;
+            engine.play.as_mut().unwrap().require_recall = false;
+            engine.store.enrollment_for(USER, "2026-08-08T00:00:00Z").unwrap();
+
+            let result = engine
+                .gate_check(Some("token"), REQUEST_HASH, USER, now())
+                .await
+                .unwrap();
+            assert!(
+                matches!(result, GateCheckResult::CheckRequired { .. }),
+                "{result:?}"
+            );
+        }
+
+        /// A PRESENT recall object is read strictly whatever the flag
+        /// says — the opt-out never launders real marks.
+        #[tokio::test]
+        async fn without_require_recall_present_marks_still_read() {
+            let (mut engine, _fake) =
+                engine_with_play(conforming_payload(serde_json::json!({"bitSecond": true}))).await;
+            engine.play.as_mut().unwrap().require_recall = false;
+            enroll_and_store(&engine, "ban-1", verdict("case-1", Disposition::Ban, "csam"), true);
+
+            let result = engine
+                .gate_check(Some("token"), REQUEST_HASH, USER, now())
+                .await
+                .unwrap();
+            assert!(matches!(result, GateCheckResult::Banned { .. }), "{result:?}");
         }
 
         // ─── Enrollment attestation ──────────────────────────────
