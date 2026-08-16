@@ -212,6 +212,14 @@ Optional:
   MODERATION_PROPAGATION_GRACE_SECS    Window in which a stale read after an accepted
                                        write is treated as Google's propagation lag,
                                        not divergence (default: 60)
+  MODERATION_REQUIRE_RECALL            INTERIM pre-device-recall-grant switch. Exactly
+                                       "false" or "0" lets the gate answer from
+                                       prerequisites 1-4 when a token carries no
+                                       deviceRecall object (every other spelling stays
+                                       strict — the fail-safe direction). While off,
+                                       device-level ban persistence is OFF, not merely
+                                       degraded. Default: true; flip back the day the
+                                       grant lands ("requireRecall" on /health confirms)
   MODERATION_ENFORCE_SIGNATURES        true to reject unverifiable verdict signatures
                                        (default: false — MUST be true in production)
   MODERATION_AUTHORITY_TOKEN           Bearer token an authority presents on POST /v1/verdicts.
